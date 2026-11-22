@@ -1,0 +1,34 @@
+{
+  "id": "island",
+  "title": "Eroded Highland Island",
+  "subtitle": "terrain-generator + Landlab Barnes Lake-Spillway -> Sea Hydrology",
+  "size": 512,
+  "worldSpan": 2400.0,
+  "minElev": -20.87,
+  "maxElev": 198.43,
+  "seaLevel": 0.0,
+  "riverCount": 36,
+  "lakeCount": 14,
+  "landmarks": {
+    "plains": [
+      0.4521,
+      0.5616
+    ],
+    "peak": [
+      0.4521,
+      0.3366
+    ],
+    "lake": [
+      0.3933,
+      0.2642
+    ],
+    "river": [
+      0.3933,
+      0.4423
+    ],
+    "coast": [
+      0.3503,
+      0.4286
+    ]
+  }
+}

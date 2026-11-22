@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>TerraGrok — Interactive 3D World Explorer</title>
+  </head>
+  <body>
+    <canvas id="scene"></canvas>
+
+    <!-- Top-left HUD: Style & Camera Presets -->
+    <aside id="hud-left" class="panel">
+      <div class="brand">
+        <h1>TerraGrok <span>3D Explorer</span></h1>
+        <p id="world-subtitle">Loading terrain…</p>
+      </div>
+
+      <div class="section">
+        <div class="label">Quick Style Comparison</div>
+        <div class="btn-row">
+          <button class="pill active" data-preset="zelda">Zelda 3D (Walk)</button>
+          <button class="pill" data-preset="hike">1st-Person Hike</button>
+          <button class="pill" data-preset="diorama">Diorama (Isometric)</button>
+        </div>
+      </div>
+
+      <div class="section">
+        <div class="label">World (Generated via mise)</div>
+        <select id="world-select"></select>
+      </div>
+
+      <div class="section">
+        <div class="label">Camera Mode <span class="hint">[1 / 2 / 3]</span></div>
+        <div class="btn-row">
+          <button class="seg active" data-cam="third">1. 3rd-Person</button>
+          <button class="seg" data-cam="first">2. 1st-Person</button>
+          <button class="seg" data-cam="diorama">3. Isometric</button>
+        </div>
+      </div>
+
+      <div class="section">
+        <div class="label">Visual Shader <span class="hint">[V]</span></div>
+        <div class="btn-row">
+          <button class="seg active" data-style="0">High-Detail</button>
+          <button class="seg" data-style="1">Faceted</button>
+          <button class="seg" data-style="2">Topo Map</button>
+        </div>
+      </div>
+
+      <div class="section">
+        <div class="label">Teleport to Landmark</div>
+        <div class="btn-grid">
+          <button class="mini" data-tp="plains">Plains</button>
+          <button class="mini" data-tp="lake">Alpine Lake</button>
+          <button class="mini" data-tp="river">River Crossing</button>
+          <button class="mini" data-tp="peak">Mountain Peak</button>
+          <button class="mini" data-tp="coast" style="grid-column: span 2;">River Estuary / Coast</button>
+        </div>
+      </div>
+
+      <div class="section sliders">
+        <label>
+          <span>Sun Altitude <strong id="sun-val">32°</strong></span>
+          <input id="sun-slider" type="range" min="8" max="75" value="32" />
+        </label>
+        <label>
+          <span>Vertical Scale <strong id="vscale-val">1.0×</strong></span>
+          <input id="vscale-slider" type="range" min="0.5" max="2.0" step="0.05" value="1.0" />
+        </label>
+      </div>
+    </aside>
+
+    <!-- Bottom-left Telemetry -->
+    <div id="telemetry" class="panel">
+      <div class="stat">
+        <span class="k">Activity</span>
+        <span id="stat-activity" class="v badge">WALKING</span>
+      </div>
+      <div class="stat">
+        <span class="k">Elevation</span>
+        <span id="stat-elev" class="v">0 m</span>
+      </div>
+      <div class="stat">
+        <span class="k">Slope</span>
+        <span id="stat-slope" class="v">0°</span>
+      </div>
+      <div class="stat">
+        <span class="k">Zone</span>
+        <span id="stat-zone" class="v">Plains</span>
+      </div>
+    </div>
+
+    <!-- Bottom-right Controls Help -->
+    <div id="controls-help" class="panel">
+      <div><strong>WASD / Arrows</strong> Move or Pan</div>
+      <div><strong>Drag</strong> Rotate Camera · <strong>Scroll</strong> Zoom</div>
+      <div><strong>Shift</strong> Sprint · <strong>Space</strong> Jump</div>
+      <div><strong>1 / 2 / 3</strong> Camera · <strong>V</strong> Shader · <strong>H</strong> Hide UI</div>
+    </div>
+
+    <div id="loading">Loading terrain heightfield…</div>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

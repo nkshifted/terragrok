@@ -1,0 +1,20 @@
+# Python / uv
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Node / Vite
+viewer/node_modules/
+viewer/dist/
+*.log
+
+# Regeneratable raw terraforming pipeline outputs (run `just all`)
+out/
+
+# OS / Editor
+.DS_Store
+.vscode/
+.idea/

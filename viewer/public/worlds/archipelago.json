@@ -1,0 +1,34 @@
+{
+  "id": "archipelago",
+  "title": "Seven-Isle Archipelago",
+  "subtitle": "terrain-generator + Landlab Lake-to-Sea Hydrology",
+  "size": 512,
+  "worldSpan": 2600.0,
+  "minElev": -17.39,
+  "maxElev": 140.82,
+  "seaLevel": 0.0,
+  "riverCount": 23,
+  "lakeCount": 2,
+  "landmarks": {
+    "plains": [
+      0.6008,
+      0.4031
+    ],
+    "peak": [
+      0.6967,
+      0.1996
+    ],
+    "lake": [
+      0.7456,
+      0.1703
+    ],
+    "river": [
+      0.6145,
+      0.1311
+    ],
+    "coast": [
+      0.5616,
+      0.0763
+    ]
+  }
+}

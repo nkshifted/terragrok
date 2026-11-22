@@ -1,0 +1,23 @@
+[tools]
+# Core runtimes & task runner
+python = "3.12"
+uv = "latest"
+rust = "1.96.1"
+node = "24"
+just = "latest"
+
+# Terraforming CLI #1: Fractal noise + Beyer hydraulic erosion + Barnes priority-flood rivers/lakes
+"cargo:terrain-generator" = "0.3.1"
+
+# Terraforming CLI #2: Full planetary tectonics, Airy isostasy, climate, multi-process erosion, biomes & 3D export
+"cargo:https://github.com/nico2525nn/geogenesis" = { version = "branch:main", crate = "geogenesis-cli" }
+
+[env]
+_.python.venv = { path = ".venv", create = true }
+
+[tasks.setup]
+description = "Install mise tools and sync Python geomorphology environment"
+run = """
+mise install
+uv sync
+"""

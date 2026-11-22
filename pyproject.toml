@@ -1,0 +1,15 @@
+[project]
+name = "terragrok"
+version = "0.1.0"
+description = "Terraforming & procedural world geography/topography research and testbed"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "fastscapelib>=0.3.0",
+    "landlab>=2.11.0",
+    "matplotlib>=3.9.0",
+    "numpy>=2.0.0",
+    "pillow>=11.0.0",
+    "pyfastnoiselite>=0.0.7",
+    "scipy>=1.14.0",
+    "whitebox-workflows>=2.0.0",
+]

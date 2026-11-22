@@ -1,0 +1,104 @@
+[
+  {
+    "id": "island",
+    "title": "Eroded Highland Island",
+    "subtitle": "terrain-generator + Landlab Barnes Lake-Spillway -> Sea Hydrology",
+    "size": 512,
+    "worldSpan": 2400.0,
+    "minElev": -20.87,
+    "maxElev": 198.43,
+    "seaLevel": 0.0,
+    "riverCount": 36,
+    "lakeCount": 14,
+    "landmarks": {
+      "plains": [
+        0.4521,
+        0.5616
+      ],
+      "peak": [
+        0.4521,
+        0.3366
+      ],
+      "lake": [
+        0.3933,
+        0.2642
+      ],
+      "river": [
+        0.3933,
+        0.4423
+      ],
+      "coast": [
+        0.3503,
+        0.4286
+      ]
+    }
+  },
+  {
+    "id": "fastscape",
+    "title": "Tectonic Alpine Continent",
+    "subtitle": "FastNoiseLite + Fastscapelib + Landlab Lake-to-Sea Hydrology",
+    "size": 512,
+    "worldSpan": 3200.0,
+    "minElev": -52.36,
+    "maxElev": 220.0,
+    "seaLevel": 0.0,
+    "riverCount": 26,
+    "lakeCount": 1,
+    "landmarks": {
+      "plains": [
+        0.2838,
+        0.4892
+      ],
+      "peak": [
+        0.4736,
+        0.3699
+      ],
+      "lake": [
+        0.6321,
+        0.4227
+      ],
+      "river": [
+        0.3777,
+        0.4423
+      ],
+      "coast": [
+        0.2701,
+        0.4266
+      ]
+    }
+  },
+  {
+    "id": "archipelago",
+    "title": "Seven-Isle Archipelago",
+    "subtitle": "terrain-generator + Landlab Lake-to-Sea Hydrology",
+    "size": 512,
+    "worldSpan": 2600.0,
+    "minElev": -17.39,
+    "maxElev": 140.82,
+    "seaLevel": 0.0,
+    "riverCount": 23,
+    "lakeCount": 2,
+    "landmarks": {
+      "plains": [
+        0.6008,
+        0.4031
+      ],
+      "peak": [
+        0.6967,
+        0.1996
+      ],
+      "lake": [
+        0.7456,
+        0.1703
+      ],
+      "river": [
+        0.6145,
+        0.1311
+      ],
+      "coast": [
+        0.5616,
+        0.0763
+      ]
+    }
+  }
+]
