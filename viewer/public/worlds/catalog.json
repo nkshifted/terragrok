@@ -100,5 +100,39 @@
         0.0763
       ]
     }
+  },
+  {
+    "id": "terrain_diffusion",
+    "title": "AI Earth Coast (Terrain Diffusion 30m)",
+    "subtitle": "InfiniteDiffusion 30m DEM + WorldClim + Landlab Lake-to-Sea Hydrology",
+    "size": 512,
+    "worldSpan": 2600.0,
+    "minElev": -35.0,
+    "maxElev": 285.0,
+    "seaLevel": 0.0,
+    "riverCount": 27,
+    "lakeCount": 1,
+    "landmarks": {
+      "plains": [
+        0.2211,
+        0.4658
+      ],
+      "peak": [
+        0.0,
+        0.9491
+      ],
+      "lake": [
+        0.1624,
+        0.6106
+      ],
+      "river": [
+        0.5577,
+        0.7319
+      ],
+      "coast": [
+        0.7162,
+        0.5636
+      ]
+    }
   }
 ]

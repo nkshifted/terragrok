@@ -258,9 +258,11 @@ def solve_physical_hydrology(
 
             nxt = int(rec[idx])
             if nxt == idx:
-                # Reached boundary node; if border is at sea level mark sea
-                if elev[r, c] <= 0.5:
+                # Reached open outer boundary of the grid (sea or continental map-edge outflow)
+                if is_ocean[r, c] or elev[r, c] <= 0.5:
                     dest_type = "sea"
+                elif r == 0 or r == ny - 1 or c == 0 or c == nx - 1:
+                    dest_type = "edge"
                 break
             idx = nxt
 
@@ -542,10 +544,11 @@ def solve_physical_hydrology(
     n_sea = sum(1 for r in rivers_data if r["dest"] == "sea")
     n_lake_dst = sum(1 for r in rivers_data if r["dest"] == "lake")
     n_conf = sum(1 for r in rivers_data if r["dest"] == "confluence")
+    n_edge = sum(1 for r in rivers_data if r["dest"] == "edge")
     print(
         f"  Hydrology OK: {len(lakes_data)} lakes | {len(rivers_data)} rivers "
         f"(sources: {n_lake_src} lake-spillway, {n_spring_src} alpine-spring | "
-        f"dests: {n_sea} sea, {n_lake_dst} lake, {n_conf} confluence | 0 dead-ends)"
+        f"dests: {n_sea} sea, {n_lake_dst} lake, {n_conf} confluence, {n_edge} map-edge | 0 dead-ends)"
     )
 
     river_u8 = np.clip(channel_mask * 255.0, 0, 255).astype(np.uint8)
@@ -752,6 +755,76 @@ def export_fastscape_world() -> dict:
     return meta
 
 
+def export_terrain_diffusion_world() -> dict | None:
+    """Export Terrain Diffusion 30m DEM + WorldClim climate through our Landlab hydrology pipeline."""
+    src = Path("out/terrain-diffusion")
+    elev_path = src / "elev_512.f32"
+    if not elev_path.exists():
+        return None
+
+    print("Solving physical hydrology for terrain_diffusion...")
+    raw = np.fromfile(elev_path, dtype=np.float32)
+    n = int(round(np.sqrt(raw.size)))
+    elev = raw.reshape(n, n)
+    elev = resample_array(elev, VIEWER_SIZE, is_mask=False).astype(np.float32)
+
+    # Preserve authentic mountain slope geometry scaled to walkable 2.6 km game region
+    world_span_m = 2600.0
+    max_land = max(float(elev.max()), 1.0)
+    scale_land = 285.0 / max_land
+    # Gently compress abyssal ocean depth to -35m while preserving coastal shelf gradient
+    elev_scaled = np.where(
+        elev >= 0.0,
+        elev * scale_land,
+        np.maximum(elev * (scale_land * 0.55), -35.0),
+    ).astype(np.float32)
+
+    carved, riv_u8, lak_u8, lakes_data, rivers_data = solve_physical_hydrology(
+        elev=elev_scaled,
+        world_span_m=world_span_m,
+        min_lake_cells=22,
+        min_lake_depth_m=0.40,
+        max_spring_rivers=18,
+    )
+    curv_u8 = compute_curvature_ao(carved)
+
+    # Drive vegetation moisture directly from Terrain Diffusion's WorldClim precipitation!
+    clim_path = src / "climate_512.npz"
+    if clim_path.exists():
+        clim = np.load(clim_path)
+        precip = resample_array(clim["precip"].astype(np.float32), VIEWER_SIZE, is_mask=False)
+        p_lo, p_hi = float(np.percentile(precip, 5)), float(np.percentile(precip, 95))
+        moisture = np.clip(0.38 + 0.55 * (precip - p_lo) / max(p_hi - p_lo, 1.0), 0.18, 0.95)
+    else:
+        moisture = np.full((VIEWER_SIZE, VIEWER_SIZE), 0.65, dtype=np.float32)
+
+    wet_seed = np.clip((riv_u8.astype(np.float32) + lak_u8.astype(np.float32)) / 255.0, 0.0, 1.0)
+    moisture = np.clip(moisture + gaussian_filter(wet_seed, sigma=8.0) * 0.85, 0.14, 1.0)
+
+    masks = np.stack([riv_u8, lak_u8, curv_u8, (moisture * 255.0).astype(np.uint8)], axis=-1)
+    carved.astype(np.float32).tofile(OUT_DIR / "terrain_diffusion.height.f32")
+    masks.astype(np.uint8).tofile(OUT_DIR / "terrain_diffusion.masks.u8")
+    (OUT_DIR / "terrain_diffusion.rivers.json").write_text(json.dumps(rivers_data))
+    (OUT_DIR / "terrain_diffusion.lakes.json").write_text(json.dumps(lakes_data))
+
+    landmarks = find_landmarks(carved, riv_u8, lak_u8, lakes_data, rivers_data, world_span_m)
+    meta = {
+        "id": "terrain_diffusion",
+        "title": "AI Earth Coast (Terrain Diffusion 30m)",
+        "subtitle": "InfiniteDiffusion 30m DEM + WorldClim + Landlab Lake-to-Sea Hydrology",
+        "size": VIEWER_SIZE,
+        "worldSpan": world_span_m,
+        "minElev": round(float(carved.min()), 2),
+        "maxElev": round(float(carved.max()), 2),
+        "seaLevel": 0.0,
+        "riverCount": len(rivers_data),
+        "lakeCount": len(lakes_data),
+        "landmarks": landmarks,
+    }
+    (OUT_DIR / "terrain_diffusion.json").write_text(json.dumps(meta, indent=2))
+    return meta
+
+
 def main() -> None:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     catalog = [
@@ -773,6 +846,9 @@ def main() -> None:
             max_elev_m=200.0,
         ),
     ]
+    td_meta = export_terrain_diffusion_world()
+    if td_meta is not None:
+        catalog.append(td_meta)
     (OUT_DIR / "catalog.json").write_text(json.dumps(catalog, indent=2))
     print(f"Wrote physically consistent catalog with {len(catalog)} worlds to {OUT_DIR}")
 

@@ -33,6 +33,10 @@ fastscape seed="42" size="512" steps="80":
 whitebox:
     python experiments/whitebox_geomorphometry.py --heightmap out/terrain-gen/island_42_height.png --out out/whitebox
 
+# Experiment 5: Terrain Diffusion 30m (AI Earth DEM + WorldClim climate on Apple Silicon MPS/CPU)
+terrain-diffusion seed="42":
+    uv run --extra diffusion python experiments/terrain_diffusion_test.py --seed {{seed}}
+
 # Pack generated worlds into binary assets for the 3D viewer
 export-viewer:
     python experiments/export_viewer_worlds.py

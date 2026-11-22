@@ -13,6 +13,7 @@ viewer/dist/
 
 # Regeneratable raw terraforming pipeline outputs (run `just all`)
 out/
+.vendor/
 
 # OS / Editor
 .DS_Store
