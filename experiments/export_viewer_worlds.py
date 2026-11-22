@@ -23,10 +23,12 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import fastscapelib as fs
 import numpy as np
 from PIL import Image
 from landlab import RasterModelGrid
 from landlab.components import PriorityFloodFlowRouter
+from pyfastnoiselite.pyfastnoiselite import FastNoiseLite, FractalType, NoiseType
 from scipy.ndimage import binary_dilation, gaussian_filter, label, laplace
 
 
@@ -54,12 +56,85 @@ def compute_curvature_ao(elev: np.ndarray) -> np.ndarray:
     return (norm * 255.0).astype(np.uint8)
 
 
+def apply_micro_detail_refinement(
+    elev: np.ndarray,
+    world_span_m: float,
+    seed: int = 42,
+) -> np.ndarray:
+    """
+    Walking-scale micro-detail refinement for 30m/px macro Terrain Diffusion DEMs:
+      1. Slope-gated multi-octave ridged crags & cliff ledges on mountain slopes (>10 deg),
+         leaving lowland valleys, plains, and sandy beaches smoothly untouched.
+      2. Gentle Fastscapelib stream-power + ADI hillslope micro-erosion (10 fine steps) to
+         etch sharp dendritic gullies, talus aprons, and crisp alpine aretes without
+         altering the macro coastline or planetary landforms.
+    """
+    ny, nx = elev.shape
+    cell_m = world_span_m / (nx - 1)
+    out = elev.astype(np.float64).copy()
+    land = out > 0.0
+
+    # 1. Slope-gated rocky crag & cliff strata micro-relief
+    gy, gx = np.gradient(out, cell_m)
+    slope_deg = np.degrees(np.arctan(np.hypot(gx, gy)))
+    slope_gate = np.clip((slope_deg - 9.0) / 20.0, 0.0, 1.0) ** 1.3
+    elev_gate = np.clip((out - 6.0) / 30.0, 0.0, 1.0)
+    mask = slope_gate * elev_gate
+
+    xs = np.linspace(0.0, float(nx), nx, dtype=np.float32)
+    ys = np.linspace(0.0, float(ny), ny, dtype=np.float32)
+    xx, yy = np.meshgrid(xs, ys)
+    coords = np.vstack([xx.ravel(), yy.ravel()])
+
+    fn_ridge = FastNoiseLite(seed=seed + 101)
+    fn_ridge.noise_type = NoiseType.NoiseType_OpenSimplex2
+    fn_ridge.fractal_type = FractalType.FractalType_Ridged
+    fn_ridge.fractal_octaves = 4
+    fn_ridge.frequency = 0.022
+    ridge_hi = fn_ridge.gen_from_coords(coords).reshape(ny, nx)
+
+    fn_crag = FastNoiseLite(seed=seed + 307)
+    fn_crag.noise_type = NoiseType.NoiseType_OpenSimplex2
+    fn_crag.fractal_type = FractalType.FractalType_FBm
+    fn_crag.fractal_octaves = 3
+    fn_crag.frequency = 0.055
+    crag_fine = fn_crag.gen_from_coords(coords).reshape(ny, nx)
+
+    # Add up to ~6.5m of crisp rock cragging & ridge ledges on steep slopes
+    micro_rock = (ridge_hi * 4.8 + crag_fine * 2.2) * mask
+    out = np.where(land, np.maximum(out + micro_rock, 0.2), out)
+
+    # 2. Gentle Fastscapelib fine-scale hydraulic + hillslope micro-erosion
+    subaerial = np.where(land, out, 0.0).copy()
+    grid = fs.RasterGrid.from_length(
+        shape=(ny, nx),
+        length=(world_span_m, world_span_m),
+        bounds_status=fs.NodeStatus.FIXED_VALUE,
+    )
+    flow_graph = fs.FlowGraph(grid, [fs.SingleFlowRouter(), fs.PFloodSinkResolver()])
+    spl = fs.SPLEroder(flow_graph=flow_graph, k_coef=2.2e-5, area_exp=0.45, slope_exp=1.0)
+    diff = fs.DiffusionADIEroder(grid=grid, k_coef=0.015)
+
+    dt = 180.0
+    for _ in range(10):
+        flow_graph.update_routes(subaerial)
+        area = flow_graph.accumulate(1.0)
+        subaerial -= spl.erode(subaerial, area, dt)
+        subaerial -= diff.erode(subaerial, dt)
+        subaerial = np.where(land, np.maximum(subaerial, 0.15), 0.0)
+
+    # Blend 65% micro-eroded detail with 35% pre-eroded peak silhouette so summit relief stays dramatic
+    refined = np.where(land, 0.65 * subaerial + 0.35 * out, out)
+    return refined.astype(np.float32)
+
+
 def solve_physical_hydrology(
     elev: np.ndarray,
     world_span_m: float,
     min_lake_cells: int = 28,
     min_lake_depth_m: float = 0.45,
     max_spring_rivers: int = 16,
+    runoff_map: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[dict], list[dict]]:
     """
     Solve exact Barnes Priority-Flood lake hierarchy & pit-free D8 drainage tree.
@@ -94,6 +169,8 @@ def solve_physical_hydrology(
     z_in = np.where(is_ocean, 0.0, elev.astype(np.float64))
     z_shift = max(0.0, -float(z_in.min())) + 1.0
     mg.add_field("topographic__elevation", (z_in + z_shift).ravel(), at="node")
+    if runoff_map is not None:
+        mg.add_field("water__unit_flux_in", np.clip(runoff_map.astype(np.float64), 0.15, 4.0).ravel(), at="node")
     mg.status_at_node[is_ocean.ravel()] = mg.BC_NODE_IS_FIXED_VALUE
 
     pf = PriorityFloodFlowRouter(
@@ -107,7 +184,12 @@ def solve_physical_hydrology(
 
     filled = mg.at_node["depression_free_elevation"].reshape(ny, nx) - z_shift
     rec = mg.at_node["flow__receiver_node"].astype(np.int64)
-    da = mg.at_node["drainage_area"].reshape(ny, nx)
+    # Use precipitation-weighted discharge when runoff_map is supplied!
+    da = (
+        mg.at_node["surface_water__discharge"].reshape(ny, nx)
+        if runoff_map is not None
+        else mg.at_node["drainage_area"].reshape(ny, nx)
+    )
     dep_depth = filled - z_in
 
     # 2. Extract real flat-surfaced lakes using 8-connectivity (matching D8 flow) on the full
@@ -756,50 +838,89 @@ def export_fastscape_world() -> dict:
 
 
 def export_terrain_diffusion_world() -> dict | None:
-    """Export Terrain Diffusion 30m DEM + WorldClim climate through our Landlab hydrology pipeline."""
+    """
+    Export high-resolution 1024x1024 Terrain Diffusion 30m DEM + WorldClim climate
+    with walking-scale micro-detail refinement, precipitation-weighted Landlab Barnes
+    lake-to-sea hydrology, and real climate texture export.
+    """
     src = Path("out/terrain-diffusion")
-    elev_path = src / "elev_512.f32"
+    elev_path = src / "elev_latest.f32"
+    if not elev_path.exists():
+        elev_path = src / "elev_512.f32"
     if not elev_path.exists():
         return None
 
-    print("Solving physical hydrology for terrain_diffusion...")
+    print("Solving micro-detail + climate-weighted hydrology for terrain_diffusion...")
     raw = np.fromfile(elev_path, dtype=np.float32)
     n = int(round(np.sqrt(raw.size)))
-    elev = raw.reshape(n, n)
-    elev = resample_array(elev, VIEWER_SIZE, is_mask=False).astype(np.float32)
+    grid_size = 1024 if n >= 1024 else VIEWER_SIZE
+    elev = resample_array(raw.reshape(n, n), grid_size, is_mask=False).astype(np.float32)
 
-    # Preserve authentic mountain slope geometry scaled to walkable 2.6 km game region
-    world_span_m = 2600.0
+    # Larger 4.8 km x 4.8 km playable peninsula (4.7 m/px) with dramatic 365 m alpine summits
+    world_span_m = 4800.0 if grid_size >= 1024 else 2600.0
+    max_elev_target = 365.0 if grid_size >= 1024 else 285.0
     max_land = max(float(elev.max()), 1.0)
-    scale_land = 285.0 / max_land
-    # Gently compress abyssal ocean depth to -35m while preserving coastal shelf gradient
+    scale_land = max_elev_target / max_land
     elev_scaled = np.where(
         elev >= 0.0,
         elev * scale_land,
-        np.maximum(elev * (scale_land * 0.55), -35.0),
+        np.maximum(elev * (scale_land * 0.45), -40.0),
     ).astype(np.float32)
 
+    # Stage 2: Walking-scale micro-detail refinement (ridged cliff crags + Fastscapelib gullies)
+    elev_refined = apply_micro_detail_refinement(elev_scaled, world_span_m=world_span_m, seed=42)
+
+    # Load WorldClim climate channels (elevation-adjusted temp C & annual precip mm/yr)
+    clim_path = src / "climate_latest.npz"
+    if not clim_path.exists():
+        clim_path = src / "climate_512.npz"
+
+    runoff_map = None
+    has_climate = False
+    temp_range = [-12.0, 28.0]
+    precip_range = [0.0, 1200.0]
+
+    if clim_path.exists():
+        clim = np.load(clim_path)
+        temp_c = resample_array(clim["temp"].astype(np.float32), grid_size, is_mask=False)
+        precip_mm = np.maximum(
+            resample_array(clim["precip"].astype(np.float32), grid_size, is_mask=False),
+            0.0,
+        )
+        t_season = resample_array(clim["temp_season"].astype(np.float32), grid_size, is_mask=False)
+
+        # Weight Landlab river discharge by real WorldClim precipitation (0.35x dry -> 1.85x wet)
+        p_med = max(float(np.median(precip_mm[elev_refined > 0])), 120.0)
+        runoff_map = np.clip(precip_mm / p_med, 0.35, 1.85).astype(np.float32)
+
+        # Pack climate RGBA8: R=temp [-12..28C], G=precip [0..1200mm], B=seasonality, A=255
+        t_u8 = np.clip((temp_c - temp_range[0]) / (temp_range[1] - temp_range[0]) * 255.0, 0, 255).astype(np.uint8)
+        p_u8 = np.clip((precip_mm - precip_range[0]) / (precip_range[1] - precip_range[0]) * 255.0, 0, 255).astype(np.uint8)
+        s_u8 = np.clip(t_season / max(float(np.percentile(t_season, 98)), 1.0) * 255.0, 0, 255).astype(np.uint8)
+        clim_rgba = np.stack([t_u8, p_u8, s_u8, np.full((grid_size, grid_size), 255, dtype=np.uint8)], axis=-1)
+        clim_rgba.tofile(OUT_DIR / "terrain_diffusion.climate.u8")
+        has_climate = True
+
+        # Moisture channel also reflects precipitation + riparian wetness
+        p_lo, p_hi = float(np.percentile(precip_mm, 5)), float(np.percentile(precip_mm, 95))
+        moisture = np.clip(0.22 + 0.72 * (precip_mm - p_lo) / max(p_hi - p_lo, 1.0), 0.12, 0.96)
+    else:
+        moisture = np.full((grid_size, grid_size), 0.65, dtype=np.float32)
+
+    # Stage 3: Landlab Barnes Lake-Spillway-to-Sea Hydrology weighted by precipitation!
+    res_scale = (grid_size / 512.0) ** 2
     carved, riv_u8, lak_u8, lakes_data, rivers_data = solve_physical_hydrology(
-        elev=elev_scaled,
+        elev=elev_refined,
         world_span_m=world_span_m,
-        min_lake_cells=22,
-        min_lake_depth_m=0.40,
-        max_spring_rivers=18,
+        min_lake_cells=int(round(26 * res_scale)),
+        min_lake_depth_m=0.55,
+        max_spring_rivers=24 if grid_size >= 1024 else 18,
+        runoff_map=runoff_map,
     )
     curv_u8 = compute_curvature_ao(carved)
 
-    # Drive vegetation moisture directly from Terrain Diffusion's WorldClim precipitation!
-    clim_path = src / "climate_512.npz"
-    if clim_path.exists():
-        clim = np.load(clim_path)
-        precip = resample_array(clim["precip"].astype(np.float32), VIEWER_SIZE, is_mask=False)
-        p_lo, p_hi = float(np.percentile(precip, 5)), float(np.percentile(precip, 95))
-        moisture = np.clip(0.38 + 0.55 * (precip - p_lo) / max(p_hi - p_lo, 1.0), 0.18, 0.95)
-    else:
-        moisture = np.full((VIEWER_SIZE, VIEWER_SIZE), 0.65, dtype=np.float32)
-
     wet_seed = np.clip((riv_u8.astype(np.float32) + lak_u8.astype(np.float32)) / 255.0, 0.0, 1.0)
-    moisture = np.clip(moisture + gaussian_filter(wet_seed, sigma=8.0) * 0.85, 0.14, 1.0)
+    moisture = np.clip(moisture + gaussian_filter(wet_seed, sigma=10.0) * 0.85, 0.10, 1.0)
 
     masks = np.stack([riv_u8, lak_u8, curv_u8, (moisture * 255.0).astype(np.uint8)], axis=-1)
     carved.astype(np.float32).tofile(OUT_DIR / "terrain_diffusion.height.f32")
@@ -810,13 +931,16 @@ def export_terrain_diffusion_world() -> dict | None:
     landmarks = find_landmarks(carved, riv_u8, lak_u8, lakes_data, rivers_data, world_span_m)
     meta = {
         "id": "terrain_diffusion",
-        "title": "AI Earth Coast (Terrain Diffusion 30m)",
-        "subtitle": "InfiniteDiffusion 30m DEM + WorldClim + Landlab Lake-to-Sea Hydrology",
-        "size": VIEWER_SIZE,
+        "title": "AI Earth Peninsula 4.8km (Terrain Diffusion 30m)",
+        "subtitle": "InfiniteDiffusion 30m (pool=2) + Micro-Erosion + WorldClim Biomes + Landlab Hydrology",
+        "size": grid_size,
         "worldSpan": world_span_m,
         "minElev": round(float(carved.min()), 2),
         "maxElev": round(float(carved.max()), 2),
         "seaLevel": 0.0,
+        "hasClimate": has_climate,
+        "tempRange": temp_range,
+        "precipRange": precip_range,
         "riverCount": len(rivers_data),
         "lakeCount": len(lakes_data),
         "landmarks": landmarks,

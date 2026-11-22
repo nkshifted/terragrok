@@ -50,6 +50,7 @@ let grassObj = null;
 let propsGroup = null;
 let heightFloatTex = null;
 let maskTex = null;
+let climateTex = null;
 
 // ---------- Settings ----------
 const state = {
@@ -168,7 +169,7 @@ canvas.addEventListener(
   (e) => {
     e.preventDefault();
     if (state.camMode === 'diorama') {
-      camRig.dioramaDist = THREE.MathUtils.clamp(camRig.dioramaDist * (1 + e.deltaY * 0.001), 160, 2200);
+      camRig.dioramaDist = THREE.MathUtils.clamp(camRig.dioramaDist * (1 + e.deltaY * 0.001), 160, 5200);
     } else if (state.camMode === 'third') {
       camRig.dist = THREE.MathUtils.clamp(camRig.dist * (1 + e.deltaY * 0.001), 8, 120);
     }
@@ -224,6 +225,16 @@ function sampleMasks(x, z) {
   };
 }
 
+function sampleClimate(x, z) {
+  if (!world || !world.meta.hasClimate || !world.climate) return null;
+  const { size, tempRange, precipRange } = world.meta;
+  const { u, v } = worldToGrid(x, z);
+  const idx = (Math.round(v) * size + Math.round(u)) * 4;
+  const tempC = tempRange[0] + (world.climate[idx] / 255) * (tempRange[1] - tempRange[0]);
+  const precipMm = precipRange[0] + (world.climate[idx + 1] / 255) * (precipRange[1] - precipRange[0]);
+  return { tempC, precipMm };
+}
+
 // ---------- Dispose Helper ----------
 function disposeWorldScene() {
   if (terrainMesh) {
@@ -272,6 +283,10 @@ function disposeWorldScene() {
     maskTex.dispose();
     maskTex = null;
   }
+  if (climateTex) {
+    climateTex.dispose();
+    climateTex = null;
+  }
 }
 
 // ---------- Load World ----------
@@ -279,19 +294,24 @@ async function loadWorld(worldId) {
   const loader = document.getElementById('loading');
   loader.classList.remove('hidden');
 
-  const [meta, heightBuf, maskBuf, splines, lakes] = await Promise.all([
-    fetch(`/worlds/${worldId}.json`).then((r) => r.json()),
+  const meta = await fetch(`/worlds/${worldId}.json`).then((r) => r.json());
+  const fetches = [
     fetch(`/worlds/${worldId}.height.f32`).then((r) => r.arrayBuffer()),
     fetch(`/worlds/${worldId}.masks.u8`).then((r) => r.arrayBuffer()),
     fetch(`/worlds/${worldId}.rivers.json`).then((r) => r.json()),
     fetch(`/worlds/${worldId}.lakes.json`).then((r) => r.json()),
-  ]);
+  ];
+  if (meta.hasClimate) {
+    fetches.push(fetch(`/worlds/${worldId}.climate.u8`).then((r) => r.arrayBuffer()));
+  }
+  const [heightBuf, maskBuf, splines, lakes, climateBuf] = await Promise.all(fetches);
 
   disposeWorldScene();
 
   const heights = new Float32Array(heightBuf);
   const masks = new Uint8Array(maskBuf);
-  world = { meta, heights, masks, splines, lakes };
+  const climate = climateBuf ? new Uint8Array(climateBuf) : null;
+  world = { meta, heights, masks, climate, splines, lakes };
 
   document.getElementById('world-subtitle').textContent = `${meta.subtitle} · ${lakes.length} lakes, ${splines.length} rivers`;
   const sel = document.getElementById('world-select');
@@ -299,8 +319,7 @@ async function loadWorld(worldId) {
 
   const { size, worldSpan, maxElev } = meta;
 
-  // Float32 height texture (used by mountain shadow raymarch, ocean foam, and 48K GPU grass!)
-  // Use NearestFilter if float linear isn't supported; check WebGL2 extension automatically
+  // Float32 height texture (full 512 or 1024 resolution for shadows, ocean foam, lakes & grass!)
   const hasFloatLinear = renderer.extensions.has('OES_texture_float_linear');
   heightFloatTex = new THREE.DataTexture(heights, size, size, THREE.RedFormat, THREE.FloatType);
   heightFloatTex.flipY = true;
@@ -315,20 +334,61 @@ async function loadWorld(worldId) {
   maskTex.magFilter = THREE.LinearFilter;
   maskTex.needsUpdate = true;
 
-  // 1. Terrain Mesh
-  const geo = new THREE.PlaneGeometry(worldSpan, worldSpan, size - 1, size - 1);
+  // Climate texture (WorldClim R=temp, G=precip, B=seasonality) or 1x1 neutral fallback
+  if (climate) {
+    climateTex = new THREE.DataTexture(climate, size, size, THREE.RGBAFormat, THREE.UnsignedByteType);
+  } else {
+    climateTex = new THREE.DataTexture(new Uint8Array([128, 128, 128, 255]), 1, 1, THREE.RGBAFormat, THREE.UnsignedByteType);
+  }
+  climateTex.flipY = true;
+  climateTex.minFilter = THREE.LinearFilter;
+  climateTex.magFilter = THREE.LinearFilter;
+  climateTex.needsUpdate = true;
+
+  // 1. Terrain Mesh (cap geometry grid at 512x512 for locked 60 FPS even on 1024x1024 worlds!)
+  const meshVerts = Math.min(size, 512);
+  const geo = new THREE.PlaneGeometry(worldSpan, worldSpan, meshVerts - 1, meshVerts - 1);
   geo.rotateX(-Math.PI / 2);
   const posAttr = geo.attributes.position;
-  for (let i = 0; i < heights.length; i++) {
-    posAttr.setY(i, heights[i]);
+  if (meshVerts === size) {
+    for (let i = 0; i < heights.length; i++) {
+      posAttr.setY(i, heights[i]);
+    }
+  } else {
+    for (let vy = 0; vy < meshVerts; vy++) {
+      const fy = (vy / (meshVerts - 1)) * (size - 1);
+      const y0 = Math.floor(fy);
+      const y1 = Math.min(y0 + 1, size - 1);
+      const ty = fy - y0;
+      for (let vx = 0; vx < meshVerts; vx++) {
+        const fx = (vx / (meshVerts - 1)) * (size - 1);
+        const x0 = Math.floor(fx);
+        const x1 = Math.min(x0 + 1, size - 1);
+        const tx = fx - x0;
+        const a = heights[y0 * size + x0] * (1 - tx) + heights[y0 * size + x1] * tx;
+        const b = heights[y1 * size + x0] * (1 - tx) + heights[y1 * size + x1] * tx;
+        posAttr.setY(vy * meshVerts + vx, a * (1 - ty) + b * ty);
+      }
+    }
   }
   geo.computeVertexNormals();
 
-  terrainMat = createTerrainMaterial(maskTex, heightFloatTex, worldSpan, maxElev, size);
+  terrainMat = createTerrainMaterial(
+    maskTex,
+    heightFloatTex,
+    worldSpan,
+    maxElev,
+    size,
+    climateTex,
+    Boolean(meta.hasClimate),
+    meta.tempRange || [-12.0, 28.0],
+    meta.precipRange || [0.0, 1200.0]
+  );
   terrainMat.uniforms.uVScale.value = state.vScale;
   terrainMesh = new THREE.Mesh(geo, terrainMat);
   terrainMesh.scale.y = state.vScale;
   scene.add(terrainMesh);
+  syncFogDensity();
 
   // 2. Ocean Water Plane
   const waterGeo = new THREE.PlaneGeometry(worldSpan * 1.6, worldSpan * 1.6, 128, 128);
@@ -350,6 +410,7 @@ async function loadWorld(worldId) {
     lakeObj.material.uniforms.uVScale.value = state.vScale;
     scene.add(lakeObj.mesh);
   }
+  syncFogDensity();
 
   // 4. GPU-Instanced 48,000-Blade Wind-Swaying 3D Grass Ring
   grassObj = createGrassField(heightFloatTex, maskTex, worldSpan, maxElev, 48000, 155.0);
@@ -390,6 +451,17 @@ function teleportTo(landmarkKey) {
   }
 }
 
+function syncFogDensity() {
+  const span = world?.meta?.worldSpan || 2400;
+  const spanFactor = Math.min(2400 / Math.max(span, 2400), 1.0);
+  const baseFog = 0.00044 * (0.62 + 0.38 * spanFactor);
+  const fogVal = state.camMode === 'diorama' ? baseFog * 0.24 : baseFog;
+  if (terrainMat) terrainMat.uniforms.uFogDensity.value = fogVal;
+  if (waterMat) waterMat.uniforms.uFogDensity.value = fogVal;
+  if (riverObj) riverObj.material.uniforms.uFogDensity.value = fogVal;
+  if (lakeObj) lakeObj.material.uniforms.uFogDensity.value = fogVal;
+}
+
 function setCameraMode(mode) {
   state.camMode = mode;
   document.querySelectorAll('[data-cam]').forEach((b) => b.classList.toggle('active', b.dataset.cam === mode));
@@ -410,6 +482,7 @@ function setCameraMode(mode) {
     explorer.scale.setScalar(1.0);
   }
   camera.updateProjectionMatrix();
+  syncFogDensity();
   if (grassObj) grassObj.mesh.visible = state.styleMode === 0 && mode !== 'diorama';
   updatePropsTransform(propsGroup, state.vScale, mode === 'diorama');
   syncPresetPills();
@@ -558,6 +631,7 @@ const clock = new THREE.Clock();
 const elActivity = document.getElementById('stat-activity');
 const elElev = document.getElementById('stat-elev');
 const elSlope = document.getElementById('stat-slope');
+const elTemp = document.getElementById('stat-temp');
 const elZone = document.getElementById('stat-zone');
 
 function updateMovement(dt) {
@@ -674,10 +748,14 @@ function updateTelemetry() {
   const elev = sampleHeight(pt.x, pt.z);
   const slope = sampleSlopeDeg(pt.x, pt.z);
   const m = sampleMasks(pt.x, pt.z);
+  const clim = sampleClimate(pt.x, pt.z);
   const hNorm = elev / Math.max(world.meta.maxElev * state.vScale, 1);
 
   elElev.textContent = `${Math.round(elev)} m`;
   elSlope.textContent = `${Math.round(slope)}°`;
+  if (elTemp) {
+    elTemp.textContent = clim ? `${Math.round(clim.tempC)}°C` : '—';
+  }
   elActivity.textContent = player.activity;
   elActivity.className = 'v badge';
   if (player.activity === 'CLIMBING') elActivity.classList.add('climbing');
@@ -688,11 +766,21 @@ function updateTelemetry() {
   if (elev <= 0.5) zone = 'Ocean Shallows';
   else if (m.river > 0.35) zone = 'River Valley';
   else if (m.lake > 0.4) zone = 'Highland Lake';
-  else if (hNorm > 0.65) zone = 'Alpine Summit';
-  else if (slope > 28) zone = 'Mountain Cliff';
-  else if (elev < 8) zone = 'Sandy Coast';
-  else if (m.moisture < 0.38) zone = 'Arid Steppe';
-  else if (m.moisture > 0.64) zone = 'Woodland Valley';
+  else if (clim) {
+    if (clim.tempC < 1.2) zone = 'Glacial Alpine';
+    else if (slope > 28) zone = 'Mountain Cliff';
+    else if (elev < 8) zone = 'Sandy Coast';
+    else if (clim.tempC < 6.5) zone = 'Boreal Highlands';
+    else if (clim.tempC > 11 && clim.precipMm < 260) zone = 'Warm Dry Steppe';
+    else if (clim.precipMm > 340) zone = 'Temperate Forest';
+    else zone = 'Coastal Meadow';
+  } else {
+    if (hNorm > 0.65) zone = 'Alpine Summit';
+    else if (slope > 28) zone = 'Mountain Cliff';
+    else if (elev < 8) zone = 'Sandy Coast';
+    else if (m.moisture < 0.38) zone = 'Arid Steppe';
+    else if (m.moisture > 0.64) zone = 'Woodland Valley';
+  }
   elZone.textContent = zone;
 }
 

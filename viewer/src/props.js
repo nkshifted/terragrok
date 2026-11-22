@@ -10,9 +10,12 @@ import * as THREE from 'three';
  */
 export function buildWorldProps(worldData, vScale = 1.0) {
   const group = new THREE.Group();
-  const { size, worldSpan, maxElev } = worldData.meta;
-  const { heights, masks } = worldData;
+  const { size, worldSpan, maxElev, hasClimate, tempRange, precipRange } = worldData.meta;
+  const { heights, masks, climate } = worldData;
   const cellSize = worldSpan / (size - 1);
+  const spanFactor = Math.min(Math.max(worldSpan / 2400, 1.0), 2.1);
+  const maxTrees = Math.round(5200 * spanFactor);
+  const maxRocks = Math.round(3400 * spanFactor);
 
   let s = 4242;
   const rand = () => {
@@ -28,9 +31,9 @@ export function buildWorldProps(worldData, vScale = 1.0) {
   const spx = pl ? (pl[0] - 0.5) * worldSpan : 99999;
   const spz = pl ? (pl[1] - 0.5) * worldSpan : 99999;
 
-  // --- Scatter Trees ---
+  // --- Scatter Trees (climate-driven timberline & species!) ---
   let attempts = 0;
-  while (pines.length + broadleafs.length < 5200 && attempts < 70000) {
+  while (pines.length + broadleafs.length < maxTrees && attempts < maxTrees * 16) {
     attempts++;
     const gx = Math.floor(rand() * (size - 4)) + 2;
     const gy = Math.floor(rand() * (size - 4)) + 2;
@@ -42,23 +45,43 @@ export function buildWorldProps(worldData, vScale = 1.0) {
     const moisture = masks[mIdx + 3] / 255;
 
     const hNorm = elev / Math.max(maxElev, 1);
-    if (elev < 5.5 || hNorm > 0.56 || lake > 0.2 || river > 0.26) continue;
-    if (rand() > THREE.MathUtils.smoothstep(moisture, 0.25, 0.72) * 0.90) continue;
+    if (elev < 5.5 || lake > 0.2 || river > 0.26) continue;
+
+    let tempC = 14.0 - hNorm * 18.0;
+    let precipNorm = moisture;
+    if (hasClimate && climate) {
+      tempC = tempRange[0] + (climate[mIdx] / 255) * (tempRange[1] - tempRange[0]);
+      const pMm = precipRange[0] + (climate[mIdx + 1] / 255) * (precipRange[1] - precipRange[0]);
+      precipNorm = Math.min(Math.max(pMm / 650, 0), 1);
+      // Natural freezing timberline (~1.8 C) & dry steppe thinning
+      if (tempC < 1.8) continue;
+      const treeProb = THREE.MathUtils.smoothstep(Math.max(precipNorm, moisture * 0.85), 0.14, 0.65) * 0.92;
+      if (rand() > treeProb) continue;
+    } else {
+      if (hNorm > 0.56) continue;
+      if (rand() > THREE.MathUtils.smoothstep(moisture, 0.25, 0.72) * 0.90) continue;
+    }
 
     const dzx = (heights[idx + 1] - heights[idx - 1]) / (2 * cellSize);
     const dzy = (heights[idx + size] - heights[idx - size]) / (2 * cellSize);
     const slopeDeg = THREE.MathUtils.radToDeg(Math.atan(Math.hypot(dzx, dzy)));
-    if (slopeDeg > 26) continue;
+    if (slopeDeg > 27) continue;
 
     const wx = (gx / (size - 1) - 0.5) * worldSpan + (rand() - 0.5) * cellSize;
     const wz = (gy / (size - 1) - 0.5) * worldSpan + (rand() - 0.5) * cellSize;
     if (Math.hypot(wx - spx, wz - spz) < 20) continue;
 
-    const scale = (0.72 + rand() * 0.78) * (1.0 - hNorm * 0.42);
+    const scale = (0.72 + rand() * 0.78) * (1.0 - hNorm * 0.38);
     const item = { wx, wz, baseElev: elev, scale, moisture, hNorm, rotY: rand() * Math.PI * 2 };
 
-    // Warm moist lowlands get broadleaf trees; higher/cooler slopes get multi-tier pines
-    if (hNorm < 0.26 && moisture > 0.48 && rand() < 0.55) {
+    // Warm moist zones get lush broadleafs; cool/boreal slopes get multi-tier conifers
+    if (hasClimate && climate) {
+      if (tempC > 8.5 && Math.max(precipNorm, moisture) > 0.36 && rand() < 0.64) {
+        broadleafs.push(item);
+      } else {
+        pines.push(item);
+      }
+    } else if (hNorm < 0.26 && moisture > 0.48 && rand() < 0.55) {
       broadleafs.push(item);
     } else {
       pines.push(item);
@@ -67,7 +90,7 @@ export function buildWorldProps(worldData, vScale = 1.0) {
 
   // --- Scatter Craggy Boulders (Cliff bases, mountain ridges & riverbanks!) ---
   attempts = 0;
-  while (rocks.length < 3400 && attempts < 75000) {
+  while (rocks.length < maxRocks && attempts < maxRocks * 22) {
     attempts++;
     const gx = Math.floor(rand() * (size - 4)) + 2;
     const gy = Math.floor(rand() * (size - 4)) + 2;

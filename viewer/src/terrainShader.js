@@ -14,11 +14,25 @@ import * as THREE from 'three';
  *     1 = Faceted Diorama (Crisp Low-Poly Miniature)
  *     2 = Topographic Atlas (Elevation Contours + Cliff Slope Map + Rivers)
  */
-export function createTerrainMaterial(maskTex, heightFloatTex, worldSpan, maxElev, gridSize) {
+export function createTerrainMaterial(
+  maskTex,
+  heightFloatTex,
+  worldSpan,
+  maxElev,
+  gridSize,
+  climateTex = null,
+  hasClimate = false,
+  tempRange = [-12.0, 28.0],
+  precipRange = [0.0, 1200.0]
+) {
   return new THREE.ShaderMaterial({
     uniforms: {
       uMasks: { value: maskTex },
       uHeightTex: { value: heightFloatTex },
+      uClimate: { value: climateTex },
+      uHasClimate: { value: hasClimate ? 1 : 0 },
+      uTempRange: { value: new THREE.Vector2(tempRange[0], tempRange[1]) },
+      uPrecipRange: { value: new THREE.Vector2(precipRange[0], precipRange[1]) },
       uWorldSpan: { value: worldSpan },
       uGridSize: { value: gridSize },
       uSunDir: { value: new THREE.Vector3(0.65, 0.45, 0.45).normalize() },
@@ -48,6 +62,10 @@ export function createTerrainMaterial(maskTex, heightFloatTex, worldSpan, maxEle
     fragmentShader: /* glsl */ `
       uniform sampler2D uMasks;
       uniform sampler2D uHeightTex;
+      uniform sampler2D uClimate;
+      uniform int uHasClimate;
+      uniform vec2 uTempRange;
+      uniform vec2 uPrecipRange;
       uniform float uWorldSpan;
       uniform float uGridSize;
       uniform vec3 uSunDir;
@@ -199,25 +217,48 @@ export function createTerrainMaterial(maskTex, heightFloatTex, worldSpan, maxEle
         float midNoise = fbm3(vWorldPos.xz * 0.045);
         float fineNoise = vnoise(vWorldPos.xz * 0.35);
 
-        // --- Rich Natural Albedo Palette ---
+        // --- Rich Natural Albedo Palette (Climate-Driven when WorldClim data is present!) ---
         vec3 seabed     = vec3(0.08, 0.19, 0.28);
         vec3 wetSand    = vec3(0.55, 0.49, 0.36);
         vec3 drySand    = vec3(0.82, 0.75, 0.56);
-        vec3 aridSteppe = vec3(0.68, 0.61, 0.39);
+        vec3 aridSteppe = vec3(0.71, 0.62, 0.38);
+        vec3 warmScrub  = vec3(0.56, 0.55, 0.30);
         vec3 meadow     = vec3(0.30, 0.51, 0.22);
-        vec3 lushMoss   = vec3(0.18, 0.38, 0.18);
-        vec3 alpineTund = vec3(0.41, 0.44, 0.31);
+        vec3 lushMoss   = vec3(0.16, 0.37, 0.18);
+        vec3 borealPine = vec3(0.19, 0.31, 0.19);
+        vec3 alpineTund = vec3(0.42, 0.44, 0.32);
 
-        // Layered sedimentary rock colors
-        vec3 rockDark   = vec3(0.25, 0.25, 0.27);
-        vec3 rockWarm   = vec3(0.46, 0.41, 0.35);
-        vec3 rockSlate  = vec3(0.38, 0.41, 0.45);
+        // Layered sedimentary & granite rock colors
+        vec3 rockDark   = vec3(0.24, 0.24, 0.27);
+        vec3 rockWarm   = vec3(0.52, 0.43, 0.33);
+        vec3 rockSlate  = vec3(0.37, 0.41, 0.46);
         vec3 snowCol    = vec3(0.95, 0.97, 1.00);
 
-        // Grass blends dry steppe -> sunlit meadow -> lush valley moss -> alpine tundra
-        vec3 grassCol = mix(aridSteppe, meadow, smoothstep(0.22, 0.56, moisture));
-        grassCol = mix(grassCol, lushMoss, smoothstep(0.62, 0.90, moisture));
-        grassCol = mix(grassCol, alpineTund, smoothstep(0.42, 0.72, hNorm));
+        float tempC = 14.0 - hNorm * 18.0;
+        float precipNorm = moisture;
+        if (uHasClimate == 1) {
+          vec4 cl = texture2D(uClimate, vUv);
+          tempC = mix(uTempRange.x, uTempRange.y, cl.r);
+          float precipMm = mix(uPrecipRange.x, uPrecipRange.y, cl.g);
+          precipNorm = clamp(precipMm / 650.0, 0.0, 1.0);
+        }
+
+        // Biome ground blend driven by temperature + precipitation + riparian wetness
+        float effMoist = clamp(mix(moisture, precipNorm, uHasClimate == 1 ? 0.55 : 0.0) + riverWet * 0.45, 0.0, 1.0);
+        vec3 warmGround = mix(aridSteppe, warmScrub, smoothstep(0.18, 0.48, effMoist));
+        vec3 lushGround = mix(meadow, lushMoss, smoothstep(0.52, 0.88, effMoist));
+        vec3 grassCol = mix(warmGround, lushGround, smoothstep(0.30, 0.65, effMoist));
+        if (uHasClimate == 1) {
+          // Warm dry lowlands stay sun-baked golden steppe; cool slopes shift boreal -> tundra
+          float warmDry = smoothstep(9.0, 17.0, tempC) * (1.0 - smoothstep(0.18, 0.50, precipNorm));
+          grassCol = mix(grassCol, aridSteppe * 1.04, warmDry * 0.72);
+          float coolBoreal = (1.0 - smoothstep(2.0, 9.5, tempC)) * smoothstep(0.25, 0.65, effMoist);
+          grassCol = mix(grassCol, borealPine, coolBoreal * 0.62);
+          float coldTundra = 1.0 - smoothstep(0.5, 4.5, tempC);
+          grassCol = mix(grassCol, alpineTund, coldTundra * 0.75);
+        } else {
+          grassCol = mix(grassCol, alpineTund, smoothstep(0.42, 0.72, hNorm));
+        }
         // Natural soil & clover mottling at 3 scales (breaks up flat green)
         grassCol = mix(grassCol * 0.80, grassCol * 1.15, macroNoise * 0.55 + midNoise * 0.30 + fineNoise * 0.15);
 
@@ -226,9 +267,10 @@ export function createTerrainMaterial(maskTex, heightFloatTex, worldSpan, maxEle
         vec3 albedo = mix(seabed, sandCol, smoothstep(-5.0, 0.8, elev));
         albedo = mix(albedo, grassCol, smoothstep(2.4, 8.5, elev));
 
-        // Detailed stratified rock on slopes & high peaks
+        // Detailed stratified rock on slopes & high peaks (warmer sandstone in warm dry zones, slate in cold alpine)
         float strataBand = rockPattern(vec2(vWorldPos.x * 0.08 + vWorldPos.z * 0.08, vWorldPos.y * 0.14));
-        vec3 rockCol = mix(rockWarm, rockSlate, smoothstep(0.30, 0.78, hNorm));
+        float coldRockT = (uHasClimate == 1) ? (1.0 - smoothstep(0.0, 14.0, tempC)) : smoothstep(0.30, 0.78, hNorm);
+        vec3 rockCol = mix(rockWarm, rockSlate, coldRockT);
         rockCol = mix(rockDark, rockCol * 1.16, strataBand);
         // Darken rock crevices using fine rock noise + cavity AO
         rockCol *= (0.72 + 0.42 * curvAO);
@@ -236,9 +278,16 @@ export function createTerrainMaterial(maskTex, heightFloatTex, worldSpan, maxEle
         float screeMask = clamp(rockMask + smoothstep(0.58, 0.82, hNorm) * 0.65, 0.0, 1.0);
         albedo = mix(albedo, rockCol, screeMask);
 
-        // Snow accumulation (clings to upper ledges & gullies, sheds off vertical cliffs)
-        float snowLine = 0.62 + (macroNoise - 0.5) * 0.10 + (1.0 - moisture) * 0.06;
-        float snowMask = smoothstep(snowLine, snowLine + 0.13, hNorm) * (1.0 - smoothstep(0.18, 0.36, baseSlope));
+        // Snow accumulation (follows real 0..2°C freezing isotherm when climate is available!)
+        float snowMask = 0.0;
+        if (uHasClimate == 1) {
+          float freezeT = 1.6 + (macroNoise - 0.5) * 2.2 + precipNorm * 1.4;
+          snowMask = (1.0 - smoothstep(freezeT - 2.6, freezeT, tempC)) * smoothstep(20.0, 65.0, elev);
+          snowMask *= (1.0 - smoothstep(0.20, 0.40, baseSlope));
+        } else {
+          float snowLine = 0.62 + (macroNoise - 0.5) * 0.10 + (1.0 - moisture) * 0.06;
+          snowMask = smoothstep(snowLine, snowLine + 0.13, hNorm) * (1.0 - smoothstep(0.18, 0.36, baseSlope));
+        }
         albedo = mix(albedo, snowCol, snowMask);
 
         // Wet riverbanks & gravel bed under the 3D flowing river ribbons
