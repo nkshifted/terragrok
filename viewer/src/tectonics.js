@@ -712,11 +712,13 @@ function runSphericalHydrology(N, heights, precip, masksOut) {
     }
   }
 
-  // Accumulate precipitation-weighted flow in exact upstream->downstream topological order!
+  // Accumulate climate-gated liquid runoff in exact upstream->downstream topological order!
+  // Dry deserts and frozen glaciers contribute 0.0 local runoff so they stay river-free
+  // (exotic rivers can still traverse desert edges if fed by wet highland headwaters).
   const flowAcc = new Float32Array(total);
   for (let i = 0; i < total; i++) {
     if (heights[i] > 0) {
-      flowAcc[i] = 0.25 + precip[i] * 1.5;
+      flowAcc[i] = precip[i] * 2.0;
     }
   }
   for (let k = orderLen - 1; k >= 0; k--) {
@@ -735,7 +737,7 @@ function runSphericalHydrology(N, heights, precip, masksOut) {
     const h = heights[i];
     const lakeDepth = h > 0 ? filled[i] - h : 0;
     let isLake = 0;
-    if (h > 48.0 && lakeDepth > 38.0 && flowAcc[i] > 12.0) {
+    if (h > 48.0 && lakeDepth > 38.0 && flowAcc[i] > 14.0 && precip[i] > 0.08) {
       isLake = Math.min(255, Math.round(150 + Math.min(105, (lakeDepth - 30) * 2.2)));
       // Raise lake surface slightly to flat spillway elevation
       heights[i] = filled[i] - 0.1;
@@ -846,6 +848,7 @@ function analyzeContinents(N, heights) {
 export function generateTectonicPlanet({
   seed = 42,
   archetype = 'auto',
+  climateMode = 'earth',
   faceSize = 128,
   radius = 3000,
   plateCount = null,
@@ -1095,6 +1098,11 @@ export function generateTectonicPlanet({
     return heights[m.faceIdx * N2 + r * N + c];
   }
 
+  // Climate preset offsets: Earth Varied | Arid Dune World | Frozen Ice World | Lush Tropical
+  const climTempBias = climateMode === 'arid' ? 7.5 : climateMode === 'frozen' ? -15.5 : climateMode === 'lush' ? 4.0 : 0.0;
+  const climMoistBias = climateMode === 'arid' ? -0.32 : climateMode === 'frozen' ? -0.10 : climateMode === 'lush' ? 0.24 : 0.0;
+  const liquidRunoff = new Float32Array(total);
+
   for (let i = 0; i < total; i++) {
     const x = unitX[i];
     const y = unitY[i];
@@ -1104,8 +1112,8 @@ export function generateTectonicPlanet({
     const latDeg = Math.asin(Math.min(1, absLat)) * (180 / Math.PI);
 
     // Latitude + elevation lapse rate temperature (°C)
-    const regionalTempNoise = nCrust.fbm(x * 2.5 + 14.2, y * 2.5 - 3.1, z * 2.5 + 7.4, 2) * 3.8;
-    const seaTemp = 28.5 - Math.pow(absLat, 1.38) * 44.5 + regionalTempNoise;
+    const regionalTempNoise = nCrust.fbm(x * 2.5 + 14.2, y * 2.5 - 3.1, z * 2.5 + 7.4, 2) * 4.2;
+    const seaTemp = 29.0 - Math.pow(absLat, 1.32) * 47.0 + regionalTempNoise + climTempBias;
     const altDrop = (Math.max(0, h) / Math.max(1, maxElev)) * 21.0; // ~21°C drop on tallest alpine ranges -> snowcapped peaks!
     const tC = seaTemp - altDrop;
     tempC[i] = tC;
@@ -1113,10 +1121,10 @@ export function generateTectonicPlanet({
     // Hadley Cell baseline moisture warped by planetary Rossby waves so deserts NEVER look like horizontal stripes!
     const rossbyWarp = nCrust.fbm(x * 2.1 + 9.4, y * 2.1 - 5.2, z * 2.1 + 3.7, 3) * 14.0;
     const effLatDeg = Math.max(0, Math.min(90, latDeg + rossbyWarp));
-    const tropWet = Math.exp(-Math.pow(effLatDeg / 21.0, 2)) * 0.50;
-    const subtropDry = Math.exp(-Math.pow((effLatDeg - 28.0) / 11.0, 2)) * 0.34;
-    const midLatWet = Math.exp(-Math.pow((effLatDeg - 52.0) / 16.0, 2)) * 0.44;
-    const moistureNoise = nCrust.fbm(x * 3.1 - 7.1, y * 3.1 + 4.3, z * 3.1 - 2.6, 3) * 0.30;
+    const tropWet = Math.exp(-Math.pow(effLatDeg / 19.0, 2)) * 0.48;
+    const subtropDry = Math.exp(-Math.pow((effLatDeg - 27.0) / 13.0, 2)) * 0.44;
+    const midLatWet = Math.exp(-Math.pow((effLatDeg - 54.0) / 15.0, 2)) * 0.40;
+    const moistureNoise = nCrust.fbm(x * 3.1 - 7.1, y * 3.1 + 4.3, z * 3.1 - 2.6, 3) * 0.34;
 
     // Prevailing wind direction: Easterlies (Trades) in tropics (<32°), Westerlies in mid-lats (32°-68°)
     const windSign = latDeg < 32 ? -1 : 1; // +1 = blowing eastward (upwind is west)
@@ -1139,20 +1147,24 @@ export function generateTectonicPlanet({
       const hUp3 = sampleHeightAtDir(u3[0], u3[1], u3[2]);
 
       // Upwind ocean -> lush moist eastern/western windward coasts!
-      if (hUp1 <= 0) coastalHumid += 0.32;
-      else if (hUp2 <= 0) coastalHumid += 0.20;
-      else if (hUp3 <= 0) coastalHumid += 0.08;
-      else coastalHumid -= 0.14; // Deep continental interior continentality (Gobi/Sahara/Outback!)
+      if (hUp1 <= 0) coastalHumid += 0.28;
+      else if (hUp2 <= 0) coastalHumid += 0.16;
+      else if (hUp3 <= 0) coastalHumid += 0.05;
+      else coastalHumid -= 0.22; // Deep continental interior continentality (Gobi/Sahara/Outback!)
 
       // Upwind high mountain barrier -> strong leeward rain shadow desert (Atacama/Patagonia!)
       const barrier = Math.max(hUp1, hUp2) - h;
-      if (barrier > 65) rainShadow -= Math.min(0.48, (barrier - 65) / 360);
+      if (barrier > 60) rainShadow -= Math.min(0.52, (barrier - 60) / 340);
       // Windward slope rising into wind -> orographic rainfall!
-      if (h - hUp1 > 50 && hUp2 < h) rainShadow += Math.min(0.30, (h - hUp1) / 320);
+      if (h - hUp1 > 50 && hUp2 < h) rainShadow += Math.min(0.28, (h - hUp1) / 320);
     }
 
-    const moist = Math.max(0.05, Math.min(1.0, 0.44 + tropWet - subtropDry + midLatWet + coastalHumid + rainShadow + moistureNoise));
+    const moist = Math.max(0.02, Math.min(1.0, 0.31 + tropWet - subtropDry + midLatWet + coastalHumid + rainShadow + moistureNoise + climMoistBias));
     precip[i] = moist;
+    // Physical liquid runoff for spherical rivers: 0 on frozen glaciers (<-3.5°C) and bone-dry deserts (<0.18)!
+    const freezeFrac = Math.max(0, Math.min(1, (tC + 3.5) / 6.0));
+    const aridFrac = Math.max(0, Math.min(1, (moist - 0.18) / 0.72));
+    liquidRunoff[i] = freezeFrac * aridFrac;
 
     // Pack climate RGBA: R=tempNorm [-20..40]->[0..255], G=moisture [0..255], B=orogeny [0..255], A=255
     climateAll[i * 4 + 0] = Math.max(0, Math.min(255, Math.round(((tC + 20) / 60) * 255)));
@@ -1164,8 +1176,8 @@ export function generateTectonicPlanet({
     masksAll[i * 4 + 2] = Math.max(0, Math.min(255, Math.round(128 + boundaryStrength[i] * 120)));
   }
 
-  // Pass 4: Exact Seamless Stitched-Sphere Priority-Flood Rivers & Alpine Lakes!
-  const hydro = runSphericalHydrology(N, heights, precip, masksAll);
+  // Pass 4: Exact Seamless Stitched-Sphere Priority-Flood Rivers & Alpine Lakes (climate-gated!)
+  const hydro = runSphericalHydrology(N, heights, liquidRunoff, masksAll);
 
   // Pass 5: Measure real continent count, island count, and largest landmass centroids!
   const stats = analyzeContinents(N, heights);

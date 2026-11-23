@@ -70,17 +70,20 @@ let atmoMesh = null;
 let explorerGroup = null;
 let homeBeacon = null;
 let targetPatchGroup = null;
+let cachedFootprintsGroup = null;
 
-// Active planet generation settings (also supports ?seed=&archetype= restore from index.html!)
+// Active planet generation settings (also supports ?seed=&archetype=&climate= restore!)
 const urlParams = new URLSearchParams(window.location.search);
 const initialSeed = Number(urlParams.get('seed')) || 523;
 const initialArch = urlParams.get('archetype') || 'earth';
+const initialClimate = urlParams.get('climate') || 'earth';
 const genState = {
   seed: initialSeed, // Starts on a rich multi-continent Earth-like tectonic seed!
   planetNumber: 1,
   archetype: ['auto', 'earth', 'rifting', 'supercontinent', 'archipelago'].includes(initialArch)
     ? initialArch
     : 'earth',
+  climateMode: ['earth', 'arid', 'frozen', 'lush'].includes(initialClimate) ? initialClimate : 'earth',
   seaLevelBias: 0.0,
   reliefScale: 1.0,
   showTectonics: false,
@@ -94,6 +97,8 @@ const stage2 = {
   serverDevice: 'mps',
   synthesizing: false,
   lastResult: null,
+  cachedRegions: [],
+  activeCached: null,
 };
 
 const nav = {
@@ -758,6 +763,278 @@ function rebuildTargetPatchOverlay() {
   scene.add(targetPatchGroup);
 }
 
+function dirFromLatLon(latDeg, lonDeg) {
+  const lat = THREE.MathUtils.degToRad(latDeg);
+  const lon = THREE.MathUtils.degToRad(lonDeg);
+  const cp = Math.cos(lat);
+  return new THREE.Vector3(Math.sin(lon) * cp, Math.sin(lat), Math.cos(lon) * cp).normalize();
+}
+
+function formatWorldCode(seed, archetype) {
+  return archetype === 'auto' ? String(seed) : `${seed}-${archetype}`;
+}
+
+function syncSeedInputAndUrl() {
+  const inp = document.getElementById('inp-seed');
+  if (inp) inp.value = formatWorldCode(genState.seed, genState.archetype);
+  const url = new URL(window.location.href);
+  url.searchParams.set('seed', String(genState.seed));
+  url.searchParams.set('archetype', genState.archetype);
+  if (genState.climateMode && genState.climateMode !== 'earth') {
+    url.searchParams.set('climate', genState.climateMode);
+  } else {
+    url.searchParams.delete('climate');
+  }
+  window.history.replaceState(null, '', `${url.pathname}?${url.searchParams.toString()}`);
+}
+
+function parseAndLoadSeedInput(raw) {
+  const s = String(raw || '').trim();
+  if (!s) return;
+  const validArch = ['auto', 'earth', 'rifting', 'supercontinent', 'archipelago'];
+  let nextSeed = null;
+  let nextArch = genState.archetype;
+
+  const combo = s.match(/^(-?\d+)\s*[-:_/\s]\s*([a-z]+)$/i);
+  if (combo) {
+    nextSeed = Math.abs(parseInt(combo[1], 10)) || 1;
+    const cand = combo[2].toLowerCase();
+    if (validArch.includes(cand)) nextArch = cand;
+  } else if (/^\d+$/.test(s)) {
+    nextSeed = Math.abs(parseInt(s, 10)) || 1;
+  } else {
+    // Deterministic Minecraft-style string hash for named seeds (e.g. "atlantis")
+    let h = 2166136261;
+    for (let i = 0; i < s.length; i++) {
+      h ^= s.charCodeAt(i);
+      h = Math.imul(h, 16777619);
+    }
+    nextSeed = (Math.abs(h >>> 0) % 999998) + 1;
+  }
+
+  genState.archetype = nextArch;
+  const sel = document.getElementById('sel-archetype');
+  if (sel) sel.value = nextArch;
+  genState.planetNumber++;
+  generatePlanetFromState(nextSeed);
+}
+
+function findCachedRegionAtDir(dir) {
+  if (!dir || !stage2.cachedRegions.length) return null;
+  let best = null;
+  let bestSpan = Infinity;
+  for (const reg of stage2.cachedRegions) {
+    const o = reg.planetOrigin;
+    if (!o) continue;
+    const center = dirFromLatLon(o.latDeg, o.lonDeg);
+    // Reject opposite hemisphere immediately
+    if (dir.dot(center) <= 0.1) continue;
+    const { c, east, north } = tangentBasisForDir(center);
+    const halfRad = THREE.MathUtils.degToRad((o.spanDeg || 46) * 0.5);
+    const dotC = dir.dot(c);
+    // Tangent-plane coordinates relative to region center
+    const tx = dir.dot(east) / Math.max(dotC, 0.2);
+    const ty = dir.dot(north) / Math.max(dotC, 0.2);
+    // Slight angular tolerance (1.03x) so clicking right near a gold edge matches cleanly
+    if (Math.abs(tx) <= halfRad * 1.03 && Math.abs(ty) <= halfRad * 1.03) {
+      const sp = o.spanDeg || 46;
+      if (sp < bestSpan) {
+        best = reg;
+        bestSpan = sp;
+      }
+    }
+  }
+  return best;
+}
+
+function updateCachedBanner() {
+  const banner = document.getElementById('stage2-cached-banner');
+  const info = document.getElementById('stage2-cached-info');
+  const link = document.getElementById('btn-open-cached');
+  if (!banner || !info || !link) return;
+
+  const hit = findCachedRegionAtDir(stage2.targetDir);
+  stage2.activeCached = hit;
+  if (!hit) {
+    banner.style.display = 'none';
+    return;
+  }
+  const o = hit.planetOrigin;
+  const latStr = `${Math.abs(o.latDeg).toFixed(0)}°${o.latDeg >= 0 ? 'N' : 'S'}`;
+  const lonStr = `${Math.abs(o.lonDeg).toFixed(0)}°${o.lonDeg >= 0 ? 'E' : 'W'}`;
+  info.innerHTML =
+    `<strong>★ Explored Region Cached: ${latStr} ${lonStr}</strong> (${o.spanDeg || 46}°)<br/>` +
+    `${hit.lakeCount ?? 0} alpine lakes · ${hit.riverCount ?? 0} rivers · ready instantly (0s)`;
+  link.href = `/index.html?world=${encodeURIComponent(hit.id)}`;
+  banner.style.display = 'block';
+}
+
+function rebuildCachedFootprintsOverlay() {
+  if (cachedFootprintsGroup) {
+    scene.remove(cachedFootprintsGroup);
+    cachedFootprintsGroup.traverse((o) => {
+      if (o.geometry) o.geometry.dispose();
+      if (o.material) o.material.dispose();
+    });
+    cachedFootprintsGroup = null;
+  }
+  if (!currentPlanet || !stage2.cachedRegions.length) return;
+
+  const R = currentPlanet.meta.radius;
+  const g = new THREE.Group();
+  const tmp = new THREE.Vector3();
+
+  for (const reg of stage2.cachedRegions) {
+    const o = reg.planetOrigin;
+    if (!o) continue;
+    const center = dirFromLatLon(o.latDeg, o.lonDeg);
+    const { c, east, north } = tangentBasisForDir(center);
+    const halfRad = THREE.MathUtils.degToRad((o.spanDeg || 46) * 0.5);
+
+    // 1. Subtle translucent gold curved patch fill hugging the globe
+    const gridN = 8;
+    const positions = [];
+    const indices = [];
+    for (let r = 0; r <= gridN; r++) {
+      const ty = (0.5 - r / gridN) * 2 * halfRad;
+      for (let col = 0; col <= gridN; col++) {
+        const tx = (col / gridN - 0.5) * 2 * halfRad;
+        projectTangentToUnitDir(c, east, north, tx, ty, tmp);
+        const s = sampleSphereSurface(tmp);
+        const rad = R + Math.max(s.elev, 0) + 14;
+        positions.push(tmp.x * rad, tmp.y * rad, tmp.z * rad);
+      }
+    }
+    for (let r = 0; r < gridN; r++) {
+      for (let col = 0; col < gridN; col++) {
+        const a = r * (gridN + 1) + col;
+        const b = a + 1;
+        const d = (r + 1) * (gridN + 1) + col;
+        const e = d + 1;
+        indices.push(a, d, b, b, d, e);
+      }
+    }
+    const patchGeo = new THREE.BufferGeometry();
+    patchGeo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+    patchGeo.setIndex(indices);
+    const patchMat = new THREE.MeshBasicMaterial({
+      color: '#fbbf24',
+      transparent: true,
+      opacity: 0.15,
+      side: THREE.DoubleSide,
+      depthWrite: false,
+    });
+    g.add(new THREE.Mesh(patchGeo, patchMat));
+
+    // 2. Crisp glowing gold double-line border
+    const segs = 24;
+    const edges = [
+      [-1, -1, 1, -1],
+      [1, -1, 1, 1],
+      [1, 1, -1, 1],
+      [-1, 1, -1, -1],
+    ];
+    for (const [scale, colHex, op, lift] of [
+      [1.0, '#fbbf24', 0.96, 18],
+      [0.975, '#fde68a', 0.65, 19],
+    ]) {
+      const pts = [];
+      for (const [sx0, sy0, sx1, sy1] of edges) {
+        for (let i = 0; i < segs; i++) {
+          const f = i / segs;
+          const tx = (sx0 + (sx1 - sx0) * f) * halfRad * scale;
+          const ty = (sy0 + (sy1 - sy0) * f) * halfRad * scale;
+          projectTangentToUnitDir(c, east, north, tx, ty, tmp);
+          const s = sampleSphereSurface(tmp);
+          pts.push(tmp.clone().multiplyScalar(R + Math.max(s.elev, 0) + lift));
+        }
+      }
+      pts.push(pts[0].clone());
+      g.add(
+        new THREE.Line(
+          new THREE.BufferGeometry().setFromPoints(pts),
+          new THREE.LineBasicMaterial({ color: colHex, transparent: true, opacity: op })
+        )
+      );
+    }
+
+    // 3. Small glowing gold diamond marker at center of explored footprint
+    const cSample = sampleSphereSurface(c);
+    const gem = new THREE.Mesh(
+      new THREE.OctahedronGeometry(26, 0),
+      new THREE.MeshBasicMaterial({ color: '#fde047' })
+    );
+    gem.position.copy(c).multiplyScalar(R + Math.max(cSample.elev, 0) + 32);
+    g.add(gem);
+  }
+
+  cachedFootprintsGroup = g;
+  scene.add(cachedFootprintsGroup);
+}
+
+function renderCachedRegionChips() {
+  const wrap = document.getElementById('cached-chips');
+  const title = document.getElementById('cached-chips-title');
+  const list = document.getElementById('cached-chips-list');
+  if (!wrap || !title || !list) return;
+
+  if (!stage2.cachedRegions.length) {
+    wrap.style.display = 'none';
+    list.innerHTML = '';
+    return;
+  }
+  wrap.style.display = 'block';
+  title.textContent = `Explored on This Planet (${stage2.cachedRegions.length})`;
+  list.innerHTML = '';
+
+  stage2.cachedRegions.forEach((reg) => {
+    const o = reg.planetOrigin;
+    const latStr = `${Math.abs(o.latDeg).toFixed(0)}°${o.latDeg >= 0 ? 'N' : 'S'}`;
+    const lonStr = `${Math.abs(o.lonDeg).toFixed(0)}°${o.lonDeg >= 0 ? 'E' : 'W'}`;
+    const btn = document.createElement('button');
+    btn.className = 'cached-chip';
+    btn.textContent = `★ ${latStr} ${lonStr} (${o.spanDeg || 46}°)`;
+    btn.title = 'Click to focus this explored gold region on the globe';
+    btn.addEventListener('click', () => {
+      const dir = dirFromLatLon(o.latDeg, o.lonDeg);
+      stage2.spanDeg = Number(o.spanDeg) || 46;
+      const selSpan = document.getElementById('sel-stage2-span');
+      if (selSpan) selSpan.value = String(stage2.spanDeg);
+      setStage2Target(dir);
+      // Swing orbit camera smoothly to face this explored region
+      setMode('orbit');
+      nav.orbitYaw = Math.atan2(dir.x, dir.z);
+      nav.orbitPitch = Math.asin(THREE.MathUtils.clamp(dir.y, -0.85, 0.85));
+    });
+    list.appendChild(btn);
+  });
+}
+
+async function loadCachedRegionsForPlanet() {
+  if (!currentPlanet) return;
+  try {
+    const resp = await fetch('/worlds/synthesized_catalog.json', { cache: 'no-store' });
+    if (!resp.ok) {
+      stage2.cachedRegions = [];
+    } else {
+      const all = await resp.json();
+      const targetSeed = Number(genState.seed);
+      const resolvedArch = currentPlanet.meta?.archetype || genState.archetype;
+      stage2.cachedRegions = (Array.isArray(all) ? all : []).filter((w) => {
+        if (!w || !w.planetOrigin || w.drillOrigin) return false;
+        const o = w.planetOrigin;
+        if (Number(o.seed) !== targetSeed) return false;
+        return o.archetype === genState.archetype || o.archetype === resolvedArch;
+      });
+    }
+  } catch {
+    stage2.cachedRegions = [];
+  }
+  rebuildCachedFootprintsOverlay();
+  renderCachedRegionChips();
+  updateCachedBanner();
+}
+
 function updateStage2TargetInfo() {
   const el = document.getElementById('stage2-target-info');
   if (!el || !currentPlanet) return;
@@ -769,6 +1046,7 @@ function updateStage2TargetInfo() {
   let totalCnt = 0;
   let peakH = 0;
   let sumTemp = 0;
+  let sumMoist = 0;
   let landTempCnt = 0;
   for (let r = 0; r < 9; r++) {
     const ty = (0.5 - r / 8) * 2 * halfRad;
@@ -781,6 +1059,7 @@ function updateStage2TargetInfo() {
         landCnt++;
         if (s.elev > peakH) peakH = s.elev;
         sumTemp += s.tempC;
+        sumMoist += s.moisture;
         landTempCnt++;
       }
     }
@@ -791,18 +1070,28 @@ function updateStage2TargetInfo() {
   const lonStr = `${Math.abs(lonDeg).toFixed(1)}°${lonDeg >= 0 ? 'E' : 'W'}`;
   const landPct = Math.round((landCnt / totalCnt) * 100);
   const avgTemp = landTempCnt > 0 ? Math.round(sumTemp / landTempCnt) : Math.round(sampleSphereSurface(c).tempC);
+  const avgMoist = landTempCnt > 0 ? sumMoist / landTempCnt : sampleSphereSurface(c).moisture;
+  const estPrecip = Math.round(35 + Math.pow(avgMoist, 1.35) * 2500);
 
   let note = '';
   if (landPct < 8) {
-    note = '<br/><span style="color:#fbbf24;">Mostly open ocean — click a coast or continent for richer terrain!</span>';
-  } else if (landPct > 94) {
-    note = '<br/><span style="color:#86efac;">Interior mountain / plateau basin</span>';
+    note = '<br/><span style="color:#fbbf24;">Mostly open ocean — click a coast or continent!</span>';
+  } else if (avgTemp < -3.5) {
+    note = '<br/><span style="color:#bae6fd;">🧊 Polar Glacier / Ice Sheet (frozen · 0 liquid rivers)</span>';
+  } else if (estPrecip < 260 && avgTemp > 11) {
+    note = '<br/><span style="color:#fcd34d;">🏜️ Arid Sand Desert / Mesas (dry · 0 rivers)</span>';
+  } else if (avgTemp < 2.5) {
+    note = '<br/><span style="color:#cbd5e1;">❄️ Arctic Tundra / Permafrost (sparse streams)</span>';
+  } else if (estPrecip < 430) {
+    note = '<br/><span style="color:#fde68a;">🌾 Dry Steppe / Savanna (few rivers)</span>';
+  } else if (avgTemp > 18 && estPrecip > 1050) {
+    note = '<br/><span style="color:#4ade80;">🌴 Tropical Rainforest (abundant rivers & lakes)</span>';
   } else {
-    note = '<br/><span style="color:#7dd3fc;">Coastline + mountain range (ideal for 30m AI detail)</span>';
+    note = '<br/><span style="color:#7dd3fc;">🌲 Temperate Highlands / Coast (lakes & rivers)</span>';
   }
   el.innerHTML =
     `<strong>Target: ${latStr} ${lonStr}</strong> (${stage2.spanDeg}° box)<br/>` +
-    `Land <strong>${landPct}%</strong> · Peak <strong>${Math.round(peakH)} m</strong> · Avg <strong>${avgTemp}°C</strong>` +
+    `Land <strong>${landPct}%</strong> · <strong>${avgTemp}°C</strong> · <strong>${estPrecip} mm/yr</strong>` +
     note;
 }
 
@@ -810,6 +1099,7 @@ function setStage2Target(unitDir) {
   stage2.targetDir.copy(unitDir).normalize();
   rebuildTargetPatchOverlay();
   updateStage2TargetInfo();
+  updateCachedBanner();
 }
 
 function float32ToBase64(f32) {
@@ -856,7 +1146,7 @@ function extractStage2Payload() {
           elev[idx] = -(60.0 + dNorm * 2800.0);
         }
         temp[idx] = Math.max(-18.0, Math.min(32.0, s.tempC));
-        precip[idx] = 120.0 + Math.pow(s.moisture, 1.25) * 2800.0;
+        precip[idx] = 35.0 + Math.pow(s.moisture, 1.35) * 2500.0;
         if (withStd) {
           tempStd[idx] = (2.5 + Math.abs(tmp.y) * 11.5) * 100.0;
           precipCv[idx] = 22.0 + (1.0 - s.moisture) * 48.0;
@@ -977,6 +1267,7 @@ async function synthesizeStage2Target() {
       `<strong>${data.lakeCount}</strong> alpine lakes · <strong>${data.riverCount}</strong> rivers (0 dead-ends)`;
     openBtn.href = data.openUrl;
     resBox.style.display = 'block';
+    loadCachedRegionsForPlanet();
   } catch (err) {
     progFill.style.width = '100%';
     progText.innerHTML =
@@ -1185,6 +1476,7 @@ function generatePlanetFromState(customSeed = null) {
   currentPlanet = generateTectonicPlanet({
     seed: genState.seed,
     archetype: genState.archetype,
+    climateMode: genState.climateMode,
     faceSize: 128,
     radius: 3000,
     seaLevelBias: genState.seaLevelBias,
@@ -1212,6 +1504,9 @@ function generatePlanetFromState(customSeed = null) {
     `Planet #${genState.planetNumber} (seed ${m.seed}) · ${m.plateCount} plates · ` +
     `${m.majorContinents} continents, ${m.islands} islands · ${m.landPct}% land (${m.genTimeMs} ms)`;
 
+  syncSeedInputAndUrl();
+  loadCachedRegionsForPlanet();
+
   loading.style.display = 'none';
 
   if (nav.mode === 'surface') {
@@ -1227,9 +1522,40 @@ function generateNewPlanet(explicitSeed = null) {
 
 // ---------- UI Bindings ----------
 document.getElementById('btn-reroll').addEventListener('click', () => generateNewPlanet());
+document.getElementById('btn-load-seed').addEventListener('click', () => {
+  parseAndLoadSeedInput(document.getElementById('inp-seed')?.value);
+});
+document.getElementById('inp-seed').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    parseAndLoadSeedInput(e.target.value);
+    e.target.blur();
+  }
+});
+document.getElementById('btn-copy-seed').addEventListener('click', async () => {
+  const code = formatWorldCode(genState.seed, genState.archetype);
+  const btn = document.getElementById('btn-copy-seed');
+  try {
+    await navigator.clipboard.writeText(code);
+    btn.textContent = '✓';
+    setTimeout(() => (btn.textContent = 'Copy'), 1200);
+  } catch {
+    const inp = document.getElementById('inp-seed');
+    if (inp) {
+      inp.select();
+      document.execCommand('copy');
+      btn.textContent = '✓';
+      setTimeout(() => (btn.textContent = 'Copy'), 1200);
+    }
+  }
+});
 document.getElementById('sel-archetype').addEventListener('change', (e) => {
   genState.archetype = e.target.value;
   generateNewPlanet();
+});
+document.getElementById('sel-climate')?.addEventListener('change', (e) => {
+  genState.climateMode = e.target.value;
+  generatePlanetFromState(genState.seed);
 });
 document.getElementById('btn-mode-orbit').addEventListener('click', () => setMode('orbit'));
 document.getElementById('btn-mode-surface').addEventListener('click', () => {
@@ -1247,7 +1573,11 @@ document.getElementById('sea-slider').addEventListener('input', (e) => {
 document.getElementById('relief-slider').addEventListener('input', (e) => {
   genState.reliefScale = Number(e.target.value);
   document.getElementById('relief-val').textContent = `${genState.reliefScale.toFixed(1)}×`;
-  if (currentPlanet) buildPlanetMesh();
+  if (currentPlanet) {
+    buildPlanetMesh();
+    rebuildCachedFootprintsOverlay();
+    rebuildTargetPatchOverlay();
+  }
 });
 
 document.getElementById('speed-slider').addEventListener('input', (e) => {
@@ -1475,10 +1805,18 @@ window.__terragrokPlanet = {
   },
   synthesizeStage2Target,
   getStage2Result: () => stage2.lastResult,
+  setClimate(mode) {
+    genState.climateMode = mode;
+    const sel = document.getElementById('sel-climate');
+    if (sel) sel.value = mode;
+    generatePlanetFromState(genState.seed);
+  },
 };
 
 // Boot!
 document.getElementById('sel-archetype').value = genState.archetype;
+const selClimInit = document.getElementById('sel-climate');
+if (selClimInit) selClimInit.value = genState.climateMode;
 buildExplorerAndBeacon();
 generatePlanetFromState(genState.seed);
 pollStage2Health();

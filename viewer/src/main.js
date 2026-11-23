@@ -239,6 +239,278 @@ const pickRaycaster = new THREE.Raycaster();
 let dioramaCursorHit = null;
 let pinDropFlash = 0;
 
+// ---------- Drill-Down Zoom State & 3D Box Overlays ----------
+const drillState = {
+  aiming: false,
+  zoomFactor: 4,
+  running: false,
+  lastResult: null,
+  cachedChildren: [],
+};
+let drillBoxGroup = null;
+let drillChildrenGroup = null;
+
+function disposeGroup(grp) {
+  if (!grp) return;
+  scene.remove(grp);
+  grp.traverse((o) => {
+    if (o.geometry) o.geometry.dispose();
+    if (o.material) o.material.dispose();
+  });
+}
+
+function buildTerrainBoxMesh(cx, cz, boxSpan, colorHex, fillOpacity = 0.0, liftY = 3.5) {
+  const grp = new THREE.Group();
+  const half = boxSpan * 0.5;
+  const segs = 28;
+  const pts = [];
+  const edges = [
+    [-1, -1, 1, -1],
+    [1, -1, 1, 1],
+    [1, 1, -1, 1],
+    [-1, 1, -1, -1],
+  ];
+  for (const [sx0, sz0, sx1, sz1] of edges) {
+    for (let i = 0; i < segs; i++) {
+      const f = i / segs;
+      const x = cx + (sx0 + (sx1 - sx0) * f) * half;
+      const z = cz + (sz0 + (sz1 - sz0) * f) * half;
+      const y = Math.max(sampleHeight(x, z), 0) + liftY;
+      pts.push(new THREE.Vector3(x, y, z));
+    }
+  }
+  pts.push(pts[0].clone());
+  grp.add(
+    new THREE.Line(
+      new THREE.BufferGeometry().setFromPoints(pts),
+      new THREE.LineBasicMaterial({ color: colorHex, transparent: true, opacity: 0.95 })
+    )
+  );
+
+  // Subtle corner ticks for crisp readability over noisy terrain
+  for (const [sx, sz] of [[-1, -1], [1, -1], [1, 1], [-1, 1]]) {
+    const x = cx + sx * half;
+    const z = cz + sz * half;
+    const y = Math.max(sampleHeight(x, z), 0) + liftY;
+    const post = new THREE.Mesh(
+      new THREE.SphereGeometry(Math.max(boxSpan * 0.011, 2.5), 10, 8),
+      new THREE.MeshBasicMaterial({ color: colorHex })
+    );
+    post.position.set(x, y + 1.5, z);
+    grp.add(post);
+  }
+
+  if (fillOpacity > 0) {
+    const gN = 10;
+    const pos = [];
+    const idx = [];
+    for (let r = 0; r <= gN; r++) {
+      const z = cz + (r / gN - 0.5) * boxSpan;
+      for (let c = 0; c <= gN; c++) {
+        const x = cx + (c / gN - 0.5) * boxSpan;
+        const y = Math.max(sampleHeight(x, z), 0) + liftY * 0.6;
+        pos.push(x, y, z);
+      }
+    }
+    for (let r = 0; r < gN; r++) {
+      for (let c = 0; c < gN; c++) {
+        const a = r * (gN + 1) + c;
+        const b = a + 1;
+        const d = (r + 1) * (gN + 1) + c;
+        const e = d + 1;
+        idx.push(a, d, b, b, d, e);
+      }
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+    geo.setIndex(idx);
+    grp.add(
+      new THREE.Mesh(
+        geo,
+        new THREE.MeshBasicMaterial({
+          color: colorHex,
+          transparent: true,
+          opacity: fillOpacity,
+          side: THREE.DoubleSide,
+          depthWrite: false,
+        })
+      )
+    );
+  }
+
+  return grp;
+}
+
+function getClampedDrillCenterUV() {
+  if (!world) return { u: 0.5, v: 0.5, cx: 0, cz: 0, boxSpan: 1200 };
+  const span = world.meta.worldSpan;
+  const half = 0.5 / drillState.zoomFactor;
+  const rawU = player.pos.x / span + 0.5;
+  const rawV = player.pos.z / span + 0.5;
+  const u = THREE.MathUtils.clamp(rawU, half, 1.0 - half);
+  const v = THREE.MathUtils.clamp(rawV, half, 1.0 - half);
+  return {
+    u,
+    v,
+    cx: (u - 0.5) * span,
+    cz: (v - 0.5) * span,
+    boxSpan: span / drillState.zoomFactor,
+  };
+}
+
+function rebuildDrillBoxOverlay() {
+  disposeGroup(drillBoxGroup);
+  drillBoxGroup = null;
+  if (!world || !drillState.aiming || state.camMode !== 'diorama') return;
+  const { cx, cz, boxSpan } = getClampedDrillCenterUV();
+  const liftY = Math.max(world.meta.worldSpan * 0.0022, 1.5);
+  drillBoxGroup = buildTerrainBoxMesh(cx, cz, boxSpan, '#38f2d8', 0.10, liftY);
+  scene.add(drillBoxGroup);
+}
+
+function rebuildDrillChildrenOverlay() {
+  disposeGroup(drillChildrenGroup);
+  drillChildrenGroup = null;
+  if (!world) return;
+  const children = catalog.filter((w) => w?.drillOrigin?.parentWorldId === world.meta.id);
+  drillState.cachedChildren = children;
+
+  const wrap = document.getElementById('drill-children');
+  const list = document.getElementById('drill-children-list');
+  if (wrap && list) {
+    if (!children.length) {
+      wrap.style.display = 'none';
+      list.innerHTML = '';
+    } else {
+      wrap.style.display = 'block';
+      list.innerHTML = '';
+      children.forEach((ch) => {
+        const d = ch.drillOrigin;
+        const a = document.createElement('a');
+        a.className = 'drill-chip';
+        a.href = `/index.html?world=${encodeURIComponent(ch.id)}`;
+        a.textContent = `★ ${d.zoomFactor}× (${d.pixelM.toFixed(1)}m/px) ⚡`;
+        a.title = `Instant open cached ${d.zoomFactor}× sub-region (${ch.lakeCount ?? 0} lakes, ${ch.riverCount ?? 0} rivers)`;
+        list.appendChild(a);
+      });
+    }
+  }
+
+  if (!children.length) return;
+  const g = new THREE.Group();
+  const span = world.meta.worldSpan;
+  const liftY = Math.max(span * 0.0018, 1.2);
+  children.forEach((ch) => {
+    const d = ch.drillOrigin;
+    const cx = (d.centerU - 0.5) * span;
+    const cz = (d.centerV - 0.5) * span;
+    const boxSpan = span / (d.zoomFactor || 4);
+    g.add(buildTerrainBoxMesh(cx, cz, boxSpan, '#fbbf24', 0.08, liftY));
+  });
+  g.visible = state.camMode === 'diorama';
+  drillChildrenGroup = g;
+  scene.add(drillChildrenGroup);
+}
+
+async function refreshCatalogData() {
+  const baseCatalog = await fetch('/worlds/catalog.json', { cache: 'no-store' }).then((r) => r.json());
+  let synthCatalog = [];
+  try {
+    const r = await fetch('/worlds/synthesized_catalog.json', { cache: 'no-store' });
+    if (r.ok) synthCatalog = await r.json();
+  } catch {
+    // ignore
+  }
+  const seenIds = new Set(baseCatalog.map((w) => w.id));
+  catalog = [...baseCatalog, ...synthCatalog.filter((w) => !seenIds.has(w.id))];
+  const select = document.getElementById('world-select');
+  if (select) {
+    const curVal = world?.meta?.id || select.value;
+    select.innerHTML = catalog.map((w) => `<option value="${w.id}">${w.title}</option>`).join('');
+    if (curVal && catalog.some((w) => w.id === curVal)) select.value = curVal;
+  }
+}
+
+async function runDrillDownAtPin() {
+  if (!world || drillState.running) return;
+  const btn = document.getElementById('btn-drill-run');
+  const progWrap = document.getElementById('drill-progress-wrap');
+  const progFill = document.getElementById('drill-progress-fill');
+  const progText = document.getElementById('drill-status-text');
+  const resBox = document.getElementById('drill-result');
+  const resMetrics = document.getElementById('drill-result-metrics');
+  const openBtn = document.getElementById('btn-open-drill');
+
+  drillState.running = true;
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = `Drilling ${drillState.zoomFactor}× Micro-Terrain…`;
+  }
+  if (resBox) resBox.style.display = 'none';
+  if (progWrap) progWrap.style.display = 'block';
+  if (progFill) progFill.style.width = '8%';
+  if (progText) progText.textContent = 'Sending sub-region to Terrain Diffusion MPS…';
+
+  const pollId = window.setInterval(async () => {
+    try {
+      const r = await fetch('/api/status', { cache: 'no-store' });
+      if (!r.ok) return;
+      const st = await r.json();
+      if (st.message && progText) progText.textContent = st.message;
+      if (typeof st.progress === 'number' && progFill) {
+        progFill.style.width = `${Math.max(10, Math.round(st.progress * 100))}%`;
+      }
+    } catch {
+      // ignore transient poll errors
+    }
+  }, 550);
+
+  try {
+    const { u, v } = getClampedDrillCenterUV();
+    const resp = await fetch('/api/drilldown', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        parentWorldId: world.meta.id,
+        centerU: u,
+        centerV: v,
+        zoomFactor: drillState.zoomFactor,
+        quality: 'high',
+        fidelity: 'exact',
+      }),
+    });
+    const data = await resp.json();
+    if (!resp.ok || !data.ok) {
+      throw new Error(data.error || `Drill-down failed (${resp.status})`);
+    }
+    drillState.lastResult = data;
+    if (progFill) progFill.style.width = '100%';
+    if (progText) progText.textContent = `Done in ${data.totalSec}s (MPS ${data.mpsSec}s · Hydro ${data.hydroSec}s)`;
+    if (resMetrics) {
+      resMetrics.innerHTML =
+        `<strong>✓ ${data.zoomFactor}× High-Res Ready!</strong> (${data.pixelM} m/px)<br/>` +
+        `IoU <strong>${data.iouPct}%</strong> · <strong>${data.lakeCount}</strong> lakes · <strong>${data.riverCount}</strong> rivers`;
+    }
+    if (openBtn) openBtn.href = data.openUrl;
+    if (resBox) resBox.style.display = 'block';
+
+    await refreshCatalogData();
+    rebuildDrillChildrenOverlay();
+  } catch (err) {
+    if (progFill) progFill.style.width = '100%';
+    if (progText) {
+      progText.innerHTML = `<span style="color:#fca5a5;">${err.message || 'Stage 2 server unreachable.'}</span>`;
+    }
+  } finally {
+    window.clearInterval(pollId);
+    drillState.running = false;
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = '🔬 Drill Down at Pin (~12s)';
+    }
+  }
+}
+
 function getDioramaPlaneY() {
   return Math.max((world?.meta?.maxElev || 160) * state.vScale * 0.22, 20);
 }
@@ -299,6 +571,7 @@ function relocateExplorerTo(x, z) {
   player.grounded = true;
   explorer.position.copy(player.pos);
   pinDropFlash = 1.0;
+  rebuildDrillBoxOverlay();
   return true;
 }
 
@@ -664,18 +937,49 @@ async function loadWorld(worldId) {
   setStyleMode(state.styleMode);
   teleportTo('plains');
 
-  // If this world came from a Stage 1 Spherical Planet, link straight back to that exact planet!
-  const planetLink = document.querySelector('a[href*="/planet.html"]');
+  // Scale default Diorama framing cleanly to worldSpan (4.8km vs 1.2km drilled sub-regions!)
+  camRig.dioramaDist = THREE.MathUtils.clamp(worldSpan * 0.45, 420, 2200);
+
+  // Sync URL query so refreshing stays on this exact world
+  const curUrl = new URL(window.location.href);
+  curUrl.searchParams.set('world', worldId);
+  window.history.replaceState(null, '', `${curUrl.pathname}?${curUrl.searchParams.toString()}`);
+
+  // Update resolution badge & drill-down UI state
+  const pixelM = worldSpan / size;
+  const resBadge = document.getElementById('drill-res-badge');
+  if (resBadge) resBadge.textContent = `${pixelM.toFixed(1)}m/px`;
+  const drillResBox = document.getElementById('drill-result');
+  if (drillResBox) drillResBox.style.display = 'none';
+  const drillProg = document.getElementById('drill-progress-wrap');
+  if (drillProg) drillProg.style.display = 'none';
+
+  // Breadcrumbs: Planet origin + Parent world (if drilled down!)
+  const planetLink = document.getElementById('link-planet');
   if (planetLink) {
     if (meta.planetOrigin) {
       const { seed, archetype } = meta.planetOrigin;
       planetLink.href = `/planet.html?seed=${encodeURIComponent(seed)}&archetype=${encodeURIComponent(archetype || 'earth')}`;
-      planetLink.textContent = `← Back to Planet #${seed}`;
+      planetLink.textContent = `← Planet #${seed}`;
     } else {
       planetLink.href = '/planet.html';
       planetLink.textContent = 'Spherical Planet Mode →';
     }
   }
+  const parentLink = document.getElementById('link-parent');
+  if (parentLink) {
+    if (meta.drillOrigin?.parentWorldId) {
+      parentLink.href = `/index.html?world=${encodeURIComponent(meta.drillOrigin.parentWorldId)}`;
+      parentLink.textContent = `↑ Back to Parent`;
+      parentLink.title = meta.drillOrigin.parentTitle || meta.drillOrigin.parentWorldId;
+      parentLink.style.display = 'inline-block';
+    } else {
+      parentLink.style.display = 'none';
+    }
+  }
+
+  rebuildDrillChildrenOverlay();
+  rebuildDrillBoxOverlay();
 
   loader.classList.add('hidden');
 }
@@ -693,6 +997,7 @@ function teleportTo(landmarkKey) {
   explorer.position.copy(player.pos);
   camRig.dioramaCenter.set(x, getDioramaPlaneY(), z);
   pinDropFlash = 1.0;
+  rebuildDrillBoxOverlay();
 
   // Frame toward highest mountain peak for dramatic horizon
   const peak = world.meta.landmarks.peak || [0.5, 0.5];
@@ -744,6 +1049,8 @@ function setCameraMode(mode) {
   camera.updateProjectionMatrix();
   syncFogDensity();
   if (grassObj) grassObj.mesh.visible = state.styleMode === 0 && mode !== 'diorama';
+  if (drillChildrenGroup) drillChildrenGroup.visible = mode === 'diorama';
+  rebuildDrillBoxOverlay();
   updatePropsTransform(propsGroup, state.vScale, mode === 'diorama');
   syncPresetPills();
 }
@@ -877,8 +1184,29 @@ document.getElementById('vscale-slider').addEventListener('input', (e) => {
   if (grassObj) grassObj.material.uniforms.uVScale.value = state.vScale;
   if (world) player.pos.y = Math.max(sampleHeight(player.pos.x, player.pos.z), 0.2);
   updatePropsTransform(propsGroup, state.vScale, state.camMode === 'diorama');
+  rebuildDrillBoxOverlay();
+  rebuildDrillChildrenOverlay();
 });
 document.getElementById('world-select').addEventListener('change', (e) => loadWorld(e.target.value));
+document.getElementById('sel-drill-zoom')?.addEventListener('change', (e) => {
+  drillState.zoomFactor = Number(e.target.value) || 4;
+  rebuildDrillBoxOverlay();
+});
+document.getElementById('btn-drill-aim')?.addEventListener('click', () => {
+  drillState.aiming = !drillState.aiming;
+  document.getElementById('btn-drill-aim')?.classList.toggle('active', drillState.aiming);
+  if (drillState.aiming) {
+    if (state.camMode !== 'diorama') setCameraMode('diorama');
+    if (world) {
+      camRig.dioramaCenter.set(player.pos.x, getDioramaPlaneY(), player.pos.z);
+      camRig.dioramaDist = Math.max(camRig.dioramaDist, Math.min(world.meta.worldSpan * 0.55, 2400));
+    }
+  }
+  rebuildDrillBoxOverlay();
+});
+document.getElementById('btn-drill-run')?.addEventListener('click', () => {
+  runDrillDownAtPin();
+});
 
 window.addEventListener('resize', () => {
   camera.aspect = window.innerWidth / window.innerHeight;
@@ -1153,6 +1481,18 @@ window.__terragrok = {
   getDioramaCenter: () => ({ x: camRig.dioramaCenter.x, y: camRig.dioramaCenter.y, z: camRig.dioramaCenter.z }),
   getCameraY: () => camera.position.y,
   isPinVisible: () => explorerPin.visible,
+  setDrillAim(on, zoomFactor = null) {
+    drillState.aiming = !!on;
+    if (zoomFactor) {
+      drillState.zoomFactor = zoomFactor;
+      const sel = document.getElementById('sel-drill-zoom');
+      if (sel) sel.value = String(zoomFactor);
+    }
+    document.getElementById('btn-drill-aim')?.classList.toggle('active', drillState.aiming);
+    rebuildDrillBoxOverlay();
+  },
+  runDrillDown: runDrillDownAtPin,
+  getDrillResult: () => drillState.lastResult,
   focusDiorama(x, z, dist = 340) {
     setCameraMode('diorama');
     camRig.dioramaCenter.set(x, getDioramaPlaneY(), z);

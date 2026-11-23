@@ -53,9 +53,9 @@ export function buildWorldProps(worldData, vScale = 1.0) {
       tempC = tempRange[0] + (climate[mIdx] / 255) * (tempRange[1] - tempRange[0]);
       const pMm = precipRange[0] + (climate[mIdx + 1] / 255) * (precipRange[1] - precipRange[0]);
       precipNorm = Math.min(Math.max(pMm / 650, 0), 1);
-      // Natural freezing timberline (~1.8 C) & dry steppe thinning
-      if (tempC < 1.8) continue;
-      const treeProb = THREE.MathUtils.smoothstep(Math.max(precipNorm, moisture * 0.85), 0.14, 0.65) * 0.92;
+      // Natural freezing timberline (~2.0 C) & true desert/arid cutoff (<260 mm/yr -> 0 trees!)
+      if (tempC < 2.0 || pMm < 260.0 || moisture < 0.16) continue;
+      const treeProb = THREE.MathUtils.smoothstep(Math.max(precipNorm, moisture * 0.75), 0.24, 0.70) * 0.92;
       if (rand() > treeProb) continue;
     } else {
       if (hNorm > 0.56) continue;
@@ -107,6 +107,9 @@ export function buildWorldProps(worldData, vScale = 1.0) {
     const hNorm = elev / Math.max(maxElev, 1);
 
     const nearRiver = river > 0.14 && river < 0.55;
+    const tempRockC = masks[mIdx + 3] !== undefined ? (masks[mIdx + 3] / 255) * 60 - 20 : 12;
+    const isGlacialSheet = tempRockC < -3.0 && slopeDeg < 34;
+    if (isGlacialSheet) continue;
     const rockyZone = (slopeDeg > 23 && slopeDeg < 48) || hNorm > 0.48 || nearRiver;
     if (!rockyZone) continue;
 

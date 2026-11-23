@@ -135,6 +135,8 @@ def solve_physical_hydrology(
     min_lake_depth_m: float = 0.45,
     max_spring_rivers: int = 16,
     runoff_map: np.ndarray | None = None,
+    max_lakes: int | None = None,
+    min_lake_runoff: float = 0.0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[dict], list[dict]]:
     """
     Solve exact Barnes Priority-Flood lake hierarchy & pit-free D8 drainage tree.
@@ -148,6 +150,12 @@ def solve_physical_hydrology(
     """
     ny, nx = elev.shape
     cell_m = world_span_m / (nx - 1)
+
+    # Dry desert / frozen glacier fast-path: legitimately 0 liquid lakes and 0 liquid rivers!
+    if max_spring_rivers <= 0 and (max_lakes is not None and max_lakes <= 0):
+        print("  Hydrology OK: 0 lakes | 0 rivers (arid/frozen biome)", flush=True)
+        zeros = np.zeros((ny, nx), dtype=np.uint8)
+        return elev.astype(np.float32), zeros, zeros, [], []
 
     # 1. Identify TRUE Ocean: ONLY cells <= 0.0m flood-connected to the outer grid boundary!
     #    Inland depressions whose floor dips below sea level are landlocked crater/valley lakes,
@@ -170,7 +178,7 @@ def solve_physical_hydrology(
     z_shift = max(0.0, -float(z_in.min())) + 1.0
     mg.add_field("topographic__elevation", (z_in + z_shift).ravel(), at="node")
     if runoff_map is not None:
-        mg.add_field("water__unit_flux_in", np.clip(runoff_map.astype(np.float64), 0.15, 4.0).ravel(), at="node")
+        mg.add_field("water__unit_flux_in", np.clip(runoff_map.astype(np.float64), 0.001, 4.0).ravel(), at="node")
     mg.status_at_node[is_ocean.ravel()] = mg.BC_NODE_IS_FIXED_VALUE
 
     pf = PriorityFloodFlowRouter(
@@ -202,13 +210,26 @@ def solve_physical_hydrology(
     lake_levels: dict[int, float] = {}
     kept_lakes: list[int] = []
 
+    qualifying: list[tuple[float, int, np.ndarray]] = []
+    if max_lakes is None or max_lakes > 0:
+        for cid in range(1, n_raw + 1):
+            comp = lbl == cid
+            n_cells = int(comp.sum())
+            max_d = float(dep_depth[comp].max())
+            if n_cells < min_lake_cells or max_d < max(min_lake_depth_m, 1.0):
+                continue
+            if runoff_map is not None and min_lake_runoff > 0.0:
+                if float(runoff_map[comp].mean()) < min_lake_runoff:
+                    continue
+            qualifying.append((n_cells * max_d, cid, comp))
+
+    # Keep top lakes by basin volume when climate limits lake count
+    qualifying.sort(key=lambda item: -item[0])
+    if max_lakes is not None:
+        qualifying = qualifying[:max_lakes]
+
     next_lake_id = 1
-    for cid in range(1, n_raw + 1):
-        comp = lbl == cid
-        n_cells = int(comp.sum())
-        max_d = float(dep_depth[comp].max())
-        if n_cells < min_lake_cells or max_d < max(min_lake_depth_m, 1.0):
-            continue
+    for _, _, comp in qualifying:
         lid = next_lake_id
         next_lake_id += 1
         lake_id_grid[comp] = lid
@@ -434,7 +455,7 @@ def solve_physical_hydrology(
     if len(trib_coords) > 0:
         trib_das = da[trib_coords[:, 0], trib_coords[:, 1]]
         for t_idx in np.argsort(-trib_das):
-            if spring_added >= max_spring_rivers + 8:
+            if spring_added >= max_spring_rivers + (max_spring_rivers // 3):
                 break
             tr, tc = int(trib_coords[t_idx, 0]), int(trib_coords[t_idx, 1])
             node = tr * nx + tc
@@ -789,14 +810,19 @@ def find_landmarks(
     else:
         plr, plc = ny // 2, nx // 2
 
-    # 5. River Estuary / Coastline (right where a major river meets the sea!)
+    # 5. River Estuary / Coastline (right where a major river meets the sea, or sandy beach if dry!)
     if sea_rivers:
         main_rv = max(sea_rivers, key=lambda rv: len(rv["points"]))
         mouth_pt = main_rv["points"][max(len(main_rv["points"]) - 6, 0)]
         cc = int(np.clip((mouth_pt[0] / world_span_m + 0.5) * (nx - 1) + 3, 2, nx - 3))
         cr = int(np.clip((mouth_pt[1] / world_span_m + 0.5) * (ny - 1), 2, ny - 3))
     else:
-        cr, cc = plr, plc
+        beach_pts = np.argwhere((elev > 1.2) & (elev < 6.5) & (slope_deg < 15.0))
+        if len(beach_pts) > 0:
+            pick = beach_pts[len(beach_pts) // 2]
+            cr, cc = int(pick[0]), int(pick[1])
+        else:
+            cr, cc = plr, plc
 
     return {
         "plains": to_norm_xy(plr, plc),

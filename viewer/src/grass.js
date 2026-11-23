@@ -145,9 +145,11 @@ export function createGrassField(heightFloatTex, maskTex, worldSpan, maxElev, bl
 
         float hNorm = clamp(elevRaw / max(uMaxElev, 1.0), 0.0, 1.0);
 
-        // Grass validity mask: above beach, below alpine snow/rock, off cliffs, out of deep rivers/lakes
+        // Grass validity mask: above beach, below alpine snow/rock, off cliffs, out of rivers/lakes,
+        // AND strictly gated by biome moisture (0 grass in deserts & frozen glaciers!)
         float valid = inBounds ? 1.0 : 0.0;
         valid *= smoothstep(3.8, 8.2, elevRaw);
+        valid *= smoothstep(0.18, 0.42, moisture);
         valid *= (1.0 - smoothstep(0.48, 0.60, hNorm));
         valid *= (1.0 - smoothstep(0.09, 0.16, slope));
         valid *= (1.0 - smoothstep(0.32, 0.55, riverWet));

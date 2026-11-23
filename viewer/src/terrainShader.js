@@ -247,43 +247,67 @@ export function createTerrainMaterial(
         float effMoist = clamp(mix(moisture, precipNorm, uHasClimate == 1 ? 0.55 : 0.0) + riverWet * 0.45, 0.0, 1.0);
         vec3 warmGround = mix(aridSteppe, warmScrub, smoothstep(0.18, 0.48, effMoist));
         vec3 lushGround = mix(meadow, lushMoss, smoothstep(0.52, 0.88, effMoist));
+        vec3 desertSand  = vec3(0.87, 0.72, 0.46);
+        vec3 desertDune  = vec3(0.79, 0.59, 0.34);
+        vec3 redMesa     = vec3(0.64, 0.33, 0.21);
+        vec3 tundraMoss  = vec3(0.46, 0.43, 0.29);
+        vec3 glacierIce  = vec3(0.73, 0.88, 0.96);
+
+        float desertMask = 0.0;
+        float glacierMask = 0.0;
         vec3 grassCol = mix(warmGround, lushGround, smoothstep(0.30, 0.65, effMoist));
         if (uHasClimate == 1) {
-          // Warm dry lowlands stay sun-baked golden steppe; cool slopes shift boreal -> tundra
-          float warmDry = smoothstep(9.0, 17.0, tempC) * (1.0 - smoothstep(0.18, 0.50, precipNorm));
-          grassCol = mix(grassCol, aridSteppe * 1.04, warmDry * 0.72);
+          // True Hot Sand Desert (Sahara / Namib / Arabian ergs with subtle wind ripples!)
+          desertMask = smoothstep(12.0, 20.0, tempC) * (1.0 - smoothstep(0.16, 0.46, precipNorm));
+          float duneRipple = 0.5 + 0.5 * sin(vWorldPos.x * 0.16 + vWorldPos.z * 0.09 + macroNoise * 4.5);
+          vec3 duneCol = mix(desertDune, desertSand, duneRipple * 0.55 + midNoise * 0.45);
+          // Warm dry steppe -> true golden desert sand
+          float warmDry = smoothstep(9.0, 17.0, tempC) * (1.0 - smoothstep(0.22, 0.54, precipNorm));
+          grassCol = mix(grassCol, aridSteppe * 1.04, warmDry * 0.78);
+          grassCol = mix(grassCol, duneCol, desertMask * 0.95);
+          // Cool boreal pine -> mossy lichen tundra
           float coolBoreal = (1.0 - smoothstep(2.0, 9.5, tempC)) * smoothstep(0.25, 0.65, effMoist);
           grassCol = mix(grassCol, borealPine, coolBoreal * 0.62);
-          float coldTundra = 1.0 - smoothstep(0.5, 4.5, tempC);
-          grassCol = mix(grassCol, alpineTund, coldTundra * 0.75);
+          float coldTundra = 1.0 - smoothstep(-1.5, 4.2, tempC);
+          grassCol = mix(grassCol, mix(tundraMoss, alpineTund, midNoise), coldTundra * 0.85);
+          // Polar frozen ice sheet / glacier (right down to sea level!)
+          glacierMask = 1.0 - smoothstep(-5.5, -1.8, tempC);
+          grassCol = mix(grassCol, mix(snowCol * 0.94, glacierIce, midNoise * 0.35), glacierMask * 0.96);
         } else {
           grassCol = mix(grassCol, alpineTund, smoothstep(0.42, 0.72, hNorm));
         }
         // Natural soil & clover mottling at 3 scales (breaks up flat green)
-        grassCol = mix(grassCol * 0.80, grassCol * 1.15, macroNoise * 0.55 + midNoise * 0.30 + fineNoise * 0.15);
+        grassCol = mix(grassCol * 0.84, grassCol * 1.13, macroNoise * 0.55 + midNoise * 0.30 + fineNoise * 0.15);
 
-        // Beach transition (wet shore -> dry sand -> grass)
+        // Beach transition (wet shore -> dry sand -> grass/desert/glacier)
         vec3 sandCol = mix(wetSand, drySand, smoothstep(0.3, 2.8, elev));
+        sandCol = mix(sandCol, glacierIce * 0.95, glacierMask * 0.85);
         vec3 albedo = mix(seabed, sandCol, smoothstep(-5.0, 0.8, elev));
-        albedo = mix(albedo, grassCol, smoothstep(2.4, 8.5, elev));
+        albedo = mix(albedo, grassCol, smoothstep(2.0, 7.5, elev));
 
-        // Detailed stratified rock on slopes & high peaks (warmer sandstone in warm dry zones, slate in cold alpine)
+        // Detailed stratified rock on slopes & high peaks (red sandstone mesas in deserts, glacial blue ice in polar!)
         float strataBand = rockPattern(vec2(vWorldPos.x * 0.08 + vWorldPos.z * 0.08, vWorldPos.y * 0.14));
         float coldRockT = (uHasClimate == 1) ? (1.0 - smoothstep(0.0, 14.0, tempC)) : smoothstep(0.30, 0.78, hNorm);
         vec3 rockCol = mix(rockWarm, rockSlate, coldRockT);
+        rockCol = mix(rockCol, redMesa, desertMask * 0.78);
         rockCol = mix(rockDark, rockCol * 1.16, strataBand);
         // Darken rock crevices using fine rock noise + cavity AO
         rockCol *= (0.72 + 0.42 * curvAO);
-        // High-altitude rocky scree even on moderate slopes
-        float screeMask = clamp(rockMask + smoothstep(0.58, 0.82, hNorm) * 0.65, 0.0, 1.0);
+        // Steep slopes on polar ice sheets expose gleaming pale-blue glacier ice + dark nunatak rock
+        vec3 glacialSlope = mix(glacierIce, rockCol, smoothstep(0.28, 0.52, baseSlope));
+        rockCol = mix(rockCol, glacialSlope, glacierMask * 0.82);
+        // High-altitude rocky scree even on moderate slopes (suppressed on flat sandy deserts & glaciers)
+        float screeMask = clamp(rockMask * (1.0 - desertMask * 0.45) + smoothstep(0.58, 0.82, hNorm) * 0.65 * (1.0 - desertMask * 0.6), 0.0, 1.0);
         albedo = mix(albedo, rockCol, screeMask);
 
-        // Snow accumulation (follows real 0..2°C freezing isotherm when climate is available!)
+        // Snow & Polar Ice accumulation (polar ice sheets reach sea level; temperate snow follows freezing isotherm)
         float snowMask = 0.0;
         if (uHasClimate == 1) {
           float freezeT = 1.6 + (macroNoise - 0.5) * 2.2 + precipNorm * 1.4;
-          snowMask = (1.0 - smoothstep(freezeT - 2.6, freezeT, tempC)) * smoothstep(20.0, 65.0, elev);
-          snowMask *= (1.0 - smoothstep(0.20, 0.40, baseSlope));
+          float alpineSnow = (1.0 - smoothstep(freezeT - 2.6, freezeT, tempC)) * smoothstep(14.0, 55.0, elev);
+          float polarSnow = glacierMask * smoothstep(0.4, 3.5, elev);
+          snowMask = max(alpineSnow, polarSnow);
+          snowMask *= (1.0 - smoothstep(0.22, 0.44, baseSlope));
         } else {
           float snowLine = 0.62 + (macroNoise - 0.5) * 0.10 + (1.0 - moisture) * 0.06;
           snowMask = smoothstep(snowLine, snowLine + 0.13, hNorm) * (1.0 - smoothstep(0.18, 0.36, baseSlope));
