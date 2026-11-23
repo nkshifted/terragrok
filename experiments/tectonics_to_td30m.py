@@ -78,6 +78,10 @@ def run_conditioned_td30m(
         histogram_raw=[0.0, 0.0, 0.0, 1.0, 1.8],
         torch_compile=False,
         caching_strategy="direct",
+        dtype="bf16" if device in ("mps", "cuda") else None,
+        decoder_tile_size=512,
+        decoder_tile_stride=448,
+        T=1,
     )
     world.to(device)
     world.set_cond_snr(list(cond_snr))

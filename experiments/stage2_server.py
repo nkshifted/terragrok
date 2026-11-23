@@ -55,11 +55,126 @@ def _format_coord_slug(lat_deg: float, lon_deg: float) -> str:
     return f"{abs(round(lat_deg))}{ns}_{abs(round(lon_deg))}{ew}"
 
 
+def _signed_sqrt(z: np.ndarray) -> np.ndarray:
+    return np.sign(z) * np.sqrt(np.abs(z))
+
+
+def _inv_signed_sqrt(s: np.ndarray) -> np.ndarray:
+    return np.sign(s) * (s * s)
+
+
+def _relax_angle_of_repose(
+    elev: np.ndarray,
+    cell_size_m: float,
+    max_slope_deg: float = 52.0,
+    iterations: int = 12,
+) -> np.ndarray:
+    """
+    Fast vectorized talus/thermal angle-of-repose relaxation on land pixels.
+    Prevents narrow Stage 1 islets from becoming sheer 80° vertical pillars
+    while preserving natural crags, peaks, and exact coastlines (ocean stays <= 0).
+    """
+    out = elev.astype(np.float32, copy=True)
+    max_diff = float(np.tan(np.deg2rad(max_slope_deg)) * cell_size_m)
+    max_diag = max_diff * 1.4142135
+    for _ in range(iterations):
+        # 4-connected + 4-diagonal neighbor max height cap
+        up = np.empty_like(out)
+        dn = np.empty_like(out)
+        lt = np.empty_like(out)
+        rt = np.empty_like(out)
+        up[1:, :] = out[:-1, :]
+        up[0, :] = out[0, :]
+        dn[:-1, :] = out[1:, :]
+        dn[-1, :] = out[-1, :]
+        lt[:, 1:] = out[:, :-1]
+        lt[:, 0] = out[:, 0]
+        rt[:, :-1] = out[:, 1:]
+        rt[:, -1] = out[:, -1]
+
+        nbr_min = np.minimum(np.minimum(up, dn), np.minimum(lt, rt))
+        cap = np.maximum(nbr_min + max_diff, 0.0)
+        excess = np.maximum(out - cap, 0.0)
+        # Relax excess gently downward on land so cliffs smooth into steep natural ridges
+        land = out > 0.0
+        if not np.any(excess[land] > 0.25):
+            break
+        out = np.where(land, out - excess * 0.42, out)
+
+        # Also check diagonals every other pass
+        d1 = np.roll(np.roll(out, 1, axis=0), 1, axis=1)
+        d2 = np.roll(np.roll(out, 1, axis=0), -1, axis=1)
+        d3 = np.roll(np.roll(out, -1, axis=0), 1, axis=1)
+        d4 = np.roll(np.roll(out, -1, axis=0), -1, axis=1)
+        d_min = np.minimum(np.minimum(d1, d2), np.minimum(d3, d4))
+        d_cap = np.maximum(d_min + max_diag, 0.0)
+        d_excess = np.maximum(out - d_cap, 0.0)
+        d_excess[0, :] = d_excess[-1, :] = d_excess[:, 0] = d_excess[:, -1] = 0.0
+        out = np.where(land, out - d_excess * 0.28, out)
+    return out
+
+
+def fuse_laplacian_coastline(
+    elev_td: np.ndarray,
+    ref_up: np.ndarray,
+    fidelity: str = "exact",
+) -> np.ndarray:
+    """
+    Laplacian frequency-band fusion in Terrain Diffusion's native signed-sqrt space:
+      - Macro shape (sigma=20px): blended toward exact 256x256 Stage 1 globe coastlines/islands
+      - High-frequency 30m geology (peaks, ridges, cirques, valleys): 100% Terrain Diffusion 30m!
+    Preserves every small island, bay, and strait from the globe square while keeping 30m AI realism
+    and natural coastal mountain slopes (no sheer cliff walls).
+    """
+    alpha_map = {"exact": 0.88, "balanced": 0.58, "creative": 0.0}
+    alpha = alpha_map.get(fidelity, 0.88)
+    if alpha <= 0.0:
+        return elev_td
+
+    s_td = _signed_sqrt(elev_td.astype(np.float32))
+    # Clip deep abyssal bathymetry (-2800m -> -320m) before signed-sqrt so ocean trenches
+    # don't create an extreme negative step that pulls down narrow island shorelines!
+    ref_clipped = np.maximum(ref_up.astype(np.float32), -320.0)
+    s_ref = _signed_sqrt(ref_clipped)
+
+    # Split Terrain Diffusion into macro shape + 30m AI alpine ridges/valleys
+    s_td_low = gaussian_filter(s_td, sigma=20.0, mode="nearest")
+    s_td_high = s_td - s_td_low
+
+    # Two-scale smoothing of Stage 1 reference:
+    #   - sigma=7.5px builds smooth, natural mountain slopes (no vertical 80° cookie-cutter walls!)
+    #   - sigma=2.5px preserves exact crisp shoreline contours of tiny islands & coves
+    s_ref_broad = gaussian_filter(s_ref, sigma=7.5, mode="nearest")
+    s_ref_crisp = gaussian_filter(s_ref, sigma=2.5, mode="nearest")
+    # Near the coastline (|s_ref_crisp| < 8), lean toward crisp shoreline; inland, lean toward smooth slopes
+    shore_band = np.exp(-((s_ref_crisp / 6.5) ** 2))
+    s_ref_low = s_ref_broad * (1.0 - 0.65 * shore_band) + s_ref_crisp * (0.65 * shore_band)
+
+    # Rescued small islands: where the globe has land (ref_up > 0) that 4x4 diffusion missed (elev_td <= 0),
+    # transfer genuine Terrain Diffusion neural ridge texture from landed areas so rescued islands look
+    # every bit as craggy and realistic as native TD30m peaks!
+    td_land = elev_td > 15.0
+    rescued = (ref_up > 0.0) & (~td_land)
+    if np.any(rescued) and np.any(td_land):
+        rescued_mask = gaussian_filter(rescued.astype(np.float32), sigma=3.5, mode="nearest")
+        donor_high = np.rot90(s_td_high, 2)
+        land_std = float(np.std(s_td_high[td_land]))
+        donor_std = float(np.std(donor_high[rescued])) if rescued.sum() > 20 else land_std
+        if donor_std < land_std * 0.45:
+            donor_high = 0.6 * np.rot90(s_td_high, 1) + 0.6 * np.rot90(s_td_high, 3)
+        # Scale rescued island ridge amplitude proportionally to island elevation so tiny atolls stay realistic
+        elev_weight = np.clip(s_ref_low / 26.0, 0.22, 0.90)
+        s_td_high = s_td_high * (1.0 - rescued_mask * 0.55) + donor_high * (rescued_mask * 0.68 * elev_weight)
+
+    s_fused = (1.0 - alpha) * s_td_low + alpha * s_ref_low + s_td_high
+    return _inv_signed_sqrt(s_fused).astype(np.float32)
+
+
 class WarmStage2Engine:
     def __init__(
         self,
         coarse_pooling: int = 2,
-        cond_snr: tuple[float, ...] = (0.15, 0.2, 1.0, 0.25, 1.0),
+        cond_snr: tuple[float, ...] = (0.45, 0.25, 1.0, 0.25, 1.0),
     ):
         self.coarse_pooling = coarse_pooling
         self.cond_snr = list(cond_snr)
@@ -112,7 +227,12 @@ class WarmStage2Engine:
     def load_model(self):
         t0 = time.perf_counter()
         try:
-            print(f"[Stage2] Loading xandergos/terrain-diffusion-30m onto {self.device} (pool={self.coarse_pooling})…", flush=True)
+            use_dtype = "bf16" if self.device in ("mps", "cuda") else None
+            print(
+                f"[Stage2] Loading xandergos/terrain-diffusion-30m onto {self.device} "
+                f"(pool={self.coarse_pooling}, dtype={use_dtype}, stride=448, T=1)…",
+                flush=True,
+            )
             world = WorldPipeline.from_pretrained(
                 "xandergos/terrain-diffusion-30m",
                 seed=42,
@@ -120,6 +240,10 @@ class WarmStage2Engine:
                 histogram_raw=[0.0, 0.0, 0.0, 1.0, 1.8],
                 torch_compile=False,
                 caching_strategy="direct",
+                dtype=use_dtype,
+                decoder_tile_size=512,
+                decoder_tile_stride=448,
+                T=1,
             )
             world.to(self.device)
             world.set_cond_snr(self.cond_snr)
@@ -214,6 +338,9 @@ class WarmStage2Engine:
                 flush=True,
             )
 
+            quality = str(payload.get("quality", "high")).lower()
+            self.world.onestep_latent = quality == "fast"
+
             prev_cwd = os.getcwd()
             os.chdir(REPO_ROOT / ".vendor" / "terrain-diffusion")
             try:
@@ -242,17 +369,20 @@ class WarmStage2Engine:
             finally:
                 os.chdir(prev_cwd)
 
-            # Fidelity metrics vs Stage 1 tectonic reference
-            ref_up = zoom(ref_elev, out_n / ref_size, order=1)
+            # Fidelity metrics & optional Laplacian Coastline Lock vs Stage 1 tectonic reference
+            fidelity = str(payload.get("fidelity", "exact")).lower()
+            ref_up = zoom(ref_elev, out_n / ref_size, order=3).astype(np.float32)
+            elev_fused = fuse_laplacian_coastline(elev_raw, ref_up, fidelity=fidelity)
+
             ref_land = ref_up > 0.0
-            gen_land = elev_raw > 0.0
+            gen_land = elev_fused > 0.0
             inter = np.logical_and(ref_land, gen_land).sum()
             union = np.logical_or(ref_land, gen_land).sum() + 1e-6
             iou = float(inter / union)
             std_ref = float(np.std(ref_up))
-            std_gen = float(np.std(elev_raw))
+            std_gen = float(np.std(elev_fused))
             corr = (
-                float(np.corrcoef(ref_up.ravel(), elev_raw.ravel())[0, 1])
+                float(np.corrcoef(ref_up.ravel(), elev_fused.ravel())[0, 1])
                 if std_ref > 1e-3 and std_gen > 1e-3
                 else 0.0
             )
@@ -266,10 +396,23 @@ class WarmStage2Engine:
             )
 
             world_span_m = 4800.0
-            land_mask = elev_raw > 0.0
-            max_land_m = float(np.percentile(elev_raw[land_mask], 99.6)) if land_mask.any() else 1000.0
-            v_scale = 460.0 / max(max_land_m, 400.0)
-            elev_viewer = np.where(land_mask, elev_raw * v_scale, np.maximum(elev_raw * 0.05, -55.0)).astype(np.float32)
+            land_mask = elev_fused > 0.0
+            max_land_m = float(np.percentile(elev_fused[land_mask], 99.6)) if land_mask.any() else 1000.0
+            v_scale = min(430.0 / max(max_land_m, 450.0), 0.44)
+            elev_viewer = np.where(land_mask, elev_fused * v_scale, np.maximum(elev_fused * 0.05, -55.0)).astype(np.float32)
+            # Soft-knee extreme outlier peaks above 330m so tiny islets don't tower as vertical spires
+            elev_viewer = np.where(
+                elev_viewer > 330.0,
+                330.0 + 115.0 * np.tanh((elev_viewer - 330.0) / 150.0),
+                elev_viewer,
+            ).astype(np.float32)
+            # Talus / angle-of-repose relaxation (~52° max macro cliff) before micro-crag refinement
+            elev_viewer = _relax_angle_of_repose(
+                elev_viewer,
+                cell_size_m=world_span_m / out_n,
+                max_slope_deg=52.0,
+                iterations=14,
+            )
             elev_refined = apply_micro_detail_refinement(elev_viewer, world_span_m=world_span_m, seed=td_seed)
 
             ref_temp_up = zoom(ref_temp, out_n / ref_size, order=1)

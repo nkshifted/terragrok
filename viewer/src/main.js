@@ -16,7 +16,7 @@ renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 
 const scene = new THREE.Scene();
-const camera = new THREE.PerspectiveCamera(56, window.innerWidth / window.innerHeight, 0.4, 10000);
+const camera = new THREE.PerspectiveCamera(56, window.innerWidth / window.innerHeight, 0.4, 20000);
 
 // Lights (driving multi-tier trees, boulders & explorer character)
 const hemiLight = new THREE.HemisphereLight('#b9dcff', '#4b5a40', 0.92);
@@ -107,6 +107,112 @@ const explorer = new THREE.Group();
 }
 scene.add(explorer);
 
+// ---------- Isometric Explorer Pin & Cursor Reticle (visible ONLY in Mode 3 / Diorama) ----------
+const explorerPin = new THREE.Group();
+explorerPin.visible = false;
+{
+  // Ground beacon ring
+  const baseRing = new THREE.Mesh(
+    new THREE.RingGeometry(2.4, 3.6, 36),
+    new THREE.MeshBasicMaterial({ color: 0xff6b4a, side: THREE.DoubleSide, transparent: true, opacity: 0.92, depthWrite: false })
+  );
+  baseRing.rotation.x = -Math.PI / 2;
+  baseRing.position.y = 0.35;
+  baseRing.name = 'pinBaseRing';
+  explorerPin.add(baseRing);
+
+  // Expanding pulse ring
+  const pulseRing = new THREE.Mesh(
+    new THREE.RingGeometry(3.2, 4.1, 36),
+    new THREE.MeshBasicMaterial({ color: 0xffa07a, side: THREE.DoubleSide, transparent: true, opacity: 0.7, depthWrite: false })
+  );
+  pulseRing.rotation.x = -Math.PI / 2;
+  pulseRing.position.y = 0.4;
+  pulseRing.name = 'pinPulseRing';
+  explorerPin.add(pulseRing);
+
+  // Vertical beacon stem
+  const stem = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.32, 0.2, 11.5, 10),
+    new THREE.MeshBasicMaterial({ color: 0xfff0e6, transparent: true, opacity: 0.9 })
+  );
+  stem.position.y = 6.0;
+  explorerPin.add(stem);
+
+  // Floating map-pin teardrop head (high-contrast coral-red + white core)
+  const pinHead = new THREE.Group();
+  pinHead.position.y = 14.2;
+  pinHead.name = 'pinHead';
+
+  const tip = new THREE.Mesh(
+    new THREE.ConeGeometry(2.35, 4.2, 18),
+    new THREE.MeshBasicMaterial({ color: 0xff4d2e })
+  );
+  tip.rotation.x = Math.PI;
+  tip.position.y = -2.4;
+  pinHead.add(tip);
+
+  const bulb = new THREE.Mesh(
+    new THREE.SphereGeometry(2.65, 20, 16),
+    new THREE.MeshBasicMaterial({ color: 0xff4d2e })
+  );
+  pinHead.add(bulb);
+
+  const core = new THREE.Mesh(
+    new THREE.SphereGeometry(1.15, 14, 12),
+    new THREE.MeshBasicMaterial({ color: 0xffffff })
+  );
+  core.position.z = 0;
+  pinHead.add(core);
+
+  const halo = new THREE.Mesh(
+    new THREE.TorusGeometry(2.95, 0.22, 10, 28),
+    new THREE.MeshBasicMaterial({ color: 0x0f172a })
+  );
+  pinHead.add(halo);
+
+  explorerPin.add(pinHead);
+}
+scene.add(explorerPin);
+
+// Cursor ground target reticle in Isometric mode (shows where 'T' / double-click will relocate explorer)
+const cursorReticle = new THREE.Group();
+cursorReticle.visible = false;
+{
+  const outer = new THREE.Mesh(
+    new THREE.RingGeometry(2.5, 3.6, 32),
+    new THREE.MeshBasicMaterial({
+      color: 0x38bdf8,
+      side: THREE.DoubleSide,
+      transparent: true,
+      opacity: 0.9,
+      depthTest: false,
+      depthWrite: false,
+    })
+  );
+  outer.rotation.x = -Math.PI / 2;
+  outer.position.y = 0.8;
+  outer.renderOrder = 25;
+  cursorReticle.add(outer);
+
+  const dot = new THREE.Mesh(
+    new THREE.CircleGeometry(0.95, 20),
+    new THREE.MeshBasicMaterial({
+      color: 0xe0f2fe,
+      side: THREE.DoubleSide,
+      transparent: true,
+      opacity: 0.95,
+      depthTest: false,
+      depthWrite: false,
+    })
+  );
+  dot.rotation.x = -Math.PI / 2;
+  dot.position.y = 0.9;
+  dot.renderOrder = 26;
+  cursorReticle.add(dot);
+}
+scene.add(cursorReticle);
+
 const player = {
   pos: new THREE.Vector3(0, 20, 0),
   velY: 0,
@@ -121,13 +227,87 @@ const camRig = {
   dist: 18,
   dioramaCenter: new THREE.Vector3(0, 0, 0),
   dioramaDist: 760,
-  dioramaYaw: Math.PI * 0.25,
+  dioramaYaw: 0.0, // North-Up so Diorama aligns 1:1 with the Stage 1 globe target square!
 };
 
 // ---------- Input Handling ----------
 const keys = new Set();
 let isDragging = false;
 let lastMouse = { x: 0, y: 0 };
+const pointerNdc = { x: 0, y: 0, inside: false };
+const pickRaycaster = new THREE.Raycaster();
+let dioramaCursorHit = null;
+let pinDropFlash = 0;
+
+function getDioramaPlaneY() {
+  return Math.max((world?.meta?.maxElev || 160) * state.vScale * 0.22, 20);
+}
+
+function pickTerrainAtNdc(ndcX, ndcY) {
+  if (!world) return null;
+  pickRaycaster.setFromCamera({ x: ndcX, y: ndcY }, camera);
+  const o = pickRaycaster.ray.origin;
+  const d = pickRaycaster.ray.direction;
+  if (d.y >= -1e-4) return null;
+
+  const halfSpan = world.meta.worldSpan * 0.49;
+  const maxY = Math.max(world.meta.maxElev * state.vScale + 30, 60);
+  const tStart = Math.max(1.0, (maxY - o.y) / d.y);
+  const tEnd = Math.min(20000, (-60 - o.y) / d.y);
+  if (tEnd <= tStart) return null;
+
+  const steps = 96;
+  const dt = (tEnd - tStart) / steps;
+  let prevT = tStart;
+  for (let i = 1; i <= steps; i++) {
+    const t = tStart + dt * i;
+    const x = o.x + d.x * t;
+    const y = o.y + d.y * t;
+    const z = o.z + d.z * t;
+    const surfY = Math.max(sampleHeight(x, z), 0);
+    if (y - surfY <= 0) {
+      let lo = prevT;
+      let hi = t;
+      for (let b = 0; b < 10; b++) {
+        const mid = (lo + hi) * 0.5;
+        const mx = o.x + d.x * mid;
+        const my = o.y + d.y * mid;
+        const mz = o.z + d.z * mid;
+        const mh = Math.max(sampleHeight(mx, mz), 0);
+        if (my - mh <= 0) hi = mid;
+        else lo = mid;
+      }
+      const fx = o.x + d.x * hi;
+      const fz = o.z + d.z * hi;
+      if (Math.abs(fx) > halfSpan || Math.abs(fz) > halfSpan) return null;
+      const fy = Math.max(sampleHeight(fx, fz), 0);
+      return new THREE.Vector3(fx, fy, fz);
+    }
+    prevT = t;
+  }
+  return null;
+}
+
+function relocateExplorerTo(x, z) {
+  if (!world) return false;
+  const halfSpan = world.meta.worldSpan * 0.48;
+  const cx = THREE.MathUtils.clamp(x, -halfSpan, halfSpan);
+  const cz = THREE.MathUtils.clamp(z, -halfSpan, halfSpan);
+  const cy = Math.max(sampleHeight(cx, cz), 0.2);
+  player.pos.set(cx, cy, cz);
+  player.velY = 0;
+  player.grounded = true;
+  explorer.position.copy(player.pos);
+  pinDropFlash = 1.0;
+  return true;
+}
+
+function updatePointerNdc(e) {
+  const rect = canvas.getBoundingClientRect();
+  pointerNdc.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+  pointerNdc.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+  pointerNdc.inside = true;
+}
 
 window.addEventListener('keydown', (e) => {
   if (e.target.tagName === 'SELECT' || e.target.tagName === 'INPUT') return;
@@ -138,11 +318,24 @@ window.addEventListener('keydown', (e) => {
   if (k === '3') setCameraMode('diorama');
   if (k === 'v') setStyleMode((state.styleMode + 1) % 3);
   if (k === 'h') document.body.classList.toggle('hud-hidden');
+  if (k === 't' && state.camMode === 'diorama') {
+    const hit = pointerNdc.inside ? pickTerrainAtNdc(pointerNdc.x, pointerNdc.y) : null;
+    if (hit) {
+      relocateExplorerTo(hit.x, hit.z);
+    } else {
+      // Fallback: place explorer at the center of the isometric view
+      relocateExplorerTo(camRig.dioramaCenter.x, camRig.dioramaCenter.z);
+    }
+  }
+  if (k === 'f' && state.camMode === 'diorama') {
+    camRig.dioramaCenter.set(player.pos.x, getDioramaPlaneY(), player.pos.z);
+  }
   if (e.code === 'Space') e.preventDefault();
 });
 window.addEventListener('keyup', (e) => keys.delete(e.key.toLowerCase()));
 
 canvas.addEventListener('pointerdown', (e) => {
+  updatePointerNdc(e);
   isDragging = true;
   lastMouse = { x: e.clientX, y: e.clientY };
   canvas.setPointerCapture(e.pointerId);
@@ -151,7 +344,18 @@ canvas.addEventListener('pointerup', (e) => {
   isDragging = false;
   if (canvas.hasPointerCapture(e.pointerId)) canvas.releasePointerCapture(e.pointerId);
 });
+canvas.addEventListener('pointerleave', () => {
+  pointerNdc.inside = false;
+  dioramaCursorHit = null;
+});
+canvas.addEventListener('dblclick', (e) => {
+  if (state.camMode !== 'diorama') return;
+  updatePointerNdc(e);
+  const hit = pickTerrainAtNdc(pointerNdc.x, pointerNdc.y);
+  if (hit) relocateExplorerTo(hit.x, hit.z);
+});
 canvas.addEventListener('pointermove', (e) => {
+  updatePointerNdc(e);
   if (!isDragging) return;
   const dx = e.clientX - lastMouse.x;
   const dy = e.clientY - lastMouse.y;
@@ -169,7 +373,7 @@ canvas.addEventListener(
   (e) => {
     e.preventDefault();
     if (state.camMode === 'diorama') {
-      camRig.dioramaDist = THREE.MathUtils.clamp(camRig.dioramaDist * (1 + e.deltaY * 0.001), 160, 5200);
+      camRig.dioramaDist = THREE.MathUtils.clamp(camRig.dioramaDist * (1 + e.deltaY * 0.001), 160, 7400);
     } else if (state.camMode === 'third') {
       camRig.dist = THREE.MathUtils.clamp(camRig.dist * (1 + e.deltaY * 0.001), 8, 120);
     }
@@ -485,7 +689,10 @@ function teleportTo(landmarkKey) {
   const y = Math.max(sampleHeight(x, z), 0.5);
   player.pos.set(x, y, z);
   player.velY = 0;
-  camRig.dioramaCenter.set(x, y, z);
+  player.grounded = true;
+  explorer.position.copy(player.pos);
+  camRig.dioramaCenter.set(x, getDioramaPlaneY(), z);
+  pinDropFlash = 1.0;
 
   // Frame toward highest mountain peak for dramatic horizon
   const peak = world.meta.landmarks.peak || [0.5, 0.5];
@@ -516,18 +723,23 @@ function setCameraMode(mode) {
 
   if (mode === 'diorama') {
     camera.fov = 24;
-    camRig.dioramaCenter.copy(player.pos);
+    camRig.dioramaCenter.set(player.pos.x, getDioramaPlaneY(), player.pos.z);
     explorer.visible = true;
     explorer.scale.setScalar(2.4);
+    explorerPin.visible = true;
   } else if (mode === 'first') {
     camera.fov = 66;
     camRig.pitch = -0.05;
     explorer.visible = false;
+    explorerPin.visible = false;
+    cursorReticle.visible = false;
   } else {
     camera.fov = 56;
     camRig.pitch = 0.09;
     explorer.visible = true;
     explorer.scale.setScalar(1.0);
+    explorerPin.visible = false;
+    cursorReticle.visible = false;
   }
   camera.updateProjectionMatrix();
   syncFogDensity();
@@ -698,17 +910,59 @@ function updateMovement(dt) {
     camRig.dioramaCenter.addScaledVector(right, rightInput * panSpeed * dt);
     camRig.dioramaCenter.x = THREE.MathUtils.clamp(camRig.dioramaCenter.x, -halfSpan, halfSpan);
     camRig.dioramaCenter.z = THREE.MathUtils.clamp(camRig.dioramaCenter.z, -halfSpan, halfSpan);
-    camRig.dioramaCenter.y = Math.max(sampleHeight(camRig.dioramaCenter.x, camRig.dioramaCenter.z), 0);
+    // Keep camera glide strictly on a level aerial plane (zero jumping up/down over ridges!)
+    camRig.dioramaCenter.y = getDioramaPlaneY();
 
     const pitch = THREE.MathUtils.degToRad(40);
     const hDist = Math.cos(pitch) * camRig.dioramaDist;
     const vDist = Math.sin(pitch) * camRig.dioramaDist;
-    camera.position.set(
-      camRig.dioramaCenter.x + Math.sin(camRig.dioramaYaw) * hDist,
-      camRig.dioramaCenter.y + vDist,
-      camRig.dioramaCenter.z + Math.cos(camRig.dioramaYaw) * hDist
-    );
+    const camX = camRig.dioramaCenter.x + Math.sin(camRig.dioramaYaw) * hDist;
+    const camZ = camRig.dioramaCenter.z + Math.cos(camRig.dioramaYaw) * hDist;
+    // Only prevent camera itself from ever dipping into a tall mountain when zoomed super tight
+    const camY = Math.max(camRig.dioramaCenter.y + vDist, sampleHeight(camX, camZ) + 45);
+    camera.position.set(camX, camY, camZ);
     camera.lookAt(camRig.dioramaCenter);
+
+    // Keep explorer & high-contrast map pin synced to player.pos, scaled nicely for current zoom
+    const groundAtPlayer = Math.max(sampleHeight(player.pos.x, player.pos.z), 0.2);
+    player.pos.y = groundAtPlayer;
+    explorer.position.copy(player.pos);
+
+    const t = clock.elapsedTime;
+    const pinScale = THREE.MathUtils.clamp(camRig.dioramaDist / 420, 0.85, 11.5);
+    explorerPin.visible = true;
+    explorerPin.position.set(player.pos.x, groundAtPlayer, player.pos.z);
+    explorerPin.scale.setScalar(pinScale);
+
+    const pinHead = explorerPin.getObjectByName('pinHead');
+    if (pinHead) {
+      const dropBounce = pinDropFlash > 0 ? Math.sin(pinDropFlash * Math.PI) * 5.0 : 0;
+      pinHead.position.y = 14.2 + Math.sin(t * 3.0) * 0.85 + dropBounce;
+      pinHead.rotation.y = camRig.dioramaYaw;
+    }
+    const pulseRing = explorerPin.getObjectByName('pinPulseRing');
+    if (pulseRing) {
+      const phase = (t * 0.75) % 1.0;
+      const boost = pinDropFlash > 0 ? 1.0 + (1.0 - pinDropFlash) * 2.4 : 1.0 + phase * 1.45;
+      pulseRing.scale.setScalar(boost);
+      pulseRing.material.opacity = pinDropFlash > 0 ? pinDropFlash * 0.95 : (1.0 - phase) * 0.65;
+    }
+    if (pinDropFlash > 0) pinDropFlash = Math.max(0, pinDropFlash - dt * 2.4);
+
+    // Update live terrain cursor reticle for 'T' / double-click relocation
+    if (pointerNdc.inside && !isDragging) {
+      dioramaCursorHit = pickTerrainAtNdc(pointerNdc.x, pointerNdc.y);
+    } else {
+      dioramaCursorHit = null;
+    }
+    if (dioramaCursorHit) {
+      cursorReticle.visible = true;
+      cursorReticle.position.copy(dioramaCursorHit);
+      cursorReticle.scale.setScalar(THREE.MathUtils.clamp(camRig.dioramaDist / 480, 0.75, 9.5));
+    } else {
+      cursorReticle.visible = false;
+    }
+
     player.activity = 'DIORAMA VIEW';
     return;
   }
@@ -792,7 +1046,10 @@ function updateMovement(dt) {
 
 function updateTelemetry() {
   if (!world) return;
-  const pt = state.camMode === 'diorama' ? camRig.dioramaCenter : player.pos;
+  const pt =
+    state.camMode === 'diorama'
+      ? dioramaCursorHit || camRig.dioramaCenter
+      : player.pos;
   const elev = sampleHeight(pt.x, pt.z);
   const slope = sampleSlopeDeg(pt.x, pt.z);
   const m = sampleMasks(pt.x, pt.z);
@@ -891,9 +1148,14 @@ window.__terragrok = {
   teleportTo,
   setCameraMode,
   setStyleMode,
+  relocateExplorer: relocateExplorerTo,
+  getPlayerPos: () => ({ x: player.pos.x, y: player.pos.y, z: player.pos.z }),
+  getDioramaCenter: () => ({ x: camRig.dioramaCenter.x, y: camRig.dioramaCenter.y, z: camRig.dioramaCenter.z }),
+  getCameraY: () => camera.position.y,
+  isPinVisible: () => explorerPin.visible,
   focusDiorama(x, z, dist = 340) {
     setCameraMode('diorama');
-    camRig.dioramaCenter.set(x, sampleHeight(x, z), z);
+    camRig.dioramaCenter.set(x, getDioramaPlaneY(), z);
     camRig.dioramaDist = dist;
   },
 };

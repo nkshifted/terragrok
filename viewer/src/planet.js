@@ -826,7 +826,7 @@ function extractStage2Payload() {
   const coarseSize = 8;
   const padding = 64;
   const fullCoarse = coarseSize + 2 * padding; // 136x136
-  const refSize = 128;
+  const refSize = 256; // High-res exact globe reference for Laplacian Coastline Lock!
 
   const { c, east, north } = tangentBasisForDir(stage2.targetDir);
   const cellStepRad = THREE.MathUtils.degToRad(stage2.spanDeg) / coarseSize;
@@ -875,6 +875,8 @@ function extractStage2Payload() {
     seed: genState.seed,
     archetype: genState.archetype,
     seaLevelBias: genState.seaLevelBias,
+    quality: document.getElementById('sel-stage2-quality')?.value || 'high',
+    fidelity: document.getElementById('sel-stage2-fidelity')?.value || 'exact',
     latDeg: Number(latDeg.toFixed(2)),
     lonDeg: Number(lonDeg.toFixed(2)),
     spanDeg: stage2.spanDeg,

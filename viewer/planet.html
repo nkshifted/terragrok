@@ -247,12 +247,24 @@
             Click anywhere on the globe to target a 30m AI terrain patch…
           </div>
           <div style="display:flex;gap:6px;margin-bottom:6px;">
-            <select id="sel-stage2-span" style="flex:1;padding:5px 7px;border-radius:6px;background:rgba(10,18,32,0.92);color:#dce9fa;border:1px solid rgba(130,180,240,0.28);font-size:11px;">
-              <option value="32">Region: 32° Compact Peninsula</option>
-              <option value="46" selected>Region: 46° Coast &amp; Mountains</option>
-              <option value="64">Region: 64° Broad Basin</option>
+            <select id="sel-stage2-span" style="flex:1;min-width:0;padding:5px 6px;border-radius:6px;background:rgba(10,18,32,0.92);color:#dce9fa;border:1px solid rgba(130,180,240,0.28);font-size:11px;">
+              <option value="14">14° Local Island / Bay</option>
+              <option value="28">28° Regional Coast</option>
+              <option value="46" selected>46° Archipelago / Range</option>
+              <option value="64">64° Broad Basin</option>
             </select>
-            <button id="btn-target-explorer" title="Center target on current location" style="padding:5px 8px;font-size:11px;">Snap</button>
+            <button id="btn-target-explorer" title="Center target on current location" style="flex:0 0 auto;padding:5px 8px;font-size:11px;">Snap</button>
+          </div>
+          <div style="display:flex;gap:6px;margin-bottom:6px;">
+            <select id="sel-stage2-fidelity" style="flex:1.25;min-width:0;padding:5px 6px;border-radius:6px;background:rgba(10,18,32,0.92);color:#dce9fa;border:1px solid rgba(130,180,240,0.28);font-size:11px;" title="Exact Coast = preserves all islands & bays via Laplacian Lock · Creative AI = pure unguided diffusion">
+              <option value="exact" selected>Exact Coast</option>
+              <option value="balanced">Balanced</option>
+              <option value="creative">Creative AI</option>
+            </select>
+            <select id="sel-stage2-quality" style="flex:1;min-width:0;padding:5px 6px;border-radius:6px;background:rgba(10,18,32,0.92);color:#dce9fa;border:1px solid rgba(130,180,240,0.28);font-size:11px;" title="High = full 2-step BF16 (~13s total, r=1.000) · Fast = 1-step BF16 (~10s total, r=0.996)">
+              <option value="high" selected>High (~13s)</option>
+              <option value="fast">Fast (~10s)</option>
+            </select>
           </div>
           <button id="btn-synthesize" class="btn-synth">✨ Synthesize 30m AI Terrain Here</button>
           <div id="synth-progress-wrap" class="synth-progress-wrap">
