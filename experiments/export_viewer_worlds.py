@@ -497,10 +497,16 @@ def solve_physical_hydrology(
         else:
             sm_r, sm_c = pts_r, pts_c
 
-        # Sample depression-filled elevation so water flows strictly downhill without bumps
+        # Sample terrain elevation (prefer actual elev over depression-filled height so rivers
+        # never float in mid-air over shallow un-laked depressions!)
         samp_h = np.array(
             [
-                float(filled[int(np.clip(round(rr), 0, ny - 1)), int(np.clip(round(cc), 0, nx - 1))])
+                float(
+                    min(
+                        filled[int(np.clip(round(rr), 0, ny - 1)), int(np.clip(round(cc), 0, nx - 1))],
+                        elev[int(np.clip(round(rr), 0, ny - 1)), int(np.clip(round(cc), 0, nx - 1))] + 0.25,
+                    )
+                )
                 for rr, cc in zip(sm_r, sm_c)
             ],
             dtype=np.float64,
@@ -614,6 +620,14 @@ def solve_physical_hydrology(
         # Rendered 3D mesh spacing (viewer caps terrain mesh at 512x512 for 60 FPS)
         mesh_cell_m = world_span_m / max(min(nx, 512) - 1, 1)
 
+        # Closest-point riverbed carving (prevents downstream low points from excavating
+        # deep caverns underneath upstream river segments on mountain slopes!).
+        closest_d = np.full((ny, nx), np.inf, dtype=np.float32)
+        closest_wy = np.zeros((ny, nx), dtype=np.float32)
+        closest_w = np.zeros((ny, nx), dtype=np.float32)
+        touched_r_lo, touched_r_hi = ny, 0
+        touched_c_lo, touched_c_hi = nx, 0
+
         spline_pts: list[list[float]] = []
         for i in range(len(path)):
             rr, cc = sm_r[i], sm_c[i]
@@ -621,11 +635,11 @@ def solve_physical_hydrology(
             w_m = float(widths[i])
             sl = float(slopes[i])
 
-            # Keep ribbon cleanly inside carved channel (no excess recession that lets mesh triangles bridge over it)
+            # Recess water surface slightly below surrounding valley banks so water sits IN ground
             if (i == 0 and source_type == "lake") or (i == len(path) - 1 and dest_type in ("lake", "sea")):
                 ribbon_y = wy
             else:
-                ribbon_y = wy - 0.12
+                ribbon_y = wy - 0.15
 
             node_id = int(path[i][0] * nx + path[i][1])
             if node_id not in node_water_y:
@@ -635,34 +649,62 @@ def solve_physical_hydrology(
             wz = (rr / (ny - 1) - 0.5) * world_span_m
             spline_pts.append([round(wx, 2), round(wz, 2), round(ribbon_y, 2), round(w_m, 2), round(sl, 3)])
 
-            # Carve mesh-safe riverbed & graded wet banks (don't over-carve inside lakes)
             ir, ic = int(np.clip(round(rr), 0, ny - 1)), int(np.clip(round(cc), 0, nx - 1))
             if lake_id_grid[ir, ic] > 0:
                 continue
 
-            # Guarantee carved trough spans at least ~1.1x rendered mesh vertex spacing so triangles NEVER bridge over water!
-            half_w = max(w_m * 0.58, mesh_cell_m * 0.92)
-            bank_w = max(w_m * 1.15, half_w * 1.75)
-            rad_cells = int(np.ceil(bank_w / cell_m)) + 2
+            # Record nearest river sample per cell inside the graded bank zone
+            half_w = w_m * 0.52
+            bank_w = max(w_m * 0.95, half_w + cell_m * 1.4)
+            rad_cells = int(np.ceil(bank_w / cell_m)) + 1
             r_lo, r_hi = max(0, ir - rad_cells), min(ny, ir + rad_cells + 1)
             c_lo, c_hi = max(0, ic - rad_cells), min(nx, ic + rad_cells + 1)
             yy, xx = np.mgrid[r_lo:r_hi, c_lo:c_hi]
             d_m = np.hypot(yy - rr, xx - cc) * cell_m
 
-            in_bank = d_m < bank_w
-            bed_depth = 1.65 + min(w_m * 0.10, 2.8)
-            # Flat-bottomed U-trough inside half_w so all vertices under the ribbon sit strictly below ribbon_y!
-            in_channel = d_m <= half_w
-            t_bank = np.clip((d_m - half_w) / max(bank_w - half_w, 0.5), 0.0, 1.0)
-            blend = t_bank * t_bank * (3.0 - 2.0 * t_bank)
-            floor_h = ribbon_y - bed_depth * (0.68 + 0.32 * np.clip(1.0 - (d_m / half_w) ** 2, 0.0, 1.0))
-            sub = carved[r_lo:r_hi, c_lo:c_hi]
-            bank_target = np.maximum(sub, ribbon_y + 0.45)
-            desired = np.where(in_channel, floor_h, (ribbon_y - bed_depth * 0.65) * (1.0 - blend) + bank_target * blend)
-            carved[r_lo:r_hi, c_lo:c_hi] = np.where(in_bank, np.minimum(sub, desired), sub)
+            better = (d_m < bank_w) & (d_m < closest_d[r_lo:r_hi, c_lo:c_hi])
+            if np.any(better):
+                cd_view = closest_d[r_lo:r_hi, c_lo:c_hi]
+                cwy_view = closest_wy[r_lo:r_hi, c_lo:c_hi]
+                cw_view = closest_w[r_lo:r_hi, c_lo:c_hi]
+                cd_view[better] = d_m[better]
+                cwy_view[better] = ribbon_y
+                cw_view[better] = w_m
+                touched_r_lo = min(touched_r_lo, r_lo)
+                touched_r_hi = max(touched_r_hi, r_hi)
+                touched_c_lo = min(touched_c_lo, c_lo)
+                touched_c_hi = max(touched_c_hi, c_hi)
 
-            wet = np.clip(1.0 - d_m / max(w_m * 0.78, mesh_cell_m * 1.05), 0.0, 1.0)
-            channel_mask[r_lo:r_hi, c_lo:c_hi] = np.maximum(channel_mask[r_lo:r_hi, c_lo:c_hi], wet)
+        # Apply shallow, realistic riverbed carving ONCE per pixel using its exact closest river point!
+        if touched_r_lo < touched_r_hi and touched_c_lo < touched_c_hi:
+            cd = closest_d[touched_r_lo:touched_r_hi, touched_c_lo:touched_c_hi]
+            cwy = closest_wy[touched_r_lo:touched_r_hi, touched_c_lo:touched_c_hi]
+            cw = closest_w[touched_r_lo:touched_r_hi, touched_c_lo:touched_c_hi]
+            sub = carved[touched_r_lo:touched_r_hi, touched_c_lo:touched_c_hi]
+            lk_sub = lake_id_grid[touched_r_lo:touched_r_hi, touched_c_lo:touched_c_hi]
+
+            valid = np.isfinite(cd) & (lk_sub == 0)
+            if np.any(valid):
+                half_w_grid = cw * 0.52
+                bank_w_grid = np.maximum(cw * 0.95, half_w_grid + cell_m * 1.4)
+                # Realistic ankle-to-waist riverbed depth (0.45m brooks -> 1.15m wide rivers)
+                bed_depth = 0.45 + np.minimum(cw * 0.025, 0.70)
+                in_chan = cd <= half_w_grid
+                chan_prof = np.clip(1.0 - (cd / np.maximum(half_w_grid, 0.5)) ** 2, 0.0, 1.0)
+                floor_h = cwy - bed_depth * (0.35 + 0.65 * chan_prof)
+
+                t_bank = np.clip((cd - half_w_grid) / np.maximum(bank_w_grid - half_w_grid, 0.5), 0.0, 1.0)
+                blend = t_bank * t_bank * (3.0 - 2.0 * t_bank)
+                # Bank rises cleanly THROUGH water surface at half_w so outer edge meets solid ground!
+                bank_h = (cwy - bed_depth * 0.35) * (1.0 - blend) + np.maximum(sub, cwy + 0.25) * blend
+                desired = np.where(in_chan, floor_h, bank_h)
+                carved[touched_r_lo:touched_r_hi, touched_c_lo:touched_c_hi] = np.where(
+                    valid, np.minimum(sub, desired), sub
+                )
+                wet = np.where(valid, np.clip(1.0 - cd / np.maximum(cw * 0.72, cell_m * 1.1), 0.0, 1.0), 0.0)
+                channel_mask[touched_r_lo:touched_r_hi, touched_c_lo:touched_c_hi] = np.maximum(
+                    channel_mask[touched_r_lo:touched_r_hi, touched_c_lo:touched_c_hi], wet
+                )
 
         rivers_data.append({
             "source": source_type,

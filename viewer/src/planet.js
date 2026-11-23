@@ -69,16 +69,31 @@ let oceanMesh = null;
 let atmoMesh = null;
 let explorerGroup = null;
 let homeBeacon = null;
+let targetPatchGroup = null;
 
-// Active planet generation settings
+// Active planet generation settings (also supports ?seed=&archetype= restore from index.html!)
+const urlParams = new URLSearchParams(window.location.search);
+const initialSeed = Number(urlParams.get('seed')) || 523;
+const initialArch = urlParams.get('archetype') || 'earth';
 const genState = {
-  seed: 523, // Starts on a rich multi-continent Earth-like tectonic seed!
+  seed: initialSeed, // Starts on a rich multi-continent Earth-like tectonic seed!
   planetNumber: 1,
-  archetype: 'earth',
+  archetype: ['auto', 'earth', 'rifting', 'supercontinent', 'archipelago'].includes(initialArch)
+    ? initialArch
+    : 'earth',
   seaLevelBias: 0.0,
   reliefScale: 1.0,
   showTectonics: false,
   magNorth: new THREE.Vector3(0.16, 0.98, 0.12).normalize(),
+};
+
+const stage2 = {
+  targetDir: new THREE.Vector3(0, 0, 1),
+  spanDeg: 46,
+  serverReady: false,
+  serverDevice: 'mps',
+  synthesizing: false,
+  lastResult: null,
 };
 
 const nav = {
@@ -99,6 +114,9 @@ const keys = new Set();
 let pointerDown = false;
 let pointerLastX = 0;
 let pointerLastY = 0;
+let pointerDownX = 0;
+let pointerDownY = 0;
+let pointerMoved = 0;
 
 window.addEventListener('keydown', (e) => {
   if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
@@ -117,14 +135,30 @@ canvas.addEventListener('pointerdown', (e) => {
   pointerDown = true;
   pointerLastX = e.clientX;
   pointerLastY = e.clientY;
+  pointerDownX = e.clientX;
+  pointerDownY = e.clientY;
+  pointerMoved = 0;
 });
-window.addEventListener('pointerup', () => {
+window.addEventListener('pointerup', (e) => {
+  const wasClick = pointerDown && pointerMoved < 5 && e.target === canvas;
   pointerDown = false;
+  if (wasClick && nav.mode === 'orbit' && currentPlanet && faceMeshes.length > 0) {
+    const ndc = new THREE.Vector2(
+      (e.clientX / window.innerWidth) * 2 - 1,
+      -(e.clientY / window.innerHeight) * 2 + 1
+    );
+    raycaster.setFromCamera(ndc, camera);
+    const hits = raycaster.intersectObjects(faceMeshes, false);
+    if (hits.length > 0) {
+      setStage2Target(hits[0].point.clone().normalize());
+    }
+  }
 });
 window.addEventListener('pointermove', (e) => {
   if (!pointerDown) return;
   const dx = e.clientX - pointerLastX;
   const dy = e.clientY - pointerLastY;
+  pointerMoved += Math.hypot(dx, dy);
   pointerLastX = e.clientX;
   pointerLastY = e.clientY;
 
@@ -626,6 +660,333 @@ function buildPlanetMesh() {
   planetGroup.add(poleGroup);
 
   scene.add(planetGroup);
+  rebuildTargetPatchOverlay();
+}
+
+// ---------- Stage 1 -> Stage 2 Target Patch Overlay & Conditioning Extractor ----------
+function tangentBasisForDir(centerDir) {
+  const c = centerDir.clone().normalize();
+  const ref = Math.abs(c.y) < 0.9 ? new THREE.Vector3(0, 1, 0) : new THREE.Vector3(1, 0, 0);
+  const east = new THREE.Vector3().crossVectors(ref, c).normalize();
+  const north = new THREE.Vector3().crossVectors(c, east).normalize();
+  return { c, east, north };
+}
+
+function projectTangentToUnitDir(c, east, north, tx, ty, out = new THREE.Vector3()) {
+  const ang = Math.hypot(tx, ty);
+  if (ang < 1e-6) return out.copy(c);
+  const ca = Math.cos(ang);
+  const sa = Math.sin(ang) / ang;
+  return out
+    .set(
+      c.x * ca + (east.x * tx + north.x * ty) * sa,
+      c.y * ca + (east.y * tx + north.y * ty) * sa,
+      c.z * ca + (east.z * tx + north.z * ty) * sa
+    )
+    .normalize();
+}
+
+function rebuildTargetPatchOverlay() {
+  if (targetPatchGroup) {
+    scene.remove(targetPatchGroup);
+    targetPatchGroup.traverse((o) => {
+      if (o.geometry) o.geometry.dispose();
+      if (o.material) o.material.dispose();
+    });
+    targetPatchGroup = null;
+  }
+  if (!currentPlanet || !stage2.targetDir) return;
+
+  const R = currentPlanet.meta.radius;
+  const { c, east, north } = tangentBasisForDir(stage2.targetDir);
+  const halfRad = THREE.MathUtils.degToRad(stage2.spanDeg * 0.5);
+  const g = new THREE.Group();
+  const tmp = new THREE.Vector3();
+
+  // Build glowing curved square outline hugging the sphere surface
+  const segs = 28;
+  const borderPts = [];
+  const edges = [
+    [-1, -1, 1, -1],
+    [1, -1, 1, 1],
+    [1, 1, -1, 1],
+    [-1, 1, -1, -1],
+  ];
+  for (const [sx0, sy0, sx1, sy1] of edges) {
+    for (let i = 0; i < segs; i++) {
+      const f = i / segs;
+      const tx = (sx0 + (sx1 - sx0) * f) * halfRad;
+      const ty = (sy0 + (sy1 - sy0) * f) * halfRad;
+      projectTangentToUnitDir(c, east, north, tx, ty, tmp);
+      const s = sampleSphereSurface(tmp);
+      const r = R + Math.max(s.elev, 0) + 22;
+      borderPts.push(tmp.clone().multiplyScalar(r));
+    }
+  }
+  borderPts.push(borderPts[0].clone());
+
+  const outerLine = new THREE.Line(
+    new THREE.BufferGeometry().setFromPoints(borderPts),
+    new THREE.LineBasicMaterial({ color: '#38f2d8', transparent: true, opacity: 0.95 })
+  );
+  g.add(outerLine);
+
+  // Subtle translucent center crosshair + beacon pin
+  const crossLen = halfRad * 0.16;
+  const crossH = [];
+  const crossV = [];
+  for (let i = -4; i <= 4; i++) {
+    const u = (i / 4) * crossLen;
+    projectTangentToUnitDir(c, east, north, u, 0, tmp);
+    crossH.push(tmp.clone().multiplyScalar(R + Math.max(sampleSphereSurface(tmp).elev, 0) + 26));
+    projectTangentToUnitDir(c, east, north, 0, u, tmp);
+    crossV.push(tmp.clone().multiplyScalar(R + Math.max(sampleSphereSurface(tmp).elev, 0) + 26));
+  }
+  const crossMat = new THREE.LineBasicMaterial({ color: '#ffd166', transparent: true, opacity: 0.9 });
+  g.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(crossH), crossMat));
+  g.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(crossV), crossMat));
+
+  const cSample = sampleSphereSurface(c);
+  const dot = new THREE.Mesh(
+    new THREE.SphereGeometry(22, 12, 10),
+    new THREE.MeshBasicMaterial({ color: '#ffd166' })
+  );
+  dot.position.copy(c).multiplyScalar(R + Math.max(cSample.elev, 0) + 26);
+  g.add(dot);
+
+  targetPatchGroup = g;
+  scene.add(targetPatchGroup);
+}
+
+function updateStage2TargetInfo() {
+  const el = document.getElementById('stage2-target-info');
+  if (!el || !currentPlanet) return;
+  const { c, east, north } = tangentBasisForDir(stage2.targetDir);
+  const halfRad = THREE.MathUtils.degToRad(stage2.spanDeg * 0.5);
+  const tmp = new THREE.Vector3();
+
+  let landCnt = 0;
+  let totalCnt = 0;
+  let peakH = 0;
+  let sumTemp = 0;
+  let landTempCnt = 0;
+  for (let r = 0; r < 9; r++) {
+    const ty = (0.5 - r / 8) * 2 * halfRad;
+    for (let col = 0; col < 9; col++) {
+      const tx = (col / 8 - 0.5) * 2 * halfRad;
+      projectTangentToUnitDir(c, east, north, tx, ty, tmp);
+      const s = sampleSphereSurface(tmp);
+      totalCnt++;
+      if (s.elev > 0) {
+        landCnt++;
+        if (s.elev > peakH) peakH = s.elev;
+        sumTemp += s.tempC;
+        landTempCnt++;
+      }
+    }
+  }
+  const latDeg = THREE.MathUtils.radToDeg(Math.asin(THREE.MathUtils.clamp(c.y, -1, 1)));
+  const lonDeg = THREE.MathUtils.radToDeg(Math.atan2(c.x, c.z));
+  const latStr = `${Math.abs(latDeg).toFixed(1)}°${latDeg >= 0 ? 'N' : 'S'}`;
+  const lonStr = `${Math.abs(lonDeg).toFixed(1)}°${lonDeg >= 0 ? 'E' : 'W'}`;
+  const landPct = Math.round((landCnt / totalCnt) * 100);
+  const avgTemp = landTempCnt > 0 ? Math.round(sumTemp / landTempCnt) : Math.round(sampleSphereSurface(c).tempC);
+
+  let note = '';
+  if (landPct < 8) {
+    note = '<br/><span style="color:#fbbf24;">Mostly open ocean — click a coast or continent for richer terrain!</span>';
+  } else if (landPct > 94) {
+    note = '<br/><span style="color:#86efac;">Interior mountain / plateau basin</span>';
+  } else {
+    note = '<br/><span style="color:#7dd3fc;">Coastline + mountain range (ideal for 30m AI detail)</span>';
+  }
+  el.innerHTML =
+    `<strong>Target: ${latStr} ${lonStr}</strong> (${stage2.spanDeg}° box)<br/>` +
+    `Land <strong>${landPct}%</strong> · Peak <strong>${Math.round(peakH)} m</strong> · Avg <strong>${avgTemp}°C</strong>` +
+    note;
+}
+
+function setStage2Target(unitDir) {
+  stage2.targetDir.copy(unitDir).normalize();
+  rebuildTargetPatchOverlay();
+  updateStage2TargetInfo();
+}
+
+function float32ToBase64(f32) {
+  const bytes = new Uint8Array(f32.buffer, f32.byteOffset, f32.byteLength);
+  let binary = '';
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+  }
+  return btoa(binary);
+}
+
+function extractStage2Payload() {
+  const coarseSize = 8;
+  const padding = 64;
+  const fullCoarse = coarseSize + 2 * padding; // 136x136
+  const refSize = 128;
+
+  const { c, east, north } = tangentBasisForDir(stage2.targetDir);
+  const cellStepRad = THREE.MathUtils.degToRad(stage2.spanDeg) / coarseSize;
+  const tmp = new THREE.Vector3();
+
+  const sampleGrid = (gridSize, totalSpanRad, withStd) => {
+    const elev = new Float32Array(gridSize * gridSize);
+    const temp = new Float32Array(gridSize * gridSize);
+    const precip = new Float32Array(gridSize * gridSize);
+    const tempStd = withStd ? new Float32Array(gridSize * gridSize) : null;
+    const precipCv = withStd ? new Float32Array(gridSize * gridSize) : null;
+
+    for (let r = 0; r < gridSize; r++) {
+      const ty = ((gridSize - 1) * 0.5 - r) * (totalSpanRad / gridSize);
+      for (let col = 0; col < gridSize; col++) {
+        const tx = (col - (gridSize - 1) * 0.5) * (totalSpanRad / gridSize);
+        projectTangentToUnitDir(c, east, north, tx, ty, tmp);
+        const s = sampleSphereSurface(tmp);
+        const idx = r * gridSize + col;
+        // Map planet elevation [0..240] -> Earth DEM meters [15..3315], ocean -> [-2860..-60]
+        const maxRef = Math.max(240.0 * genState.reliefScale, 120.0);
+        if (s.elev > 0) {
+          const norm = Math.min(1.25, s.elev / maxRef);
+          elev[idx] = 15.0 + Math.pow(norm, 1.15) * 3300.0;
+        } else {
+          const dNorm = Math.min(1.0, -s.elev / 260.0);
+          elev[idx] = -(60.0 + dNorm * 2800.0);
+        }
+        temp[idx] = Math.max(-18.0, Math.min(32.0, s.tempC));
+        precip[idx] = 120.0 + Math.pow(s.moisture, 1.25) * 2800.0;
+        if (withStd) {
+          tempStd[idx] = (2.5 + Math.abs(tmp.y) * 11.5) * 100.0;
+          precipCv[idx] = 22.0 + (1.0 - s.moisture) * 48.0;
+        }
+      }
+    }
+    return { elev, temp, precip, tempStd, precipCv };
+  };
+
+  const coarse = sampleGrid(fullCoarse, fullCoarse * cellStepRad, true);
+  const ref = sampleGrid(refSize, coarseSize * cellStepRad, false);
+  const latDeg = THREE.MathUtils.radToDeg(Math.asin(THREE.MathUtils.clamp(c.y, -1, 1)));
+  const lonDeg = THREE.MathUtils.radToDeg(Math.atan2(c.x, c.z));
+
+  return {
+    seed: genState.seed,
+    archetype: genState.archetype,
+    seaLevelBias: genState.seaLevelBias,
+    latDeg: Number(latDeg.toFixed(2)),
+    lonDeg: Number(lonDeg.toFixed(2)),
+    spanDeg: stage2.spanDeg,
+    coarseSize,
+    padding,
+    refSize,
+    condElev: float32ToBase64(coarse.elev),
+    condTemp: float32ToBase64(coarse.temp),
+    condTempStd: float32ToBase64(coarse.tempStd),
+    condPrecip: float32ToBase64(coarse.precip),
+    condPrecipCv: float32ToBase64(coarse.precipCv),
+    refElev: float32ToBase64(ref.elev),
+    refTemp: float32ToBase64(ref.temp),
+    refPrecip: float32ToBase64(ref.precip),
+  };
+}
+
+async function pollStage2Health() {
+  const pill = document.getElementById('stage2-pill');
+  if (!pill) return;
+  try {
+    const resp = await fetch('/api/health', { cache: 'no-store' });
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    const data = await resp.json();
+    stage2.serverReady = !!data.ready;
+    stage2.serverDevice = (data.device || 'mps').toUpperCase();
+    if (data.ready) {
+      pill.textContent = `● ${stage2.serverDevice} Ready`;
+      pill.className = 'status-pill ready';
+    } else if (data.error) {
+      pill.textContent = '✕ Load Error';
+      pill.className = 'status-pill offline';
+    } else {
+      pill.textContent = `◐ Warming ${stage2.serverDevice}…`;
+      pill.className = 'status-pill warming';
+    }
+  } catch {
+    stage2.serverReady = false;
+    pill.textContent = '○ Server Offline';
+    pill.className = 'status-pill offline';
+  }
+}
+
+async function synthesizeStage2Target() {
+  if (stage2.synthesizing || !currentPlanet) return;
+  const btn = document.getElementById('btn-synthesize');
+  const progWrap = document.getElementById('synth-progress-wrap');
+  const progFill = document.getElementById('synth-progress-fill');
+  const progText = document.getElementById('synth-status-text');
+  const resBox = document.getElementById('synth-result');
+  const resMetrics = document.getElementById('synth-result-metrics');
+  const openBtn = document.getElementById('btn-open-3d');
+
+  stage2.synthesizing = true;
+  btn.disabled = true;
+  btn.textContent = 'Synthesizing 30m AI Terrain…';
+  resBox.style.display = 'none';
+  progWrap.style.display = 'block';
+  progFill.style.width = '6%';
+  progText.textContent = 'Extracting Stage 1 tectonic conditioning fields…';
+
+  // Poll live server phase while MPS runs
+  const pollId = window.setInterval(async () => {
+    try {
+      const r = await fetch('/api/status', { cache: 'no-store' });
+      if (!r.ok) return;
+      const st = await r.json();
+      if (st.message) progText.textContent = st.message;
+      if (typeof st.progress === 'number') {
+        progFill.style.width = `${Math.max(8, Math.round(st.progress * 100))}%`;
+      }
+    } catch {
+      // ignore transient poll errors
+    }
+  }, 600);
+
+  try {
+    const payload = extractStage2Payload();
+    progFill.style.width = '14%';
+    progText.textContent = `Sending patch to ${stage2.serverDevice} Terrain Diffusion 30m…`;
+
+    const resp = await fetch('/api/synthesize', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await resp.json();
+    if (!resp.ok || !data.ok) {
+      throw new Error(data.error || `Server error (${resp.status})`);
+    }
+
+    stage2.lastResult = data;
+    progFill.style.width = '100%';
+    progText.textContent = `Done in ${data.totalSec}s (MPS ${data.mpsSec}s · Hydro ${data.hydroSec}s)`;
+    resMetrics.innerHTML =
+      `<strong>✓ ${data.coordLabel} Synthesized!</strong> (${data.totalSec}s)<br/>` +
+      `Coastline IoU <strong>${data.iouPct}%</strong> · Elev r=<strong>${data.elevCorr}</strong><br/>` +
+      `<strong>${data.lakeCount}</strong> alpine lakes · <strong>${data.riverCount}</strong> rivers (0 dead-ends)`;
+    openBtn.href = data.openUrl;
+    resBox.style.display = 'block';
+  } catch (err) {
+    progFill.style.width = '100%';
+    progText.innerHTML =
+      `<span style="color:#fca5a5;">${err.message || 'Stage 2 server unreachable.'} ` +
+      `(Run <code>just stage2-server</code>)</span>`;
+  } finally {
+    window.clearInterval(pollId);
+    stage2.synthesizing = false;
+    btn.disabled = false;
+    btn.textContent = '✨ Synthesize 30m AI Terrain Here';
+    pollStage2Health();
+  }
 }
 
 function buildSphericalForest(R, maxElev) {
@@ -768,6 +1129,7 @@ function landAtDirection(unitDir) {
   homeBeacon.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), beaconDir);
   homeBeacon.visible = true;
 
+  setStage2Target(nav.surfDir);
   setMode('surface');
 }
 
@@ -831,12 +1193,17 @@ function generatePlanetFromState(customSeed = null) {
   buildPlanetMesh();
   refreshContinentButtons();
 
-  // Aim orbit camera toward the planet's largest continent so every roll opens on dramatic geography!
+  // Aim orbit camera + Stage 2 target reticle toward the planet's largest continent so every roll opens on dramatic geography!
   if (currentPlanet.meta.landmasses.length > 0) {
     const d = currentPlanet.meta.landmasses[0].dir;
     nav.orbitYaw = Math.atan2(d[0], d[2]);
     nav.orbitPitch = THREE.MathUtils.clamp(Math.asin(Math.max(-0.8, Math.min(0.8, d[1]))), -0.75, 0.75);
+    setStage2Target(new THREE.Vector3(...d));
+  } else {
+    setStage2Target(new THREE.Vector3(0, 0, 1));
   }
+  const resBox = document.getElementById('synth-result');
+  if (resBox) resBox.style.display = 'none';
 
   const m = currentPlanet.meta;
   document.getElementById('planet-subtitle').textContent =
@@ -898,6 +1265,22 @@ document.getElementById('chk-tectonics').addEventListener('change', (e) => {
 
 document.getElementById('chk-poles').addEventListener('change', (e) => {
   if (poleGroup) poleGroup.visible = e.target.checked;
+});
+
+document.getElementById('sel-stage2-span').addEventListener('change', (e) => {
+  stage2.spanDeg = Number(e.target.value) || 46;
+  rebuildTargetPatchOverlay();
+  updateStage2TargetInfo();
+});
+
+document.getElementById('btn-target-explorer').addEventListener('click', () => {
+  if (!currentPlanet) return;
+  const dir = nav.mode === 'surface' ? nav.surfDir.clone() : camera.position.clone().normalize();
+  setStage2Target(dir);
+});
+
+document.getElementById('btn-synthesize').addEventListener('click', () => {
+  synthesizeStage2Target();
 });
 
 // ---------- HUD & Live Magnetic Compass ----------
@@ -1085,9 +1468,17 @@ window.__terragrokPlanet = {
     nav.orbitDist = dist;
   },
   getMeta: () => currentPlanet?.meta ?? null,
+  setStage2Target(x, y, z) {
+    setStage2Target(new THREE.Vector3(x, y, z));
+  },
+  synthesizeStage2Target,
+  getStage2Result: () => stage2.lastResult,
 };
 
 // Boot!
+document.getElementById('sel-archetype').value = genState.archetype;
 buildExplorerAndBeacon();
 generatePlanetFromState(genState.seed);
+pollStage2Health();
+window.setInterval(pollStage2Health, 4000);
 animate();

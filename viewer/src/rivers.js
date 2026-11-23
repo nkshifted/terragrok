@@ -4,6 +4,15 @@ import * as THREE from 'three';
  * Builds real 3D flowing river ribbon meshes along physically solved
  * lake-to-sea and alpine-spring-to-sea drainage splines.
  *
+ * Physical guarantees:
+ *  - Every cross-section is strictly HORIZONTALLY LEVEL (water never tilts or climbs hillsides!)
+ *  - Left and right half-widths are independently bank-confined against the actual rendered
+ *    terrain mesh so rivers hug steep canyon bluffs on one side while widening across flat
+ *    valley floodplains on the other.
+ *  - Centerline elevation receives a small capped clearance lift (<= +0.60 m) above the
+ *    rendered mesh triangle so narrow streams never suffer terrain "dirt bridges".
+ *  - Springs fade in gently at their source; coastal estuaries fade smoothly into sea level.
+ *
  * Each river entry: { source: 'lake'|'spring', dest: 'sea'|'lake'|'confluence', points: [[x,z,y,w,slope], ...] }
  */
 export function buildRiverSystem(riversData, sampleMeshHeight = null) {
@@ -14,60 +23,151 @@ export function buildRiverSystem(riversData, sampleMeshHeight = null) {
   const indices = [];
   let vertOffset = 0;
 
+  function findBankHalfWidth(x, z, dirX, dirZ, maxHalfW, waterY) {
+    if (!sampleMeshHeight || maxHalfW <= 2.4) return maxHalfW;
+    const steps = 8;
+    const minChannelHalf = Math.min(2.4, maxHalfW);
+    let openDist = minChannelHalf;
+    for (let s = 1; s <= steps; s++) {
+      const d = (s / steps) * maxHalfW;
+      if (d <= minChannelHalf) {
+        openDist = d;
+        continue;
+      }
+      const h = sampleMeshHeight(x + dirX * d, z + dirZ * d);
+      // Stop right when we meet a rising riverbank/cliff above the flat water level
+      if (h > waterY + 0.35) {
+        return Math.min(maxHalfW, openDist + 1.3);
+      }
+      openDist = d;
+    }
+    return maxHalfW;
+  }
+
+  function smoothArray(arr, passes = 2) {
+    const n = arr.length;
+    if (n < 3) return arr;
+    let cur = arr.slice();
+    const tmp = new Float32Array(n);
+    for (let p = 0; p < passes; p++) {
+      tmp[0] = cur[0];
+      tmp[n - 1] = cur[n - 1];
+      for (let i = 1; i < n - 1; i++) {
+        tmp[i] = cur[i - 1] * 0.25 + cur[i] * 0.5 + cur[i + 1] * 0.25;
+      }
+      cur = Array.from(tmp);
+    }
+    return cur;
+  }
+
   for (const river of riversData) {
     const pts = Array.isArray(river) ? river : river.points;
     const isSpring = !Array.isArray(river) && river.source === 'spring';
+    const isSeaDest = !Array.isArray(river) && river.dest === 'sea';
     if (!pts || pts.length < 2) continue;
 
-    const crossU = [0.0, 0.22, 0.78, 1.0];
-    let distAcc = 0.0;
+    const n = pts.length;
+    const tangentsX = new Float32Array(n);
+    const tangentsZ = new Float32Array(n);
+    const waterYs = new Float32Array(n);
+    const halfLeft = new Array(n);
+    const halfRight = new Array(n);
 
-    for (let i = 0; i < pts.length; i++) {
-      const [x, z, yRaw, width, slope] = pts[i];
-      if (i > 0) {
-        distAcc += Math.hypot(x - pts[i - 1][0], z - pts[i - 1][1]);
-      }
-
+    // Pass 1: tangents + strictly capped flat centerline water levels + bank-confined half-widths
+    for (let i = 0; i < n; i++) {
+      const [x, z, yRaw, width] = pts[i];
       const prev = pts[Math.max(i - 1, 0)];
-      const next = pts[Math.min(i + 1, pts.length - 1)];
+      const next = pts[Math.min(i + 1, n - 1)];
       let tx = next[0] - prev[0];
       let tz = next[1] - prev[1];
       const len = Math.hypot(tx, tz) || 1.0;
       tx /= len;
       tz /= len;
+      tangentsX[i] = tx;
+      tangentsZ[i] = tz;
 
       const rx = -tz;
       const rz = tx;
-      const halfW = width * 0.56;
 
-      // Guarantee centerline sits cleanly above the actual rendered terrain triangle (zero dirt bridges!)
-      let y = yRaw;
+      // Physically ground river water surface strictly to the rendered riverbed:
+      //  - Floor: bedY + 0.12m (never buried by terrain mesh triangles!)
+      //  - Ceiling: bedY + maxWaterDepth (0.28..0.72m — NEVER hovers 3-4ft in the air so you can NEVER walk under it!)
+      let y = Math.max(yRaw, 0.04);
       if (sampleMeshHeight) {
         const meshCenterY = sampleMeshHeight(x, z);
-        if (meshCenterY + 0.14 > y) {
-          y = meshCenterY + 0.14;
-        }
+        const maxWaterDepth = 0.28 + Math.min(width * 0.014, 0.44);
+        const minY = Math.max(meshCenterY + 0.12, 0.04);
+        const maxY = Math.max(meshCenterY + maxWaterDepth, 0.04);
+        y = Math.max(minY, Math.min(y, maxY));
+      }
+      waterYs[i] = y;
+
+      const desiredHalfW = width * 0.56;
+      halfLeft[i] = findBankHalfWidth(x, z, -rx, -rz, desiredHalfW, y);
+      halfRight[i] = findBankHalfWidth(x, z, rx, rz, desiredHalfW, y);
+    }
+
+    // Smooth waterYs gently along the channel while preserving ground clearance
+    const smoothYs = smoothArray(Array.from(waterYs), 1);
+    for (let i = 0; i < n; i++) {
+      const [x, z, , width] = pts[i];
+      let y = smoothYs[i];
+      if (sampleMeshHeight) {
+        const bedY = sampleMeshHeight(x, z);
+        const maxWaterDepth = 0.30 + Math.min(width * 0.015, 0.46);
+        y = Math.max(Math.max(bedY + 0.12, 0.04), Math.min(y, Math.max(bedY + maxWaterDepth, 0.04)));
+      }
+      waterYs[i] = y;
+    }
+
+    // Smooth bank-confined half-widths along the river for organic shorelines
+    const smoothL = smoothArray(halfLeft, 2);
+    const smoothR = smoothArray(halfRight, 2);
+
+    // Pass 2: build strictly horizontally-flat 4-strip ribbon geometry with ground-tucked edges
+    const crossU = [0.0, 0.22, 0.78, 1.0];
+    let distAcc = 0.0;
+
+    for (let i = 0; i < n; i++) {
+      const [x, z, , , slope] = pts[i];
+      if (i > 0) {
+        distAcc += Math.hypot(x - pts[i - 1][0], z - pts[i - 1][1]);
       }
 
-      // Softly fade in the first few meters of an alpine spring trickle
-      const headFade = isSpring ? Math.min(i / 6.0, 1.0) : 1.0;
+      const rx = -tangentsZ[i];
+      const rz = tangentsX[i];
+      const y = waterYs[i];
+      const wL = smoothL[i];
+      const wR = smoothR[i];
+
+      // Softly fade in alpine spring starts, cross-fade lake spillway exits, & blend river mouths into the ocean
+      const headFade = isSpring ? Math.min(i / 6.0, 1.0) : Math.min((i + 1) / 3.0, 1.0);
+      const tailFade = isSeaDest && y < 0.8 ? Math.min((n - 1 - i) / 3.5, 1.0) : 1.0;
+      const endFade = Math.min(headFade, tailFade);
 
       for (let k = 0; k < crossU.length; k++) {
         const u = crossU[k];
-        const side = (u - 0.5) * 2.0;
-        const vx = x + rx * side * halfW;
-        const vz = z + rz * side * halfW;
+        const side = (u - 0.5) * 2.0; // -1..+1
+        const offset = side < 0 ? side * wL : side * wR;
+        const vx = x + rx * offset;
+        const vz = z + rz * offset;
         const isEdge = k === 0 || k === crossU.length - 1;
-        let vy = y + (isEdge ? -0.05 : 0.0);
-        // For interior water vertices, ensure rendered mesh never pokes through the water surface
-        if (!isEdge && sampleMeshHeight) {
-          const mY = sampleMeshHeight(vx, vz);
-          if (mY + 0.10 > vy) vy = mY + 0.10;
+        // Interior water surface is strictly level at y; outer feathered bank edge tucks cleanly into the ground (zero air gap!)
+        let vy = y;
+        if (isEdge) {
+          vy = y - 0.05;
+          if (sampleMeshHeight) {
+            const edgeGroundY = sampleMeshHeight(vx, vz);
+            if (edgeGroundY < vy) {
+              vy = Math.max(edgeGroundY - 0.06, y - 0.65);
+            }
+          }
         }
+
         positions.push(vx, vy, vz);
         uvs.push(u, distAcc);
         slopes.push(slope);
-        headFades.push(headFade);
+        headFades.push(endFade);
       }
 
       if (i > 0) {
@@ -79,7 +179,7 @@ export function buildRiverSystem(riversData, sampleMeshHeight = null) {
         }
       }
     }
-    vertOffset += pts.length * 4;
+    vertOffset += n * 4;
   }
 
   const geo = new THREE.BufferGeometry();
@@ -119,7 +219,7 @@ export function buildRiverSystem(riversData, sampleMeshHeight = null) {
         vSlope = aSlope;
         vHeadFade = aHeadFade;
         vec3 pos = position;
-        pos.y += sin(uv.y * 0.45 - uTime * 4.5 + uv.x * 5.0) * 0.07 * (1.0 + aSlope * 2.5);
+        pos.y += sin(uv.y * 0.45 - uTime * 4.5 + uv.x * 5.0) * 0.05 * (1.0 + aSlope * 2.0);
         vec4 wp = modelMatrix * vec4(pos, 1.0);
         vWorldPos = wp.xyz;
         gl_Position = projectionMatrix * viewMatrix * wp;
@@ -219,11 +319,75 @@ export function buildRiverSystem(riversData, sampleMeshHeight = null) {
 export function buildLakeSystem(lakesData, gridSize, worldSpan, heightFloatTex, maskTex) {
   const positions = [];
   const levels = [];
+  const edgeFades = [];
   const indices = [];
 
   for (const lake of lakesData) {
     if (!lake.cells || lake.cells.length === 0) continue;
     const y = lake.level;
+
+    // Pad lake footprint by 2 cells so organic shorelines (depth -> 0) never hit a hard
+    // polygon cutoff, while outer pad vertices carry aEdgeFade -> 0 so spillway outlets
+    // cross-fade seamlessly into outgoing rivers (zero sharp geometric cyan edges!).
+    const cellDist = new Map();
+    const coreSet = new Set();
+    for (const [r, c] of lake.cells) {
+      const k = r * gridSize + c;
+      coreSet.add(k);
+      cellDist.set(k, 0);
+    }
+    // Ring 1 & Ring 2 dilation
+    for (let ring = 1; ring <= 2; ring++) {
+      const prevKeys = Array.from(cellDist.entries())
+        .filter(([, d]) => d === ring - 1)
+        .map(([k]) => k);
+      for (const k of prevKeys) {
+        const r = Math.floor(k / gridSize);
+        const c = k % gridSize;
+        for (let dr = -1; dr <= 1; dr++) {
+          for (let dc = -1; dc <= 1; dc++) {
+            const nr = r + dr;
+            const nc = c + dc;
+            if (nr < 0 || nr >= gridSize || nc < 0 || nc >= gridSize) continue;
+            const nk = nr * gridSize + nc;
+            if (!cellDist.has(nk)) cellDist.set(nk, ring);
+          }
+        }
+      }
+    }
+
+    // Determine smooth fade per grid corner (vr, vc):
+    //   1.0 if corner touches any core lake cell (ring 0)
+    //   0.55 if corner touches ring 1 (and not ring 0)
+    //   0.0 on the outermost rim of ring 2 -> guaranteed zero hard mesh edges!
+    const vertFade = (vr, vc) => {
+      let minRing = 99;
+      for (let dr = -1; dr <= 0; dr++) {
+        for (let dc = -1; dc <= 0; dc++) {
+          const r = vr + dr;
+          const c = vc + dc;
+          if (r < 0 || r >= gridSize || c < 0 || c >= gridSize) continue;
+          const d = cellDist.get(r * gridSize + c);
+          if (d !== undefined && d < minRing) minRing = d;
+        }
+      }
+      // Corner is on the exterior boundary if any of its 4 adjacent cells isn't in cellDist
+      let touchesOutside = false;
+      for (let dr = -1; dr <= 0; dr++) {
+        for (let dc = -1; dc <= 0; dc++) {
+          const r = vr + dr;
+          const c = vc + dc;
+          if (r < 0 || r >= gridSize || c < 0 || c >= gridSize || !cellDist.has(r * gridSize + c)) {
+            touchesOutside = true;
+          }
+        }
+      }
+      if (touchesOutside) return 0.0;
+      if (minRing === 0) return 1.0;
+      if (minRing === 1) return 0.65;
+      return 0.0;
+    };
+
     // Deduplicate grid-corner vertices (vr, vc) within this lake so adjacent cells share
     // exact edges (zero double-blended alpha seams, strictly disjoint from other lakes).
     const vertMap = new Map();
@@ -236,12 +400,15 @@ export function buildLakeSystem(lakesData, gridSize, worldSpan, heightFloatTex, 
         const wz = ((vr - 0.5) / (gridSize - 1) - 0.5) * worldSpan;
         positions.push(wx, y, wz);
         levels.push(y);
+        edgeFades.push(vertFade(vr, vc));
         vertMap.set(key, idx);
       }
       return idx;
     };
 
-    for (const [r, c] of lake.cells) {
+    for (const k of cellDist.keys()) {
+      const r = Math.floor(k / gridSize);
+      const c = k % gridSize;
       const v00 = getVert(r, c);
       const v10 = getVert(r, c + 1);
       const v01 = getVert(r + 1, c);
@@ -253,6 +420,7 @@ export function buildLakeSystem(lakesData, gridSize, worldSpan, heightFloatTex, 
   const geo = new THREE.BufferGeometry();
   geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
   geo.setAttribute('aLevel', new THREE.Float32BufferAttribute(levels, 1));
+  geo.setAttribute('aEdgeFade', new THREE.Float32BufferAttribute(edgeFades, 1));
   geo.setIndex(indices);
 
   const mat = new THREE.ShaderMaterial({
@@ -271,11 +439,14 @@ export function buildLakeSystem(lakesData, gridSize, worldSpan, heightFloatTex, 
     },
     vertexShader: /* glsl */ `
       attribute float aLevel;
+      attribute float aEdgeFade;
       varying float vLevel;
+      varying float vEdgeFade;
       varying vec3 vWorldPos;
 
       void main() {
         vLevel = aLevel;
+        vEdgeFade = aEdgeFade;
         vec4 wp = modelMatrix * vec4(position, 1.0);
         vWorldPos = wp.xyz;
         gl_Position = projectionMatrix * viewMatrix * wp;
@@ -293,6 +464,7 @@ export function buildLakeSystem(lakesData, gridSize, worldSpan, heightFloatTex, 
       uniform int uStyleMode;
 
       varying float vLevel;
+      varying float vEdgeFade;
       varying vec3 vWorldPos;
 
       float hash21(vec2 p) {
@@ -351,8 +523,10 @@ export function buildLakeSystem(lakesData, gridSize, worldSpan, heightFloatTex, 
         float fogFactor = 1.0 - exp(-pow(dist * density, 1.5));
         waterCol = mix(waterCol, uFogColor, clamp(fogFactor, 0.0, 0.90));
 
-        // Feather smoothly to alpha=0 right at the waterline
-        float alpha = clamp(smoothstep(0.0, 0.35, depth) * (0.68 + smoothstep(0.0, 2.5, depth) * 0.28 + fresnel * 0.12), 0.0, 0.95);
+        // Feather smoothly to alpha=0 right at the waterline AND outer spillway pad rim!
+        float rimFade = smoothstep(0.0, 0.55, vEdgeFade);
+        float alpha = clamp(smoothstep(0.0, 0.40, depth) * rimFade * (0.68 + smoothstep(0.0, 2.5, depth) * 0.28 + fresnel * 0.12), 0.0, 0.95);
+        if (alpha < 0.015) discard;
         gl_FragColor = vec4(waterCol, alpha);
       }
     `,

@@ -45,6 +45,10 @@ planet seed="42" radius="3000":
 export-viewer:
     python experiments/export_viewer_worlds.py
 
+# Launch persistent warm Stage 2 Terrain Diffusion 30m MPS server (http://127.0.0.1:8765)
+stage2-server:
+    uv run --extra diffusion python experiments/stage2_server.py --port 8765
+
 # Launch the interactive 3D world explorer at http://127.0.0.1:5173
 viewer:
     cd viewer && npm run dev

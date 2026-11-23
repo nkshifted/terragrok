@@ -85,6 +85,122 @@
         background: rgba(255, 255, 255, 0.04);
         border: 1px solid rgba(255, 255, 255, 0.08);
       }
+      #hud-left {
+        max-height: calc(100vh - 90px);
+        overflow-y: auto;
+      }
+      .stage2-card {
+        background: linear-gradient(155deg, rgba(22, 52, 88, 0.45), rgba(14, 24, 42, 0.72));
+        border: 1px solid rgba(92, 198, 255, 0.32);
+        border-radius: 10px;
+        padding: 9px 10px;
+      }
+      .stage2-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 6px;
+        margin-bottom: 6px;
+      }
+      .status-pill {
+        font-size: 10px;
+        font-weight: 600;
+        padding: 2px 7px;
+        border-radius: 999px;
+        letter-spacing: 0.02em;
+        background: rgba(255, 255, 255, 0.08);
+        color: #a4b6cc;
+        white-space: nowrap;
+      }
+      .status-pill.ready {
+        background: rgba(34, 197, 94, 0.20);
+        color: #7bf2a9;
+        border: 1px solid rgba(74, 222, 128, 0.35);
+      }
+      .status-pill.warming {
+        background: rgba(245, 158, 11, 0.20);
+        color: #fcd34d;
+        border: 1px solid rgba(251, 191, 36, 0.35);
+      }
+      .status-pill.offline {
+        background: rgba(148, 163, 184, 0.14);
+        color: #94a3b8;
+        border: 1px solid rgba(148, 163, 184, 0.22);
+      }
+      .target-readout {
+        font-size: 11px;
+        color: #d6e9ff;
+        line-height: 1.4;
+        margin-bottom: 7px;
+        padding: 6px 7px;
+        border-radius: 6px;
+        background: rgba(6, 12, 22, 0.55);
+        border: 1px solid rgba(124, 196, 255, 0.16);
+      }
+      .btn-synth {
+        width: 100%;
+        background: linear-gradient(135deg, #0ea5e9, #2563eb) !important;
+        border-color: rgba(125, 211, 252, 0.55) !important;
+        color: #fff !important;
+        font-weight: 600;
+        padding: 8px 10px !important;
+      }
+      .btn-synth:hover:not(:disabled) {
+        filter: brightness(1.12);
+      }
+      .btn-synth:disabled {
+        opacity: 0.55;
+        cursor: wait;
+      }
+      .synth-progress-wrap {
+        margin-top: 7px;
+        display: none;
+      }
+      .synth-progress-bar {
+        height: 5px;
+        border-radius: 999px;
+        background: rgba(255, 255, 255, 0.10);
+        overflow: hidden;
+        margin-bottom: 4px;
+      }
+      .synth-progress-fill {
+        height: 100%;
+        width: 0%;
+        background: linear-gradient(90deg, #38bdf8, #34d399);
+        transition: width 0.35s ease;
+      }
+      .synth-status-text {
+        font-size: 10.5px;
+        color: #9dd4ff;
+      }
+      .synth-result {
+        margin-top: 8px;
+        padding: 8px;
+        border-radius: 8px;
+        background: rgba(16, 185, 129, 0.14);
+        border: 1px solid rgba(52, 211, 153, 0.42);
+        display: none;
+      }
+      .synth-result-metrics {
+        font-size: 10.5px;
+        color: #c7f9e5;
+        line-height: 1.4;
+        margin-bottom: 6px;
+      }
+      .btn-open-3d {
+        display: block;
+        text-align: center;
+        text-decoration: none;
+        padding: 7px 10px;
+        border-radius: 7px;
+        font-size: 12px;
+        font-weight: 700;
+        color: #06281e;
+        background: linear-gradient(135deg, #34d399, #22d3ee);
+      }
+      .btn-open-3d:hover {
+        filter: brightness(1.08);
+      }
     </style>
   </head>
   <body>
@@ -117,7 +233,36 @@
           <button id="btn-mode-surface" class="btn-accent">Land &amp; Walk</button>
         </div>
         <div id="orbit-hint" class="hint-box">
-          <strong>Orbit Mode:</strong> Drag to rotate globe · Scroll to zoom · <strong>Double-click any continent or island arc</strong> to land and walk around the sphere!
+          <strong>Orbit Mode:</strong> Drag to rotate · <strong>Click</strong> any spot to aim the 30m AI target box · <strong>Double-click</strong> to land &amp; walk!
+        </div>
+      </div>
+
+      <div class="section">
+        <div class="stage2-card">
+          <div class="stage2-head">
+            <div class="section-label" style="margin:0;">STAGE 2 · AI 30m TERRAIN</div>
+            <span id="stage2-pill" class="status-pill offline">○ Checking…</span>
+          </div>
+          <div id="stage2-target-info" class="target-readout">
+            Click anywhere on the globe to target a 30m AI terrain patch…
+          </div>
+          <div style="display:flex;gap:6px;margin-bottom:6px;">
+            <select id="sel-stage2-span" style="flex:1;padding:5px 7px;border-radius:6px;background:rgba(10,18,32,0.92);color:#dce9fa;border:1px solid rgba(130,180,240,0.28);font-size:11px;">
+              <option value="32">Region: 32° Compact Peninsula</option>
+              <option value="46" selected>Region: 46° Coast &amp; Mountains</option>
+              <option value="64">Region: 64° Broad Basin</option>
+            </select>
+            <button id="btn-target-explorer" title="Center target on current location" style="padding:5px 8px;font-size:11px;">Snap</button>
+          </div>
+          <button id="btn-synthesize" class="btn-synth">✨ Synthesize 30m AI Terrain Here</button>
+          <div id="synth-progress-wrap" class="synth-progress-wrap">
+            <div class="synth-progress-bar"><div id="synth-progress-fill" class="synth-progress-fill"></div></div>
+            <div id="synth-status-text" class="synth-status-text">Preparing tectonic patch…</div>
+          </div>
+          <div id="synth-result" class="synth-result">
+            <div id="synth-result-metrics" class="synth-result-metrics"></div>
+            <a id="btn-open-3d" class="btn-open-3d" href="/index.html">Explore Synthesized 3D World →</a>
+          </div>
         </div>
       </div>
 

@@ -15,6 +15,10 @@ viewer/dist/
 out/
 .vendor/
 
+# Interactively synthesized Stage 2 worlds from planet.html (kept locally, not committed)
+viewer/public/worlds/planet_*
+viewer/public/worlds/synthesized_catalog.json
+
 # OS / Editor
 .DS_Store
 .vscode/

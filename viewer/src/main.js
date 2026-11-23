@@ -460,6 +460,19 @@ async function loadWorld(worldId) {
   setStyleMode(state.styleMode);
   teleportTo('plains');
 
+  // If this world came from a Stage 1 Spherical Planet, link straight back to that exact planet!
+  const planetLink = document.querySelector('a[href*="/planet.html"]');
+  if (planetLink) {
+    if (meta.planetOrigin) {
+      const { seed, archetype } = meta.planetOrigin;
+      planetLink.href = `/planet.html?seed=${encodeURIComponent(seed)}&archetype=${encodeURIComponent(archetype || 'earth')}`;
+      planetLink.textContent = `← Back to Planet #${seed}`;
+    } else {
+      planetLink.href = '/planet.html';
+      planetLink.textContent = 'Spherical Planet Mode →';
+    }
+  }
+
   loader.classList.add('hidden');
 }
 
@@ -849,10 +862,25 @@ function animate() {
 
 // ---------- Boot ----------
 async function init() {
-  catalog = await fetch('/worlds/catalog.json').then((r) => r.json());
+  const baseCatalog = await fetch('/worlds/catalog.json', { cache: 'no-store' }).then((r) => r.json());
+  let synthCatalog = [];
+  try {
+    const r = await fetch('/worlds/synthesized_catalog.json', { cache: 'no-store' });
+    if (r.ok) synthCatalog = await r.json();
+  } catch {
+    // No locally synthesized worlds yet
+  }
+  const seenIds = new Set(baseCatalog.map((w) => w.id));
+  catalog = [...baseCatalog, ...synthCatalog.filter((w) => !seenIds.has(w.id))];
+
   const select = document.getElementById('world-select');
   select.innerHTML = catalog.map((w) => `<option value="${w.id}">${w.title}</option>`).join('');
-  await loadWorld(catalog[0].id);
+
+  const reqWorld = new URLSearchParams(window.location.search).get('world');
+  const startId = reqWorld && catalog.some((w) => w.id === reqWorld) ? reqWorld : catalog[0].id;
+  select.value = startId;
+
+  await loadWorld(startId);
   applyPreset('zelda');
   animate();
 }
