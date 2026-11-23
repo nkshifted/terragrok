@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>TerraGrok — Walkable Spherical Planet Explorer</title>
+    <link rel="stylesheet" href="/src/style.css" />
+    <style>
+      .nav-link {
+        display: inline-block;
+        margin-top: 6px;
+        font-size: 11px;
+        color: #7cc4ff;
+        text-decoration: none;
+        border: 1px solid rgba(124, 196, 255, 0.28);
+        border-radius: 6px;
+        padding: 3px 8px;
+        background: rgba(56, 132, 224, 0.12);
+      }
+      .nav-link:hover {
+        background: rgba(56, 132, 224, 0.26);
+      }
+      .btn-primary {
+        background: linear-gradient(135deg, #2b7de9, #1f5ec4) !important;
+        border-color: rgba(130, 195, 255, 0.45) !important;
+        color: #fff !important;
+        font-weight: 600;
+      }
+      .btn-primary:hover {
+        filter: brightness(1.1);
+      }
+      .btn-accent {
+        background: rgba(45, 168, 128, 0.24) !important;
+        border-color: rgba(95, 230, 185, 0.42) !important;
+        color: #d6fff0 !important;
+        font-weight: 600;
+      }
+      #compass-wrap {
+        position: fixed;
+        top: 16px;
+        right: 16px;
+        width: 96px;
+        height: 96px;
+        border-radius: 50%;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        pointer-events: none;
+      }
+      #compass-dial {
+        position: relative;
+        width: 68px;
+        height: 68px;
+        border-radius: 50%;
+        border: 1.5px solid rgba(255, 255, 255, 0.28);
+        background: rgba(8, 14, 24, 0.55);
+      }
+      #compass-needle {
+        position: absolute;
+        left: 50%;
+        top: 50%;
+        width: 4px;
+        height: 50px;
+        margin-left: -2px;
+        margin-top: -25px;
+        transform-origin: center center;
+        background: linear-gradient(to bottom, #ff5b5b 0%, #ff5b5b 50%, #e5eef8 50%, #e5eef8 100%);
+        border-radius: 2px;
+      }
+      #compass-label {
+        font-size: 9.5px;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        color: #9bb4d4;
+        margin-top: 4px;
+      }
+      .hint-box {
+        font-size: 11px;
+        color: #a8bed8;
+        line-height: 1.4;
+        margin-top: 6px;
+        padding: 7px 8px;
+        border-radius: 7px;
+        background: rgba(255, 255, 255, 0.04);
+        border: 1px solid rgba(255, 255, 255, 0.08);
+      }
+    </style>
+  </head>
+  <body>
+    <canvas id="scene"></canvas>
+
+    <!-- Top-left Controls Panel -->
+    <aside id="hud-left" class="panel">
+      <div class="brand">
+        <h1>TerraGrok Planet</h1>
+        <p id="planet-subtitle">Generating spherical plate-tectonics world…</p>
+        <a class="nav-link" href="/index.html">← Flat Worlds Explorer</a>
+      </div>
+
+      <div class="section">
+        <div class="section-label">TECTONIC PLANET GENERATOR</div>
+        <div class="btn-row">
+          <button id="btn-reroll" class="btn-primary">Try Again (New Planet)</button>
+        </div>
+        <div style="margin-top: 6px;">
+          <select id="sel-archetype" style="width:100%;padding:6px 8px;border-radius:7px;background:rgba(14,22,36,0.9);color:#dce9fa;border:1px solid rgba(130,180,240,0.28);font-size:12px;">
+            <option value="auto">Archetype: Auto (Varied)</option>
+            <option value="earth" selected>Archetype: Earth-Like (Varied Continents)</option>
+            <option value="rifting">Archetype: Rifting Breakup (Matching Coasts)</option>
+            <option value="supercontinent">Archetype: Supercontinent (1–2 Giant)</option>
+            <option value="archipelago">Archetype: Ring-of-Fire Island Arcs</option>
+          </select>
+        </div>
+        <div class="btn-row" style="margin-top: 6px">
+          <button id="btn-mode-orbit" class="active">Orbit Space</button>
+          <button id="btn-mode-surface" class="btn-accent">Land &amp; Walk</button>
+        </div>
+        <div id="orbit-hint" class="hint-box">
+          <strong>Orbit Mode:</strong> Drag to rotate globe · Scroll to zoom · <strong>Double-click any continent or island arc</strong> to land and walk around the sphere!
+        </div>
+      </div>
+
+      <div class="section">
+        <div class="section-label">LAND ON CONTINENT</div>
+        <div id="continent-buttons" class="btn-grid">
+          <button data-land="0">Continent 1</button>
+          <button data-land="1">Continent 2</button>
+        </div>
+      </div>
+
+      <div class="section sliders">
+        <label>
+          <span>Sea Level <strong id="sea-val">Normal</strong></span>
+          <input id="sea-slider" type="range" min="-0.14" max="0.14" step="0.02" value="0.0" />
+        </label>
+        <label>
+          <span>Relief Scale <strong id="relief-val">1.0×</strong></span>
+          <input id="relief-slider" type="range" min="0.5" max="2.4" step="0.1" value="1.0" />
+        </label>
+        <label>
+          <span>Travel Speed <strong id="speed-val">Walk / Sprint</strong></span>
+          <input id="speed-slider" type="range" min="1" max="12" step="1" value="2" />
+        </label>
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-top:2px;">
+          <input id="chk-tectonics" type="checkbox" style="width:auto;" />
+          <span>Show Plate Boundaries (Rifts / Subduction)</span>
+        </label>
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-top:2px;">
+          <input id="chk-poles" type="checkbox" checked style="width:auto;" />
+          <span>Show Magnetic &amp; Spin Poles</span>
+        </label>
+      </div>
+    </aside>
+
+    <!-- Top-right Live Magnetic Compass -->
+    <div id="compass-wrap" class="panel">
+      <div id="compass-dial">
+        <div id="compass-needle"></div>
+      </div>
+      <div id="compass-label">MAG N</div>
+    </div>
+
+    <!-- Bottom-left Planetary Telemetry -->
+    <div id="telemetry" class="panel">
+      <div class="stat">
+        <span class="k">Mode</span>
+        <span id="stat-mode" class="v badge diorama">ORBIT</span>
+      </div>
+      <div class="stat">
+        <span class="k">Lat / Lon</span>
+        <span id="stat-latlon" class="v">0°N 0°E</span>
+      </div>
+      <div class="stat">
+        <span class="k">Elev</span>
+        <span id="stat-elev" class="v">0 m</span>
+      </div>
+      <div class="stat">
+        <span class="k">Temp</span>
+        <span id="stat-temp" class="v">12°C</span>
+      </div>
+      <div class="stat">
+        <span class="k">Biome</span>
+        <span id="stat-biome" class="v">Ocean</span>
+      </div>
+      <div class="stat">
+        <span class="k">From Start</span>
+        <span id="stat-home" class="v">0.00 km</span>
+      </div>
+    </div>
+
+    <!-- Bottom-right Controls Help -->
+    <div id="controls-help" class="panel">
+      <div><strong>Orbit:</strong> Drag Spin · Scroll Zoom · Double-Click Land</div>
+      <div><strong>Surface:</strong> WASD Great-Circle Walk · Drag Look · Shift Fast</div>
+      <div><strong>O</strong> Orbit / Surface · <strong>R</strong> Try Again · <strong>H</strong> Hide UI</div>
+    </div>
+
+    <div id="loading">Building zero-seam 3D planet…</div>
+    <script type="module" src="/src/planet.js"></script>
+  </body>
+</html>

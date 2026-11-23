@@ -37,6 +37,10 @@ whitebox:
 terrain-diffusion seed="42":
     uv run --extra diffusion python experiments/terrain_diffusion_test.py --seed {{seed}}
 
+# Experiment 6: Zero-Seam Cube-Sphere Planet (6 Terrain Diffusion 30m continents + Landlab hydrology)
+planet seed="42" radius="3000":
+    uv run --extra diffusion python experiments/generate_planet.py --seed {{seed}} --radius {{radius}}
+
 # Pack generated worlds into binary assets for the 3D viewer
 export-viewer:
     python experiments/export_viewer_worlds.py

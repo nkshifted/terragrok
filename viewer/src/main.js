@@ -350,9 +350,11 @@ async function loadWorld(worldId) {
   const geo = new THREE.PlaneGeometry(worldSpan, worldSpan, meshVerts - 1, meshVerts - 1);
   geo.rotateX(-Math.PI / 2);
   const posAttr = geo.attributes.position;
+  const meshHeights = new Float32Array(meshVerts * meshVerts);
   if (meshVerts === size) {
     for (let i = 0; i < heights.length; i++) {
       posAttr.setY(i, heights[i]);
+      meshHeights[i] = heights[i];
     }
   } else {
     for (let vy = 0; vy < meshVerts; vy++) {
@@ -365,13 +367,46 @@ async function loadWorld(worldId) {
         const x0 = Math.floor(fx);
         const x1 = Math.min(x0 + 1, size - 1);
         const tx = fx - x0;
-        const a = heights[y0 * size + x0] * (1 - tx) + heights[y0 * size + x1] * tx;
-        const b = heights[y1 * size + x0] * (1 - tx) + heights[y1 * size + x1] * tx;
-        posAttr.setY(vy * meshVerts + vx, a * (1 - ty) + b * ty);
+        const i00 = y0 * size + x0;
+        const i10 = y0 * size + x1;
+        const i01 = y1 * size + x0;
+        const i11 = y1 * size + x1;
+        const a = heights[i00] * (1 - tx) + heights[i10] * tx;
+        const b = heights[i01] * (1 - tx) + heights[i11] * tx;
+        let hVal = a * (1 - ty) + b * ty;
+        // Preserve carved riverbeds during 1024->512 mesh reduction so terrain triangles NEVER bridge over streams!
+        const maxRiv = Math.max(masks[i00 * 4], masks[i10 * 4], masks[i01 * 4], masks[i11 * 4]);
+        if (maxRiv > 45) {
+          const minH = Math.min(heights[i00], heights[i10], heights[i01], heights[i11]);
+          const blendMin = Math.min(1.0, (maxRiv - 45) / 110.0);
+          hVal = hVal * (1.0 - blendMin) + minH * blendMin;
+        }
+        const idx = vy * meshVerts + vx;
+        posAttr.setY(idx, hVal);
+        meshHeights[idx] = hVal;
       }
     }
   }
   geo.computeVertexNormals();
+
+  // Exact triangle-interpolated height sampler of the rendered terrain mesh (for zero-clipping river ribbons!)
+  const sampleRenderedMeshHeight = (wx, wz) => {
+    const gx = ((wx / worldSpan) + 0.5) * (meshVerts - 1);
+    const gz = ((wz / worldSpan) + 0.5) * (meshVerts - 1);
+    const x0 = Math.max(0, Math.min(meshVerts - 2, Math.floor(gx)));
+    const z0 = Math.max(0, Math.min(meshVerts - 2, Math.floor(gz)));
+    const fx = Math.max(0, Math.min(1, gx - x0));
+    const fz = Math.max(0, Math.min(1, gz - z0));
+    const h00 = meshHeights[z0 * meshVerts + x0];
+    const h10 = meshHeights[z0 * meshVerts + x0 + 1];
+    const h01 = meshHeights[(z0 + 1) * meshVerts + x0];
+    const h11 = meshHeights[(z0 + 1) * meshVerts + x0 + 1];
+    // Matches THREE.PlaneGeometry diagonal split (a,c,b / b,c,d -> diagonal from (1,0) to (0,1))
+    if (fx + fz <= 1.0) {
+      return h00 + fx * (h10 - h00) + fz * (h01 - h00);
+    }
+    return h11 + (1.0 - fx) * (h01 - h11) + (1.0 - fz) * (h10 - h11);
+  };
 
   terrainMat = createTerrainMaterial(
     maskTex,
@@ -400,7 +435,7 @@ async function loadWorld(worldId) {
   scene.add(waterMesh);
 
   // 3. Real 3D Flowing River Ribbons & Flat-Surfaced Alpine/Valley Lakes
-  riverObj = buildRiverSystem(splines);
+  riverObj = buildRiverSystem(splines, sampleRenderedMeshHeight);
   riverObj.mesh.scale.y = state.vScale;
   scene.add(riverObj.mesh);
 

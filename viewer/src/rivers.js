@@ -6,7 +6,7 @@ import * as THREE from 'three';
  *
  * Each river entry: { source: 'lake'|'spring', dest: 'sea'|'lake'|'confluence', points: [[x,z,y,w,slope], ...] }
  */
-export function buildRiverSystem(riversData) {
+export function buildRiverSystem(riversData, sampleMeshHeight = null) {
   const positions = [];
   const uvs = [];
   const slopes = [];
@@ -23,7 +23,7 @@ export function buildRiverSystem(riversData) {
     let distAcc = 0.0;
 
     for (let i = 0; i < pts.length; i++) {
-      const [x, z, y, width, slope] = pts[i];
+      const [x, z, yRaw, width, slope] = pts[i];
       if (i > 0) {
         distAcc += Math.hypot(x - pts[i - 1][0], z - pts[i - 1][1]);
       }
@@ -38,7 +38,16 @@ export function buildRiverSystem(riversData) {
 
       const rx = -tz;
       const rz = tx;
-      const halfW = width * 0.58;
+      const halfW = width * 0.56;
+
+      // Guarantee centerline sits cleanly above the actual rendered terrain triangle (zero dirt bridges!)
+      let y = yRaw;
+      if (sampleMeshHeight) {
+        const meshCenterY = sampleMeshHeight(x, z);
+        if (meshCenterY + 0.14 > y) {
+          y = meshCenterY + 0.14;
+        }
+      }
 
       // Softly fade in the first few meters of an alpine spring trickle
       const headFade = isSpring ? Math.min(i / 6.0, 1.0) : 1.0;
@@ -46,8 +55,16 @@ export function buildRiverSystem(riversData) {
       for (let k = 0; k < crossU.length; k++) {
         const u = crossU[k];
         const side = (u - 0.5) * 2.0;
-        const edgeDip = k === 0 || k === crossU.length - 1 ? -0.22 : 0.0;
-        positions.push(x + rx * side * halfW, y + edgeDip, z + rz * side * halfW);
+        const vx = x + rx * side * halfW;
+        const vz = z + rz * side * halfW;
+        const isEdge = k === 0 || k === crossU.length - 1;
+        let vy = y + (isEdge ? -0.05 : 0.0);
+        // For interior water vertices, ensure rendered mesh never pokes through the water surface
+        if (!isEdge && sampleMeshHeight) {
+          const mY = sampleMeshHeight(vx, vz);
+          if (mY + 0.10 > vy) vy = mY + 0.10;
+        }
+        positions.push(vx, vy, vz);
         uvs.push(u, distAcc);
         slopes.push(slope);
         headFades.push(headFade);
@@ -78,8 +95,8 @@ export function buildRiverSystem(riversData) {
     depthWrite: false,
     side: THREE.DoubleSide,
     polygonOffset: true,
-    polygonOffsetFactor: -1,
-    polygonOffsetUnits: -1,
+    polygonOffsetFactor: -2,
+    polygonOffsetUnits: -2,
     uniforms: {
       uTime: { value: 0.0 },
       uSunDir: { value: new THREE.Vector3(0.65, 0.45, 0.45).normalize() },

@@ -1,0 +1,43 @@
+{
+  "id": "tectonic_td30m",
+  "title": "Tectonic \u2192 AI Earth 30m (Seed 101)",
+  "subtitle": "Stage 1 Plate Tectonics (earth) \u2192 Conditioned Terrain Diffusion 30m (IoU 80%)",
+  "size": 1024,
+  "worldSpan": 4800.0,
+  "minElev": -55.0,
+  "maxElev": 520.04,
+  "seaLevel": 0.0,
+  "hasClimate": true,
+  "tempRange": [
+    -12.0,
+    28.0
+  ],
+  "precipRange": [
+    0.0,
+    1800.0
+  ],
+  "riverCount": 41,
+  "lakeCount": 9,
+  "landmarks": {
+    "plains": [
+      0.2835,
+      0.8456
+    ],
+    "peak": [
+      0.1271,
+      0.9355
+    ],
+    "lake": [
+      0.0997,
+      0.9765
+    ],
+    "river": [
+      0.2532,
+      0.6989
+    ],
+    "coast": [
+      0.4301,
+      0.7488
+    ]
+  }
+}

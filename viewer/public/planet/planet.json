@@ -1,0 +1,103 @@
+{
+  "seed": 42,
+  "radius": 3000.0,
+  "diameterKm": 6.0,
+  "circumferenceKm": 18.85,
+  "faceSize": 256,
+  "maxElev": 216.0,
+  "tempRange": [
+    -25.0,
+    30.0
+  ],
+  "precipRange": [
+    0.0,
+    1200.0
+  ],
+  "magneticNorth": [
+    0.1571,
+    0.97992,
+    0.12274
+  ],
+  "totalRivers": 154,
+  "totalLakes": 67,
+  "faces": [
+    {
+      "name": "px",
+      "index": 0,
+      "landFrac": 0.433,
+      "maxElev": 216.88,
+      "riverCount": 26,
+      "lakeCount": 11,
+      "landingDir": [
+        0.87192,
+        -0.08548,
+        -0.48212
+      ]
+    },
+    {
+      "name": "nx",
+      "index": 1,
+      "landFrac": 0.453,
+      "maxElev": 231.38,
+      "riverCount": 29,
+      "lakeCount": 12,
+      "landingDir": [
+        -0.80272,
+        -0.04092,
+        -0.59495
+      ]
+    },
+    {
+      "name": "py",
+      "index": 2,
+      "landFrac": 0.459,
+      "maxElev": 217.31,
+      "riverCount": 28,
+      "lakeCount": 12,
+      "landingDir": [
+        0.53337,
+        0.84478,
+        0.04307
+      ]
+    },
+    {
+      "name": "ny",
+      "index": 3,
+      "landFrac": 0.465,
+      "maxElev": 211.58,
+      "riverCount": 29,
+      "lakeCount": 11,
+      "landingDir": [
+        0.53729,
+        -0.84055,
+        -0.06922
+      ]
+    },
+    {
+      "name": "pz",
+      "index": 4,
+      "landFrac": 0.427,
+      "maxElev": 224.35,
+      "riverCount": 19,
+      "lakeCount": 9,
+      "landingDir": [
+        0.59101,
+        0.12195,
+        0.79739
+      ]
+    },
+    {
+      "name": "nz",
+      "index": 5,
+      "landFrac": 0.443,
+      "maxElev": 216.02,
+      "riverCount": 23,
+      "lakeCount": 12,
+      "landingDir": [
+        -0.50298,
+        -0.07764,
+        -0.8608
+      ]
+    }
+  ]
+}

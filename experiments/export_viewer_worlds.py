@@ -540,29 +540,79 @@ def solve_physical_hydrology(
             if end_node in node_water_y:
                 water_y[-1] = min(water_y[-1], node_water_y[end_node])
 
-        # Hydraulic geometry (Leopold & Maddock: W ~ Q^0.42)
-        # Spring headwaters start narrow (0.7m) and flare organically; lake outlets start wider!
-        q_norm = np.clip(pts_da / max(da_max, 1.0), 1e-5, 1.0)
-        widths = 1.1 + 17.5 * (q_norm**0.42)
-        if source_type == "spring":
-            # Taper first 10 samples smoothly from 0.55m spring trickle -> hydraulic width
-            taper_n = min(10, len(widths))
-            taper = np.linspace(0.28, 1.0, taper_n)
-            widths[:taper_n] *= taper
-        elif source_type == "lake":
-            widths[0] = max(widths[0], 4.5)
-        if dest_type == "sea":
-            # Flare river mouth into natural coastal estuary!
-            est_n = min(6, len(widths))
-            widths[-est_n:] *= np.linspace(1.0, 1.85, est_n)
-
-        # Compute local slope for whitewater cascades/rapids
+        # Compute local slope FIRST so Manning / Finnegan hydraulic geometry can widen flat valley rivers!
         step_dist = np.maximum(
             np.hypot(np.diff(sm_r, prepend=sm_r[0]), np.diff(sm_c, prepend=sm_c[0])) * cell_m,
             cell_m,
         )
         dh = np.maximum(-np.diff(water_y, prepend=water_y[0]), 0.0)
-        slopes = gaussian_filter(np.clip(dh / step_dist, 0.0, 1.0), sigma=1.1, mode="nearest")
+        slopes = gaussian_filter(np.clip(dh / step_dist, 0.0, 1.0), sigma=1.6, mode="nearest")
+
+        # Measure local cross-sectional valley-floor clearance (HAND: Height Above Nearest Drainage)
+        # Cast perpendicular rays left & right from the river centerline to detect tight canyons vs broad valleys!
+        n_pts = len(path)
+        valley_w = np.zeros(n_pts, dtype=np.float32)
+        q_norm = np.clip(pts_da / max(da_max, 1.0), 1e-5, 1.0)
+        max_scan_m = 72.0
+        n_steps_scan = max(4, int(round(max_scan_m / cell_m)))
+        for i in range(n_pts):
+            i0 = max(i - 1, 0)
+            i1 = min(i + 1, n_pts - 1)
+            dr_t = sm_r[i1] - sm_r[i0]
+            dc_t = sm_c[i1] - sm_c[i0]
+            t_len = float(np.hypot(dr_t, dc_t)) or 1.0
+            # Perpendicular unit vector in grid coords
+            nr_p = -dc_t / t_len
+            nc_p = dr_t / t_len
+            wy_i = float(water_y[i])
+            # Allowable HAND bank rise scales gently with river discharge (1.8m upland -> 5.0m major trunk)
+            hand_tol = 1.8 + 3.2 * float(q_norm[i] ** 0.35)
+
+            clear_both = 0.0
+            for sign in (-1.0, 1.0):
+                clear_side = cell_m
+                for s_step in range(1, n_steps_scan + 1):
+                    sr = sm_r[i] + sign * nr_p * s_step
+                    sc = sm_c[i] + sign * nc_p * s_step
+                    ir_s = int(round(sr))
+                    ic_s = int(round(sc))
+                    if ir_s < 0 or ir_s >= ny or ic_s < 0 or ic_s >= nx:
+                        break
+                    h_s = float(elev[ir_s, ic_s])
+                    if h_s - wy_i > hand_tol:
+                        break
+                    clear_side = s_step * cell_m
+                clear_both += clear_side
+            valley_w[i] = clear_both
+        valley_w = gaussian_filter(valley_w, sigma=2.5, mode="nearest")
+
+        # Physics-based Hydraulic Geometry:
+        #   Leopold-Maddock discharge scaling (W ~ Q^0.45)
+        #   × Finnegan/Manning inverse-slope expansion (W ~ S^-0.24: narrow steep gorges, wide flat valleys!)
+        #   clamped cleanly to measured HAND valley-floor width so rivers fill broad valleys without climbing cliffs!
+        w_q = 2.6 + 24.0 * (q_norm**0.45)
+        slope_eff = np.clip(slopes, 0.004, 0.38)
+        slope_factor = np.clip((0.045 / slope_eff) ** 0.24, 0.62, 2.35)
+        w_phys = w_q * slope_factor
+        # Valley confinement: let broad valleys expand up to 72% of valley floor, keep canyons wall-hugging
+        w_confined = np.minimum(w_phys, np.maximum(valley_w * 0.72, w_q * 0.62))
+        widths = gaussian_filter(w_confined, sigma=2.2, mode="nearest")
+        widths = np.clip(widths, 1.6, 68.0)
+
+        if source_type == "spring":
+            # Taper first 10 samples smoothly from narrow spring trickle -> full hydraulic width
+            taper_n = min(10, len(widths))
+            taper = np.linspace(0.35, 1.0, taper_n)
+            widths[:taper_n] *= taper
+        elif source_type == "lake":
+            widths[0] = max(widths[0], 5.5)
+        if dest_type == "sea":
+            # Flare river mouth into natural coastal estuary!
+            est_n = min(8, len(widths))
+            widths[-est_n:] *= np.linspace(1.0, 1.85, est_n)
+
+        # Rendered 3D mesh spacing (viewer caps terrain mesh at 512x512 for 60 FPS)
+        mesh_cell_m = world_span_m / max(min(nx, 512) - 1, 1)
 
         spline_pts: list[list[float]] = []
         for i in range(len(path)):
@@ -571,11 +621,11 @@ def solve_physical_hydrology(
             w_m = float(widths[i])
             sl = float(slopes[i])
 
-            # Slightly recess ribbon inside banks except at lake/ocean anchors
+            # Keep ribbon cleanly inside carved channel (no excess recession that lets mesh triangles bridge over it)
             if (i == 0 and source_type == "lake") or (i == len(path) - 1 and dest_type in ("lake", "sea")):
                 ribbon_y = wy
             else:
-                ribbon_y = wy - 0.35
+                ribbon_y = wy - 0.12
 
             node_id = int(path[i][0] * nx + path[i][1])
             if node_id not in node_water_y:
@@ -585,29 +635,33 @@ def solve_physical_hydrology(
             wz = (rr / (ny - 1) - 0.5) * world_span_m
             spline_pts.append([round(wx, 2), round(wz, 2), round(ribbon_y, 2), round(w_m, 2), round(sl, 3)])
 
-            # Carve riverbed & graded wet banks (don't over-carve inside lakes)
+            # Carve mesh-safe riverbed & graded wet banks (don't over-carve inside lakes)
             ir, ic = int(np.clip(round(rr), 0, ny - 1)), int(np.clip(round(cc), 0, nx - 1))
             if lake_id_grid[ir, ic] > 0:
                 continue
 
-            rad_cells = int(np.ceil((w_m * 0.95) / cell_m)) + 2
+            # Guarantee carved trough spans at least ~1.1x rendered mesh vertex spacing so triangles NEVER bridge over water!
+            half_w = max(w_m * 0.58, mesh_cell_m * 0.92)
+            bank_w = max(w_m * 1.15, half_w * 1.75)
+            rad_cells = int(np.ceil(bank_w / cell_m)) + 2
             r_lo, r_hi = max(0, ir - rad_cells), min(ny, ir + rad_cells + 1)
             c_lo, c_hi = max(0, ic - rad_cells), min(nx, ic + rad_cells + 1)
             yy, xx = np.mgrid[r_lo:r_hi, c_lo:c_hi]
             d_m = np.hypot(yy - rr, xx - cc) * cell_m
 
-            half_w = max(w_m * 0.52, 1.2)
-            bank_w = max(w_m * 1.15, 3.0)
             in_bank = d_m < bank_w
-            t = np.clip(d_m / bank_w, 0.0, 1.0)
-            bed_depth = 0.8 + min(w_m * 0.14, 1.8)
-            bed_h = ribbon_y - bed_depth * np.clip(1.0 - (d_m / half_w) ** 2, 0.0, 1.0)
-            blend = t * t * (3.0 - 2.0 * t)
+            bed_depth = 1.65 + min(w_m * 0.10, 2.8)
+            # Flat-bottomed U-trough inside half_w so all vertices under the ribbon sit strictly below ribbon_y!
+            in_channel = d_m <= half_w
+            t_bank = np.clip((d_m - half_w) / max(bank_w - half_w, 0.5), 0.0, 1.0)
+            blend = t_bank * t_bank * (3.0 - 2.0 * t_bank)
+            floor_h = ribbon_y - bed_depth * (0.68 + 0.32 * np.clip(1.0 - (d_m / half_w) ** 2, 0.0, 1.0))
             sub = carved[r_lo:r_hi, c_lo:c_hi]
-            desired = bed_h * (1.0 - blend) + np.maximum(sub, ribbon_y + 0.55) * blend
+            bank_target = np.maximum(sub, ribbon_y + 0.45)
+            desired = np.where(in_channel, floor_h, (ribbon_y - bed_depth * 0.65) * (1.0 - blend) + bank_target * blend)
             carved[r_lo:r_hi, c_lo:c_hi] = np.where(in_bank, np.minimum(sub, desired), sub)
 
-            wet = np.clip(1.0 - d_m / max(w_m * 0.72, 1.8), 0.0, 1.0)
+            wet = np.clip(1.0 - d_m / max(w_m * 0.78, mesh_cell_m * 1.05), 0.0, 1.0)
             channel_mask[r_lo:r_hi, c_lo:c_hi] = np.maximum(channel_mask[r_lo:r_hi, c_lo:c_hi], wet)
 
         rivers_data.append({
@@ -973,6 +1027,9 @@ def main() -> None:
     td_meta = export_terrain_diffusion_world()
     if td_meta is not None:
         catalog.append(td_meta)
+    tec_td_path = OUT_DIR / "tectonic_td30m.json"
+    if tec_td_path.exists():
+        catalog.append(json.loads(tec_td_path.read_text()))
     (OUT_DIR / "catalog.json").write_text(json.dumps(catalog, indent=2))
     print(f"Wrote physically consistent catalog with {len(catalog)} worlds to {OUT_DIR}")
 
