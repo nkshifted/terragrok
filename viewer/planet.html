@@ -173,33 +173,71 @@
         font-size: 10.5px;
         color: #9dd4ff;
       }
-      .synth-result {
-        margin-top: 8px;
-        padding: 8px;
-        border-radius: 8px;
-        background: rgba(16, 185, 129, 0.14);
-        border: 1px solid rgba(52, 211, 153, 0.42);
+      .stage2-action-card {
         display: none;
+        margin-bottom: 8px;
+        padding: 9px 10px;
+        border-radius: 8px;
+        font-size: 11px;
+        line-height: 1.42;
       }
-      .synth-result-metrics {
-        font-size: 10.5px;
-        color: #c7f9e5;
-        line-height: 1.4;
-        margin-bottom: 6px;
+      .stage2-action-card.fresh {
+        background: rgba(16, 185, 129, 0.16);
+        border: 1px solid rgba(52, 211, 153, 0.54);
+        color: #d1fae5;
       }
-      .btn-open-3d {
+      .stage2-action-card.explored {
+        background: rgba(120, 74, 12, 0.36);
+        border: 1px solid rgba(251, 191, 36, 0.62);
+        color: #fef3c7;
+      }
+      .stage2-action-metrics {
+        margin-bottom: 7px;
+      }
+      .btn-enter-world {
         display: block;
+        width: 100%;
         text-align: center;
         text-decoration: none;
-        padding: 7px 10px;
+        padding: 8px 10px;
         border-radius: 7px;
         font-size: 12px;
         font-weight: 700;
+      }
+      .stage2-action-card.fresh .btn-enter-world {
         color: #06281e;
         background: linear-gradient(135deg, #34d399, #22d3ee);
       }
-      .btn-open-3d:hover {
+      .stage2-action-card.explored .btn-enter-world {
+        color: #291600;
+        background: linear-gradient(135deg, #fbbf24, #f59e0b);
+      }
+      .btn-enter-world:hover {
         filter: brightness(1.08);
+      }
+      .stage2-action-sub {
+        margin-top: 6px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 6px;
+        font-size: 10px;
+        color: rgba(226, 232, 240, 0.72);
+      }
+      .btn-resynth {
+        flex: 0 0 auto;
+        padding: 3px 7px;
+        border-radius: 5px;
+        font-size: 10px;
+        font-weight: 600;
+        background: rgba(15, 23, 42, 0.65);
+        border: 1px solid rgba(148, 163, 184, 0.35);
+        color: #cbd5e1;
+        cursor: pointer;
+      }
+      .btn-resynth:hover {
+        background: rgba(30, 41, 59, 0.9);
+        color: #f8fafc;
       }
       .seed-row {
         display: flex;
@@ -226,33 +264,6 @@
         padding: 5px 8px;
         font-size: 11px;
       }
-      .cached-banner {
-        display: none;
-        margin-bottom: 7px;
-        padding: 7px 8px;
-        border-radius: 7px;
-        background: rgba(120, 74, 12, 0.36);
-        border: 1px solid rgba(251, 191, 36, 0.62);
-        font-size: 11px;
-        line-height: 1.38;
-        color: #fef3c7;
-      }
-      .btn-open-cached {
-        display: block;
-        width: 100%;
-        text-align: center;
-        text-decoration: none;
-        margin-top: 5px;
-        padding: 6px 8px;
-        border-radius: 6px;
-        font-size: 11.5px;
-        font-weight: 700;
-        color: #291600;
-        background: linear-gradient(135deg, #fbbf24, #f59e0b);
-      }
-      .btn-open-cached:hover {
-        filter: brightness(1.08);
-      }
       .cached-chips {
         display: none;
         margin-top: 7px;
@@ -275,13 +286,19 @@
         padding: 3px 6px;
         border-radius: 5px;
         font-size: 10.5px;
-        background: rgba(251, 191, 36, 0.16);
-        border: 1px solid rgba(251, 191, 36, 0.42);
+        background: rgba(251, 191, 36, 0.14);
+        border: 1px solid rgba(251, 191, 36, 0.38);
         color: #fde68a;
         cursor: pointer;
       }
       .cached-chip:hover {
-        background: rgba(251, 191, 36, 0.3);
+        background: rgba(251, 191, 36, 0.28);
+      }
+      .cached-chip.active {
+        background: rgba(251, 191, 36, 0.36);
+        border-color: #fef08a;
+        color: #ffffff;
+        box-shadow: 0 0 8px rgba(251, 191, 36, 0.38);
       }
     </style>
   </head>
@@ -336,10 +353,16 @@
             <div class="section-label" style="margin:0;">STAGE 2 · AI 30m TERRAIN</div>
             <span id="stage2-pill" class="status-pill offline">○ Checking…</span>
           </div>
-          <div id="stage2-cached-banner" class="cached-banner">
-            <div id="stage2-cached-info"></div>
-            <a id="btn-open-cached" class="btn-open-cached" href="/index.html">⚡ Enter Cached 3D World (Instant) →</a>
+          <!-- Mode A: Unified card for a selected explored / just-synthesized region (always ONE Enter button!) -->
+          <div id="stage2-action-card" class="stage2-action-card">
+            <div id="stage2-action-metrics" class="stage2-action-metrics"></div>
+            <a id="btn-enter-world" class="btn-enter-world" href="/index.html">Explore 3D World →</a>
+            <div class="stage2-action-sub">
+              <span>Click outside to pick a new zone</span>
+              <button id="btn-resynth" class="btn-resynth" type="button" title="Re-run 30m AI synthesis for this zone">↻ Re-synth</button>
+            </div>
           </div>
+          <!-- Mode B: New unexplored target readout -->
           <div id="stage2-target-info" class="target-readout">
             Click anywhere on the globe to target a 30m AI terrain patch…
           </div>
@@ -352,25 +375,23 @@
             </select>
             <button id="btn-target-explorer" title="Center target on current location" style="flex:0 0 auto;padding:5px 8px;font-size:11px;">Snap</button>
           </div>
-          <div style="display:flex;gap:6px;margin-bottom:6px;">
-            <select id="sel-stage2-fidelity" style="flex:1.25;min-width:0;padding:5px 6px;border-radius:6px;background:rgba(10,18,32,0.92);color:#dce9fa;border:1px solid rgba(130,180,240,0.28);font-size:11px;" title="Exact Coast = preserves all islands & bays via Laplacian Lock · Creative AI = pure unguided diffusion">
-              <option value="exact" selected>Exact Coast</option>
-              <option value="balanced">Balanced</option>
-              <option value="creative">Creative AI</option>
-            </select>
-            <select id="sel-stage2-quality" style="flex:1;min-width:0;padding:5px 6px;border-radius:6px;background:rgba(10,18,32,0.92);color:#dce9fa;border:1px solid rgba(130,180,240,0.28);font-size:11px;" title="High = full 2-step BF16 (~13s total, r=1.000) · Fast = 1-step BF16 (~10s total, r=0.996)">
-              <option value="high" selected>High (~13s)</option>
-              <option value="fast">Fast (~10s)</option>
-            </select>
+          <div id="stage2-synth-controls">
+            <div style="display:flex;gap:6px;margin-bottom:6px;">
+              <select id="sel-stage2-fidelity" style="flex:1.25;min-width:0;padding:5px 6px;border-radius:6px;background:rgba(10,18,32,0.92);color:#dce9fa;border:1px solid rgba(130,180,240,0.28);font-size:11px;" title="Exact Coast = preserves all islands & bays via Laplacian Lock · Creative AI = pure unguided diffusion">
+                <option value="exact" selected>Exact Coast</option>
+                <option value="balanced">Balanced</option>
+                <option value="creative">Creative AI</option>
+              </select>
+              <select id="sel-stage2-quality" style="flex:1;min-width:0;padding:5px 6px;border-radius:6px;background:rgba(10,18,32,0.92);color:#dce9fa;border:1px solid rgba(130,180,240,0.28);font-size:11px;" title="High = full 2-step BF16 (~13s total, r=1.000) · Fast = 1-step BF16 (~10s total, r=0.996)">
+                <option value="high" selected>High (~13s)</option>
+                <option value="fast">Fast (~10s)</option>
+              </select>
+            </div>
+            <button id="btn-synthesize" class="btn-synth">✨ Synthesize 30m AI Terrain Here</button>
           </div>
-          <button id="btn-synthesize" class="btn-synth">✨ Synthesize 30m AI Terrain Here</button>
           <div id="synth-progress-wrap" class="synth-progress-wrap">
             <div class="synth-progress-bar"><div id="synth-progress-fill" class="synth-progress-fill"></div></div>
             <div id="synth-status-text" class="synth-status-text">Preparing tectonic patch…</div>
-          </div>
-          <div id="synth-result" class="synth-result">
-            <div id="synth-result-metrics" class="synth-result-metrics"></div>
-            <a id="btn-open-3d" class="btn-open-3d" href="/index.html">Explore Synthesized 3D World →</a>
           </div>
           <div id="cached-chips" class="cached-chips">
             <div id="cached-chips-title" class="cached-chips-title">Explored Regions (Gold)</div>

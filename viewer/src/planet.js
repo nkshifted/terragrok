@@ -99,6 +99,8 @@ const stage2 = {
   lastResult: null,
   cachedRegions: [],
   activeCached: null,
+  justSynthesizedId: null,
+  justSynthesizedMeta: null,
 };
 
 const nav = {
@@ -700,7 +702,7 @@ function rebuildTargetPatchOverlay() {
     });
     targetPatchGroup = null;
   }
-  if (!currentPlanet || !stage2.targetDir) return;
+  if (!currentPlanet || !stage2.targetDir || stage2.activeCached) return;
 
   const R = currentPlanet.meta.radius;
   const { c, east, north } = tangentBasisForDir(stage2.targetDir);
@@ -819,54 +821,136 @@ function parseAndLoadSeedInput(raw) {
   generatePlanetFromState(nextSeed);
 }
 
-function findCachedRegionAtDir(dir) {
-  if (!dir || !stage2.cachedRegions.length) return null;
+/**
+ * Compute fraction [0..1] of a candidate square patch (candDir, candSpanDeg)
+ * that is already covered by an existing explored gold region `reg`.
+ */
+function computePatchOverlapFrac(candDir, candSpanDeg, reg) {
+  const o = reg?.planetOrigin;
+  if (!o || !candDir) return 0;
+  const regCenter = dirFromLatLon(o.latDeg, o.lonDeg);
+  if (candDir.dot(regCenter) <= 0.05) return 0;
+
+  const candBasis = tangentBasisForDir(candDir);
+  const regBasis = tangentBasisForDir(regCenter);
+  const candHalf = THREE.MathUtils.degToRad((candSpanDeg || 46) * 0.5);
+  const regHalf = THREE.MathUtils.degToRad((o.spanDeg || 46) * 0.5);
+  const tmp = new THREE.Vector3();
+
+  const N = 9;
+  let inside = 0;
+  const total = N * N;
+  for (let r = 0; r < N; r++) {
+    const ty = (0.5 - (r + 0.5) / N) * 2 * candHalf;
+    for (let col = 0; col < N; col++) {
+      const tx = ((col + 0.5) / N - 0.5) * 2 * candHalf;
+      projectTangentToUnitDir(candBasis.c, candBasis.east, candBasis.north, tx, ty, tmp);
+      const dotC = tmp.dot(regBasis.c);
+      if (dotC <= 0.1) continue;
+      const rx = tmp.dot(regBasis.east) / dotC;
+      const ry = tmp.dot(regBasis.north) / dotC;
+      if (Math.abs(rx) <= regHalf && Math.abs(ry) <= regHalf) {
+        inside++;
+      }
+    }
+  }
+  return inside / total;
+}
+
+/**
+ * Find the best existing explored region covering >= minOverlap (default 75%)
+ * of the candidate patch. Prevents drawing confusing overlapping cyan boxes!
+ */
+function findOverlappingExploredRegion(candDir, candSpanDeg, minOverlap = 0.75) {
+  if (!candDir || !stage2.cachedRegions.length) return null;
   let best = null;
-  let bestSpan = Infinity;
+  let bestScore = -1;
   for (const reg of stage2.cachedRegions) {
-    const o = reg.planetOrigin;
-    if (!o) continue;
-    const center = dirFromLatLon(o.latDeg, o.lonDeg);
-    // Reject opposite hemisphere immediately
-    if (dir.dot(center) <= 0.1) continue;
-    const { c, east, north } = tangentBasisForDir(center);
-    const halfRad = THREE.MathUtils.degToRad((o.spanDeg || 46) * 0.5);
-    const dotC = dir.dot(c);
-    // Tangent-plane coordinates relative to region center
-    const tx = dir.dot(east) / Math.max(dotC, 0.2);
-    const ty = dir.dot(north) / Math.max(dotC, 0.2);
-    // Slight angular tolerance (1.03x) so clicking right near a gold edge matches cleanly
-    if (Math.abs(tx) <= halfRad * 1.03 && Math.abs(ty) <= halfRad * 1.03) {
-      const sp = o.spanDeg || 46;
-      if (sp < bestSpan) {
-        best = reg;
-        bestSpan = sp;
+    const overlap = computePatchOverlapFrac(candDir, candSpanDeg, reg);
+    if (overlap >= minOverlap) {
+      const o = reg.planetOrigin;
+      const spanDiff = Math.abs((o.spanDeg || 46) - (candSpanDeg || 46));
+      const score = overlap - spanDiff * 0.002;
+      if (score > bestScore) {
+        bestScore = score;
+        best = { reg, overlap };
       }
     }
   }
   return best;
 }
 
-function updateCachedBanner() {
-  const banner = document.getElementById('stage2-cached-banner');
-  const info = document.getElementById('stage2-cached-info');
-  const link = document.getElementById('btn-open-cached');
-  if (!banner || !info || !link) return;
+/**
+ * Single source of truth for the Stage 2 action panel:
+ * - Mode A (`stage2.activeCached !== null`): ONE unified Enter card (emerald if just
+ *   synthesized, warm gold if previously explored), hides target readout & main Synthesize CTA.
+ * - Mode B (`stage2.activeCached === null`): Live target readout + ONE Synthesize CTA.
+ */
+function syncStage2ActionUI() {
+  const card = document.getElementById('stage2-action-card');
+  const metrics = document.getElementById('stage2-action-metrics');
+  const enterLink = document.getElementById('btn-enter-world');
+  const targetInfo = document.getElementById('stage2-target-info');
+  const synthControls = document.getElementById('stage2-synth-controls');
+  if (!card || !metrics || !enterLink) return;
 
-  const hit = findCachedRegionAtDir(stage2.targetDir);
-  stage2.activeCached = hit;
+  const hit = stage2.activeCached;
   if (!hit) {
-    banner.style.display = 'none';
+    card.style.display = 'none';
+    card.className = 'stage2-action-card';
+    if (targetInfo) targetInfo.style.display = 'block';
+    if (synthControls) synthControls.style.display = 'block';
+    renderCachedRegionChips();
     return;
   }
-  const o = hit.planetOrigin;
-  const latStr = `${Math.abs(o.latDeg).toFixed(0)}°${o.latDeg >= 0 ? 'N' : 'S'}`;
-  const lonStr = `${Math.abs(o.lonDeg).toFixed(0)}°${o.lonDeg >= 0 ? 'E' : 'W'}`;
-  info.innerHTML =
-    `<strong>★ Explored Region Cached: ${latStr} ${lonStr}</strong> (${o.spanDeg || 46}°)<br/>` +
-    `${hit.lakeCount ?? 0} alpine lakes · ${hit.riverCount ?? 0} rivers · ready instantly (0s)`;
-  link.href = `/index.html?world=${encodeURIComponent(hit.id)}`;
-  banner.style.display = 'block';
+
+  const o = hit.planetOrigin || {};
+  const latDeg = o.latDeg ?? 0;
+  const lonDeg = o.lonDeg ?? 0;
+  const latStr = `${Math.abs(latDeg).toFixed(0)}°${latDeg >= 0 ? 'N' : 'S'}`;
+  const lonStr = `${Math.abs(lonDeg).toFixed(0)}°${lonDeg >= 0 ? 'E' : 'W'}`;
+  const isFresh = stage2.justSynthesizedId === hit.id && stage2.justSynthesizedMeta;
+
+  if (isFresh) {
+    const d = stage2.justSynthesizedMeta;
+    card.className = 'stage2-action-card fresh';
+    metrics.innerHTML =
+      `<strong>✓ ${d.coordLabel || `${latStr} ${lonStr}`} Synthesized!</strong> (${d.totalSec}s)<br/>` +
+      `Coastline IoU <strong>${d.iouPct}%</strong> · Elev r=<strong>${d.elevCorr}</strong><br/>` +
+      `<strong>${d.lakeCount}</strong> alpine lakes · <strong>${d.riverCount}</strong> rivers`;
+    enterLink.textContent = 'Explore Synthesized 3D World →';
+    enterLink.href = d.openUrl || `/index.html?world=${encodeURIComponent(hit.id)}`;
+  } else {
+    card.className = 'stage2-action-card explored';
+    const biomeTag = hit.biome ? ` · ${hit.biome}` : '';
+    metrics.innerHTML =
+      `<strong>★ Explored Zone: ${latStr} ${lonStr}</strong> (${o.spanDeg || 46}°${biomeTag})<br/>` +
+      `<strong>${hit.lakeCount ?? 0}</strong> alpine lakes · <strong>${hit.riverCount ?? 0}</strong> rivers · ready instantly`;
+    enterLink.textContent = '⚡ Enter Explored 3D World →';
+    enterLink.href = `/index.html?world=${encodeURIComponent(hit.id)}`;
+  }
+
+  card.style.display = 'block';
+  if (targetInfo) targetInfo.style.display = 'none';
+  if (synthControls) synthControls.style.display = 'none';
+  renderCachedRegionChips();
+}
+
+function selectExploredRegion(reg, { justSynthesized = false, synthData = null } = {}) {
+  if (!reg?.planetOrigin) return;
+  const o = reg.planetOrigin;
+  stage2.activeCached = reg;
+  stage2.targetDir.copy(dirFromLatLon(o.latDeg, o.lonDeg));
+  stage2.spanDeg = Number(o.spanDeg) || stage2.spanDeg;
+  const selSpan = document.getElementById('sel-stage2-span');
+  if (selSpan) selSpan.value = String(stage2.spanDeg);
+  stage2.justSynthesizedId = justSynthesized ? reg.id : null;
+  stage2.justSynthesizedMeta = justSynthesized ? synthData : null;
+
+  // Hide cyan target box & highlight the selected gold footprint cleanly!
+  rebuildTargetPatchOverlay();
+  rebuildCachedFootprintsOverlay();
+  syncStage2ActionUI();
 }
 
 function rebuildCachedFootprintsOverlay() {
@@ -883,15 +967,18 @@ function rebuildCachedFootprintsOverlay() {
   const R = currentPlanet.meta.radius;
   const g = new THREE.Group();
   const tmp = new THREE.Vector3();
+  const selectedId = stage2.activeCached?.id || null;
 
   for (const reg of stage2.cachedRegions) {
     const o = reg.planetOrigin;
     if (!o) continue;
+    const isSelected = reg.id === selectedId;
+    const isFreshSel = isSelected && stage2.justSynthesizedId === reg.id;
     const center = dirFromLatLon(o.latDeg, o.lonDeg);
     const { c, east, north } = tangentBasisForDir(center);
     const halfRad = THREE.MathUtils.degToRad((o.spanDeg || 46) * 0.5);
 
-    // 1. Subtle translucent gold curved patch fill hugging the globe
+    // 1. Translucent curved patch fill (brighter when selected so you know the exact zone!)
     const gridN = 8;
     const positions = [];
     const indices = [];
@@ -901,7 +988,7 @@ function rebuildCachedFootprintsOverlay() {
         const tx = (col / gridN - 0.5) * 2 * halfRad;
         projectTangentToUnitDir(c, east, north, tx, ty, tmp);
         const s = sampleSphereSurface(tmp);
-        const rad = R + Math.max(s.elev, 0) + 14;
+        const rad = R + Math.max(s.elev, 0) + (isSelected ? 17 : 14);
         positions.push(tmp.x * rad, tmp.y * rad, tmp.z * rad);
       }
     }
@@ -918,15 +1005,15 @@ function rebuildCachedFootprintsOverlay() {
     patchGeo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
     patchGeo.setIndex(indices);
     const patchMat = new THREE.MeshBasicMaterial({
-      color: '#fbbf24',
+      color: isFreshSel ? '#34d399' : '#fbbf24',
       transparent: true,
-      opacity: 0.15,
+      opacity: isSelected ? 0.24 : 0.12,
       side: THREE.DoubleSide,
       depthWrite: false,
     });
     g.add(new THREE.Mesh(patchGeo, patchMat));
 
-    // 2. Crisp glowing gold double-line border
+    // 2. Crisp glowing double-line border (highlighted when selected!)
     const segs = 24;
     const edges = [
       [-1, -1, 1, -1],
@@ -934,10 +1021,16 @@ function rebuildCachedFootprintsOverlay() {
       [1, 1, -1, 1],
       [-1, 1, -1, -1],
     ];
-    for (const [scale, colHex, op, lift] of [
-      [1.0, '#fbbf24', 0.96, 18],
-      [0.975, '#fde68a', 0.65, 19],
-    ]) {
+    const borderLayers = isSelected
+      ? [
+          [1.0, isFreshSel ? '#5eead4' : '#fef08a', 1.0, 22],
+          [0.972, isFreshSel ? '#34d399' : '#fbbf24', 0.92, 23],
+        ]
+      : [
+          [1.0, '#fbbf24', 0.78, 18],
+          [0.975, '#fde68a', 0.45, 19],
+        ];
+    for (const [scale, colHex, op, lift] of borderLayers) {
       const pts = [];
       for (const [sx0, sy0, sx1, sy1] of edges) {
         for (let i = 0; i < segs; i++) {
@@ -958,13 +1051,13 @@ function rebuildCachedFootprintsOverlay() {
       );
     }
 
-    // 3. Small glowing gold diamond marker at center of explored footprint
+    // 3. Center diamond marker (brighter & slightly larger when selected)
     const cSample = sampleSphereSurface(c);
     const gem = new THREE.Mesh(
-      new THREE.OctahedronGeometry(26, 0),
-      new THREE.MeshBasicMaterial({ color: '#fde047' })
+      new THREE.OctahedronGeometry(isSelected ? 34 : 24, 0),
+      new THREE.MeshBasicMaterial({ color: isFreshSel ? '#5eead4' : isSelected ? '#fef9c3' : '#fde047' })
     );
-    gem.position.copy(c).multiplyScalar(R + Math.max(cSample.elev, 0) + 32);
+    gem.position.copy(c).multiplyScalar(R + Math.max(cSample.elev, 0) + (isSelected ? 36 : 30));
     g.add(gem);
   }
 
@@ -986,21 +1079,19 @@ function renderCachedRegionChips() {
   wrap.style.display = 'block';
   title.textContent = `Explored on This Planet (${stage2.cachedRegions.length})`;
   list.innerHTML = '';
+  const activeId = stage2.activeCached?.id || null;
 
   stage2.cachedRegions.forEach((reg) => {
     const o = reg.planetOrigin;
     const latStr = `${Math.abs(o.latDeg).toFixed(0)}°${o.latDeg >= 0 ? 'N' : 'S'}`;
     const lonStr = `${Math.abs(o.lonDeg).toFixed(0)}°${o.lonDeg >= 0 ? 'E' : 'W'}`;
     const btn = document.createElement('button');
-    btn.className = 'cached-chip';
+    btn.className = reg.id === activeId ? 'cached-chip active' : 'cached-chip';
     btn.textContent = `★ ${latStr} ${lonStr} (${o.spanDeg || 46}°)`;
-    btn.title = 'Click to focus this explored gold region on the globe';
+    btn.title = 'Click to focus & enter this explored zone';
     btn.addEventListener('click', () => {
       const dir = dirFromLatLon(o.latDeg, o.lonDeg);
-      stage2.spanDeg = Number(o.spanDeg) || 46;
-      const selSpan = document.getElementById('sel-stage2-span');
-      if (selSpan) selSpan.value = String(stage2.spanDeg);
-      setStage2Target(dir);
+      selectExploredRegion(reg);
       // Swing orbit camera smoothly to face this explored region
       setMode('orbit');
       nav.orbitYaw = Math.atan2(dir.x, dir.z);
@@ -1010,7 +1101,7 @@ function renderCachedRegionChips() {
   });
 }
 
-async function loadCachedRegionsForPlanet() {
+async function loadCachedRegionsForPlanet({ focusFreshId = null, freshData = null } = {}) {
   if (!currentPlanet) return;
   try {
     const resp = await fetch('/worlds/synthesized_catalog.json', { cache: 'no-store' });
@@ -1030,9 +1121,27 @@ async function loadCachedRegionsForPlanet() {
   } catch {
     stage2.cachedRegions = [];
   }
+
+  // Case 1: Just finished synthesizing -> seamlessly lock onto the new region as a single fresh card!
+  if (focusFreshId) {
+    const found = stage2.cachedRegions.find((r) => r.id === focusFreshId);
+    if (found) {
+      selectExploredRegion(found, { justSynthesized: true, synthData: freshData });
+      return;
+    }
+  }
+
+  // Case 2: Re-evaluate whether the current target overlaps >= 75% with an existing explored zone
+  const match = findOverlappingExploredRegion(stage2.targetDir, stage2.spanDeg, 0.75);
+  if (match) {
+    selectExploredRegion(match.reg);
+    return;
+  }
+
+  stage2.activeCached = null;
+  rebuildTargetPatchOverlay();
   rebuildCachedFootprintsOverlay();
-  renderCachedRegionChips();
-  updateCachedBanner();
+  syncStage2ActionUI();
 }
 
 function updateStage2TargetInfo() {
@@ -1095,11 +1204,23 @@ function updateStage2TargetInfo() {
     note;
 }
 
-function setStage2Target(unitDir) {
-  stage2.targetDir.copy(unitDir).normalize();
+function setStage2Target(unitDir, { forceNew = false } = {}) {
+  stage2.justSynthesizedId = null;
+  stage2.justSynthesizedMeta = null;
+  const dir = unitDir.clone().normalize();
+  if (!forceNew) {
+    const match = findOverlappingExploredRegion(dir, stage2.spanDeg, 0.75);
+    if (match) {
+      selectExploredRegion(match.reg);
+      return;
+    }
+  }
+  stage2.activeCached = null;
+  stage2.targetDir.copy(dir);
   rebuildTargetPatchOverlay();
+  rebuildCachedFootprintsOverlay();
   updateStage2TargetInfo();
-  updateCachedBanner();
+  syncStage2ActionUI();
 }
 
 function float32ToBase64(f32) {
@@ -1213,17 +1334,19 @@ async function pollStage2Health() {
 async function synthesizeStage2Target() {
   if (stage2.synthesizing || !currentPlanet) return;
   const btn = document.getElementById('btn-synthesize');
+  const resynthBtn = document.getElementById('btn-resynth');
   const progWrap = document.getElementById('synth-progress-wrap');
   const progFill = document.getElementById('synth-progress-fill');
   const progText = document.getElementById('synth-status-text');
-  const resBox = document.getElementById('synth-result');
-  const resMetrics = document.getElementById('synth-result-metrics');
-  const openBtn = document.getElementById('btn-open-3d');
+  const actionCard = document.getElementById('stage2-action-card');
 
   stage2.synthesizing = true;
-  btn.disabled = true;
-  btn.textContent = 'Synthesizing 30m AI Terrain…';
-  resBox.style.display = 'none';
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Synthesizing 30m AI Terrain…';
+  }
+  if (resynthBtn) resynthBtn.disabled = true;
+  if (actionCard) actionCard.style.display = 'none';
   progWrap.style.display = 'block';
   progFill.style.width = '6%';
   progText.textContent = 'Extracting Stage 1 tectonic conditioning fields…';
@@ -1259,25 +1382,23 @@ async function synthesizeStage2Target() {
     }
 
     stage2.lastResult = data;
-    progFill.style.width = '100%';
-    progText.textContent = `Done in ${data.totalSec}s (MPS ${data.mpsSec}s · Hydro ${data.hydroSec}s)`;
-    resMetrics.innerHTML =
-      `<strong>✓ ${data.coordLabel} Synthesized!</strong> (${data.totalSec}s)<br/>` +
-      `Coastline IoU <strong>${data.iouPct}%</strong> · Elev r=<strong>${data.elevCorr}</strong><br/>` +
-      `<strong>${data.lakeCount}</strong> alpine lakes · <strong>${data.riverCount}</strong> rivers (0 dead-ends)`;
-    openBtn.href = data.openUrl;
-    resBox.style.display = 'block';
-    loadCachedRegionsForPlanet();
+    progWrap.style.display = 'none';
+    // Immediately refresh cached footprints and transition into ONE single "Explore Synthesized 3D World" card!
+    await loadCachedRegionsForPlanet({ focusFreshId: data.worldId, freshData: data });
   } catch (err) {
     progFill.style.width = '100%';
     progText.innerHTML =
       `<span style="color:#fca5a5;">${err.message || 'Stage 2 server unreachable.'} ` +
       `(Run <code>just stage2-server</code>)</span>`;
+    syncStage2ActionUI();
   } finally {
     window.clearInterval(pollId);
     stage2.synthesizing = false;
-    btn.disabled = false;
-    btn.textContent = '✨ Synthesize 30m AI Terrain Here';
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = '✨ Synthesize 30m AI Terrain Here';
+    }
+    if (resynthBtn) resynthBtn.disabled = false;
     pollStage2Health();
   }
 }
@@ -1487,6 +1608,11 @@ function generatePlanetFromState(customSeed = null) {
   buildPlanetMesh();
   refreshContinentButtons();
 
+  stage2.activeCached = null;
+  stage2.justSynthesizedId = null;
+  stage2.justSynthesizedMeta = null;
+  const progWrap = document.getElementById('synth-progress-wrap');
+  if (progWrap) progWrap.style.display = 'none';
   // Aim orbit camera + Stage 2 target reticle toward the planet's largest continent so every roll opens on dramatic geography!
   if (currentPlanet.meta.landmasses.length > 0) {
     const d = currentPlanet.meta.landmasses[0].dir;
@@ -1496,8 +1622,6 @@ function generatePlanetFromState(customSeed = null) {
   } else {
     setStage2Target(new THREE.Vector3(0, 0, 1));
   }
-  const resBox = document.getElementById('synth-result');
-  if (resBox) resBox.style.display = 'none';
 
   const m = currentPlanet.meta;
   document.getElementById('planet-subtitle').textContent =
@@ -1601,8 +1725,7 @@ document.getElementById('chk-poles').addEventListener('change', (e) => {
 
 document.getElementById('sel-stage2-span').addEventListener('change', (e) => {
   stage2.spanDeg = Number(e.target.value) || 46;
-  rebuildTargetPatchOverlay();
-  updateStage2TargetInfo();
+  setStage2Target(stage2.targetDir);
 });
 
 document.getElementById('btn-target-explorer').addEventListener('click', () => {
@@ -1612,6 +1735,10 @@ document.getElementById('btn-target-explorer').addEventListener('click', () => {
 });
 
 document.getElementById('btn-synthesize').addEventListener('click', () => {
+  synthesizeStage2Target();
+});
+
+document.getElementById('btn-resynth')?.addEventListener('click', () => {
   synthesizeStage2Target();
 });
 
