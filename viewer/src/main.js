@@ -4,6 +4,8 @@ import { createSkyDome, createTerrainMaterial, createWaterMaterial } from './ter
 import { buildLakeSystem, buildRiverSystem } from './rivers.js';
 import { createGrassField } from './grass.js';
 import { buildWorldProps, updatePropsTransform } from './props.js';
+import { buildTerrainClipmapGeometry } from './clipmap.js';
+import { createTileStreamController } from './tileStream.js';
 
 // ---------- Renderer & Scene ----------
 const canvas = document.getElementById('scene');
@@ -17,6 +19,9 @@ renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 
 const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(56, window.innerWidth / window.innerHeight, 0.4, 20000);
+
+// Phase 1: ghost neighbor tiles beyond the home rim (not walkable yet)
+let tileStream = null;
 
 // Lights (driving multi-tier trees, boulders & explorer character)
 const hemiLight = new THREE.HemisphereLight('#b9dcff', '#4b5a40', 0.92);
@@ -240,6 +245,8 @@ let dioramaCursorHit = null;
 let pinDropFlash = 0;
 
 // ---------- Drill-Down Zoom State & 3D Box Overlays ----------
+// UI is hidden (index.html #section-drilldown[hidden]); keep helpers for possible future streaming LOD.
+const DRILLDOWN_UI_ENABLED = false;
 const drillState = {
   aiming: false,
   zoomFactor: 4,
@@ -361,7 +368,7 @@ function getClampedDrillCenterUV() {
 function rebuildDrillBoxOverlay() {
   disposeGroup(drillBoxGroup);
   drillBoxGroup = null;
-  if (!world || !drillState.aiming || state.camMode !== 'diorama') return;
+  if (!DRILLDOWN_UI_ENABLED || !world || !drillState.aiming || state.camMode !== 'diorama') return;
   const { cx, cz, boxSpan } = getClampedDrillCenterUV();
   const liftY = Math.max(world.meta.worldSpan * 0.0022, 1.5);
   drillBoxGroup = buildTerrainBoxMesh(cx, cz, boxSpan, '#38f2d8', 0.10, liftY);
@@ -371,7 +378,7 @@ function rebuildDrillBoxOverlay() {
 function rebuildDrillChildrenOverlay() {
   disposeGroup(drillChildrenGroup);
   drillChildrenGroup = null;
-  if (!world) return;
+  if (!DRILLDOWN_UI_ENABLED || !world) return;
   const children = catalog.filter((w) => w?.drillOrigin?.parentWorldId === world.meta.id);
   drillState.cachedChildren = children;
 
@@ -432,7 +439,7 @@ async function refreshCatalogData() {
 }
 
 async function runDrillDownAtPin() {
-  if (!world || drillState.running) return;
+  if (!DRILLDOWN_UI_ENABLED || !world || drillState.running) return;
   const btn = document.getElementById('btn-drill-run');
   const progWrap = document.getElementById('drill-progress-wrap');
   const progFill = document.getElementById('drill-progress-fill');
@@ -522,7 +529,7 @@ function pickTerrainAtNdc(ndcX, ndcY) {
   const d = pickRaycaster.ray.direction;
   if (d.y >= -1e-4) return null;
 
-  const halfSpan = world.meta.worldSpan * 0.49;
+  const halfSpan = walkHalfSpan();
   const maxY = Math.max(world.meta.maxElev * state.vScale + 30, 60);
   const tStart = Math.max(1.0, (maxY - o.y) / d.y);
   const tEnd = Math.min(20000, (-60 - o.y) / d.y);
@@ -562,9 +569,7 @@ function pickTerrainAtNdc(ndcX, ndcY) {
 
 function relocateExplorerTo(x, z) {
   if (!world) return false;
-  const halfSpan = world.meta.worldSpan * 0.48;
-  const cx = THREE.MathUtils.clamp(x, -halfSpan, halfSpan);
-  const cz = THREE.MathUtils.clamp(z, -halfSpan, halfSpan);
+  const { x: cx, z: cz } = clampToWalkable(x, z);
   const cy = Math.max(sampleHeight(cx, cz), 0.2);
   player.pos.set(cx, cy, cz);
   player.velY = 0;
@@ -654,7 +659,21 @@ canvas.addEventListener(
   { passive: false }
 );
 
-// ---------- Terrain Sampling ----------
+// ---------- Terrain Sampling / Walk Bounds ----------
+/** Playable half-extent — match the visual clipmap rim (±worldSpan/2), minus 1 m for float safety. */
+function walkHalfSpan() {
+  if (!world) return 0;
+  return Math.max(0, world.meta.worldSpan * 0.5 - 1);
+}
+
+function clampToWalkable(x, z) {
+  const lim = walkHalfSpan();
+  return {
+    x: THREE.MathUtils.clamp(x, -lim, lim),
+    z: THREE.MathUtils.clamp(z, -lim, lim),
+  };
+}
+
 function worldToGrid(x, z) {
   const { size, worldSpan } = world.meta;
   const u = (x / worldSpan + 0.5) * (size - 1);
@@ -705,8 +724,12 @@ function sampleMasks(x, z) {
 function sampleClimate(x, z) {
   if (!world || !world.meta.hasClimate || !world.climate) return null;
   const { size, tempRange, precipRange } = world.meta;
+  const climateSize = world.meta.climateSize || size;
   const { u, v } = worldToGrid(x, z);
-  const idx = (Math.round(v) * size + Math.round(u)) * 4;
+  // Climate may be packed at a coarser grid (e.g. 512 on 2K/4K worlds)
+  const cu = THREE.MathUtils.clamp((u / Math.max(size - 1, 1)) * (climateSize - 1), 0, climateSize - 1.001);
+  const cv = THREE.MathUtils.clamp((v / Math.max(size - 1, 1)) * (climateSize - 1), 0, climateSize - 1.001);
+  const idx = (Math.round(cv) * climateSize + Math.round(cu)) * 4;
   const tempC = tempRange[0] + (world.climate[idx] / 255) * (tempRange[1] - tempRange[0]);
   const precipMm = precipRange[0] + (world.climate[idx + 1] / 255) * (precipRange[1] - precipRange[0]);
   return { tempC, precipMm };
@@ -714,6 +737,7 @@ function sampleClimate(x, z) {
 
 // ---------- Dispose Helper ----------
 function disposeWorldScene() {
+  if (tileStream) tileStream.stop();
   if (terrainMesh) {
     scene.remove(terrainMesh);
     terrainMesh.geometry.dispose();
@@ -793,10 +817,13 @@ async function loadWorld(worldId) {
   document.getElementById('world-subtitle').textContent = `${meta.subtitle} · ${lakes.length} lakes, ${splines.length} rivers`;
   const sel = document.getElementById('world-select');
   if (sel) sel.value = worldId;
+  syncWorldCacheActions();
 
   const { size, worldSpan, maxElev } = meta;
+  const climateSize = meta.climateSize || size;
+  const lakeGridSize = meta.lakeGridSize || size;
 
-  // Float32 height texture (full 512 or 1024 resolution for shadows, ocean foam, lakes & grass!)
+  // Float32 height texture at full 1K/2K/4K resolution (clipmap samples this for native detail!)
   const hasFloatLinear = renderer.extensions.has('OES_texture_float_linear');
   heightFloatTex = new THREE.DataTexture(heights, size, size, THREE.RedFormat, THREE.FloatType);
   heightFloatTex.flipY = true;
@@ -811,9 +838,9 @@ async function loadWorld(worldId) {
   maskTex.magFilter = THREE.LinearFilter;
   maskTex.needsUpdate = true;
 
-  // Climate texture (WorldClim R=temp, G=precip, B=seasonality) or 1x1 neutral fallback
+  // Climate texture (may be compact 512x512 even on 2K/4K worlds)
   if (climate) {
-    climateTex = new THREE.DataTexture(climate, size, size, THREE.RGBAFormat, THREE.UnsignedByteType);
+    climateTex = new THREE.DataTexture(climate, climateSize, climateSize, THREE.RGBAFormat, THREE.UnsignedByteType);
   } else {
     climateTex = new THREE.DataTexture(new Uint8Array([128, 128, 128, 255]), 1, 1, THREE.RGBAFormat, THREE.UnsignedByteType);
   }
@@ -822,69 +849,8 @@ async function loadWorld(worldId) {
   climateTex.magFilter = THREE.LinearFilter;
   climateTex.needsUpdate = true;
 
-  // 1. Terrain Mesh (cap geometry grid at 512x512 for locked 60 FPS even on 1024x1024 worlds!)
-  const meshVerts = Math.min(size, 512);
-  const geo = new THREE.PlaneGeometry(worldSpan, worldSpan, meshVerts - 1, meshVerts - 1);
-  geo.rotateX(-Math.PI / 2);
-  const posAttr = geo.attributes.position;
-  const meshHeights = new Float32Array(meshVerts * meshVerts);
-  if (meshVerts === size) {
-    for (let i = 0; i < heights.length; i++) {
-      posAttr.setY(i, heights[i]);
-      meshHeights[i] = heights[i];
-    }
-  } else {
-    for (let vy = 0; vy < meshVerts; vy++) {
-      const fy = (vy / (meshVerts - 1)) * (size - 1);
-      const y0 = Math.floor(fy);
-      const y1 = Math.min(y0 + 1, size - 1);
-      const ty = fy - y0;
-      for (let vx = 0; vx < meshVerts; vx++) {
-        const fx = (vx / (meshVerts - 1)) * (size - 1);
-        const x0 = Math.floor(fx);
-        const x1 = Math.min(x0 + 1, size - 1);
-        const tx = fx - x0;
-        const i00 = y0 * size + x0;
-        const i10 = y0 * size + x1;
-        const i01 = y1 * size + x0;
-        const i11 = y1 * size + x1;
-        const a = heights[i00] * (1 - tx) + heights[i10] * tx;
-        const b = heights[i01] * (1 - tx) + heights[i11] * tx;
-        let hVal = a * (1 - ty) + b * ty;
-        // Preserve carved riverbeds during 1024->512 mesh reduction so terrain triangles NEVER bridge over streams!
-        const maxRiv = Math.max(masks[i00 * 4], masks[i10 * 4], masks[i01 * 4], masks[i11 * 4]);
-        if (maxRiv > 45) {
-          const minH = Math.min(heights[i00], heights[i10], heights[i01], heights[i11]);
-          const blendMin = Math.min(1.0, (maxRiv - 45) / 110.0);
-          hVal = hVal * (1.0 - blendMin) + minH * blendMin;
-        }
-        const idx = vy * meshVerts + vx;
-        posAttr.setY(idx, hVal);
-        meshHeights[idx] = hVal;
-      }
-    }
-  }
-  geo.computeVertexNormals();
-
-  // Exact triangle-interpolated height sampler of the rendered terrain mesh (for zero-clipping river ribbons!)
-  const sampleRenderedMeshHeight = (wx, wz) => {
-    const gx = ((wx / worldSpan) + 0.5) * (meshVerts - 1);
-    const gz = ((wz / worldSpan) + 0.5) * (meshVerts - 1);
-    const x0 = Math.max(0, Math.min(meshVerts - 2, Math.floor(gx)));
-    const z0 = Math.max(0, Math.min(meshVerts - 2, Math.floor(gz)));
-    const fx = Math.max(0, Math.min(1, gx - x0));
-    const fz = Math.max(0, Math.min(1, gz - z0));
-    const h00 = meshHeights[z0 * meshVerts + x0];
-    const h10 = meshHeights[z0 * meshVerts + x0 + 1];
-    const h01 = meshHeights[(z0 + 1) * meshVerts + x0];
-    const h11 = meshHeights[(z0 + 1) * meshVerts + x0 + 1];
-    // Matches THREE.PlaneGeometry diagonal split (a,c,b / b,c,d -> diagonal from (1,0) to (0,1))
-    if (fx + fz <= 1.0) {
-      return h00 + fx * (h10 - h00) + fz * (h01 - h00);
-    }
-    return h11 + (1.0 - fx) * (h01 - h11) + (1.0 - fz) * (h10 - h11);
-  };
-
+  // 1. GPU Geometry Clipmap — native 1.17–4.69 m triangles around the walker, coarse on the horizon
+  const geo = buildTerrainClipmapGeometry(worldSpan, size, size >= 2048 ? 160 : 128);
   terrainMat = createTerrainMaterial(
     maskTex,
     heightFloatTex,
@@ -897,27 +863,32 @@ async function loadWorld(worldId) {
     meta.precipRange || [0.0, 1200.0]
   );
   terrainMat.uniforms.uVScale.value = state.vScale;
+  terrainMat.uniforms.uFocusPos.value.set(0, 0, 0);
   terrainMesh = new THREE.Mesh(geo, terrainMat);
-  terrainMesh.scale.y = state.vScale;
+  // Clipmap displacement is done in the vertex shader via uVScale — do NOT scale the mesh Y
+  terrainMesh.scale.set(1, 1, 1);
+  terrainMesh.frustumCulled = false;
   scene.add(terrainMesh);
   syncFogDensity();
 
   // 2. Ocean Water Plane
   const waterGeo = new THREE.PlaneGeometry(worldSpan * 1.6, worldSpan * 1.6, 128, 128);
   waterGeo.rotateX(-Math.PI / 2);
-  waterMat = createWaterMaterial(heightFloatTex, maskTex, worldSpan);
+  waterMat = createWaterMaterial(heightFloatTex, maskTex, worldSpan, size);
   waterMat.uniforms.uVScale.value = state.vScale;
   waterMesh = new THREE.Mesh(waterGeo, waterMat);
   waterMesh.position.y = 0.0;
   scene.add(waterMesh);
 
   // 3. Real 3D Flowing River Ribbons & Flat-Surfaced Alpine/Valley Lakes
+  // Sample full-resolution heightfield (not a downsampled mesh) so ribbons hug 2K/4K riverbeds
+  const sampleRenderedMeshHeight = (wx, wz) => sampleHeight(wx, wz) / Math.max(state.vScale, 1e-6);
   riverObj = buildRiverSystem(splines, sampleRenderedMeshHeight);
   riverObj.mesh.scale.y = state.vScale;
   scene.add(riverObj.mesh);
 
   if (lakes.length > 0) {
-    lakeObj = buildLakeSystem(lakes, size, worldSpan, heightFloatTex, maskTex);
+    lakeObj = buildLakeSystem(lakes, lakeGridSize, worldSpan, heightFloatTex, maskTex);
     lakeObj.mesh.scale.y = state.vScale;
     lakeObj.material.uniforms.uVScale.value = state.vScale;
     scene.add(lakeObj.mesh);
@@ -981,6 +952,15 @@ async function loadWorld(worldId) {
   rebuildDrillChildrenOverlay();
   rebuildDrillBoxOverlay();
 
+  if (!tileStream) {
+    tileStream = createTileStreamController({
+      scene,
+      getVScale: () => state.vScale,
+    });
+  }
+  if (meta.planetOrigin) tileStream.start(meta);
+  else tileStream.stop();
+
   loader.classList.add('hidden');
 }
 
@@ -988,8 +968,9 @@ async function loadWorld(worldId) {
 function teleportTo(landmarkKey) {
   if (!world) return;
   const pt = world.meta.landmarks[landmarkKey] || [0.5, 0.5];
-  const x = (pt[0] - 0.5) * world.meta.worldSpan;
-  const z = (pt[1] - 0.5) * world.meta.worldSpan;
+  const rawX = (pt[0] - 0.5) * world.meta.worldSpan;
+  const rawZ = (pt[1] - 0.5) * world.meta.worldSpan;
+  const { x, z } = clampToWalkable(rawX, rawZ);
   const y = Math.max(sampleHeight(x, z), 0.5);
   player.pos.set(x, y, z);
   player.velY = 0;
@@ -1026,6 +1007,14 @@ function setCameraMode(mode) {
   state.camMode = mode;
   document.querySelectorAll('[data-cam]').forEach((b) => b.classList.toggle('active', b.dataset.cam === mode));
 
+  // Diorama pin can sit on the visual rim; snap inward before walking so the AABB clamp isn't an "invisible wall"
+  if (mode !== 'diorama' && world) {
+    const { x, z } = clampToWalkable(player.pos.x, player.pos.z);
+    player.pos.x = x;
+    player.pos.z = z;
+    player.pos.y = Math.max(sampleHeight(x, z), 0.2);
+  }
+
   if (mode === 'diorama') {
     camera.fov = 24;
     camRig.dioramaCenter.set(player.pos.x, getDioramaPlaneY(), player.pos.z);
@@ -1052,7 +1041,6 @@ function setCameraMode(mode) {
   if (drillChildrenGroup) drillChildrenGroup.visible = mode === 'diorama';
   rebuildDrillBoxOverlay();
   updatePropsTransform(propsGroup, state.vScale, mode === 'diorama');
-  syncPresetPills();
 }
 
 function setStyleMode(styleIdx) {
@@ -1070,38 +1058,6 @@ function setStyleMode(styleIdx) {
   if (grassObj) grassObj.mesh.visible = styleIdx === 0 && state.camMode !== 'diorama';
   if (propsGroup) propsGroup.visible = styleIdx !== 2;
   document.querySelectorAll('[data-style]').forEach((b) => b.classList.toggle('active', Number(b.dataset.style) === styleIdx));
-  syncPresetPills();
-}
-
-function applyPreset(preset) {
-  if (preset === 'zelda') {
-    setCameraMode('third');
-    setStyleMode(0);
-    state.sunElevDeg = 26;
-    document.getElementById('sun-slider').value = '26';
-    updateSun();
-  } else if (preset === 'hike') {
-    setCameraMode('first');
-    setStyleMode(0);
-    state.sunElevDeg = 24;
-    document.getElementById('sun-slider').value = '24';
-    updateSun();
-  } else if (preset === 'diorama') {
-    setCameraMode('diorama');
-    setStyleMode(1);
-    state.sunElevDeg = 44;
-    document.getElementById('sun-slider').value = '44';
-    updateSun();
-  }
-  syncPresetPills();
-}
-
-function syncPresetPills() {
-  let active = '';
-  if (state.camMode === 'third' && state.styleMode === 0) active = 'zelda';
-  else if (state.camMode === 'first' && state.styleMode === 0) active = 'hike';
-  else if (state.camMode === 'diorama' && state.styleMode === 1) active = 'diorama';
-  document.querySelectorAll('[data-preset]').forEach((b) => b.classList.toggle('active', b.dataset.preset === active));
 }
 
 function updateSun() {
@@ -1154,9 +1110,6 @@ function updateSun() {
 }
 
 // ---------- UI Wiring ----------
-document.querySelectorAll('[data-preset]').forEach((b) =>
-  b.addEventListener('click', () => applyPreset(b.dataset.preset))
-);
 document.querySelectorAll('[data-cam]').forEach((b) =>
   b.addEventListener('click', () => setCameraMode(b.dataset.cam))
 );
@@ -1173,7 +1126,8 @@ document.getElementById('sun-slider').addEventListener('input', (e) => {
 document.getElementById('vscale-slider').addEventListener('input', (e) => {
   state.vScale = Number(e.target.value);
   document.getElementById('vscale-val').textContent = `${state.vScale.toFixed(2)}×`;
-  if (terrainMesh) terrainMesh.scale.y = state.vScale;
+  if (tileStream) tileStream.setVScale(state.vScale);
+  // Clipmap height is displaced in-shader; mesh Y scale stays 1
   if (terrainMat) terrainMat.uniforms.uVScale.value = state.vScale;
   if (waterMat) waterMat.uniforms.uVScale.value = state.vScale;
   if (riverObj) riverObj.mesh.scale.y = state.vScale;
@@ -1188,6 +1142,61 @@ document.getElementById('vscale-slider').addEventListener('input', (e) => {
   rebuildDrillChildrenOverlay();
 });
 document.getElementById('world-select').addEventListener('change', (e) => loadWorld(e.target.value));
+
+function syncWorldCacheActions() {
+  const wrap = document.getElementById('world-cache-actions');
+  const bmBtn = document.getElementById('btn-bookmark-world');
+  if (!wrap || !world) return;
+  const isSynth = Boolean(world.meta?.planetOrigin || world.meta?.drillOrigin);
+  wrap.style.display = isSynth ? 'flex' : 'none';
+  if (bmBtn) {
+    bmBtn.textContent = world.meta?.bookmarked ? '★ Bookmarked' : '☆ Bookmark';
+  }
+}
+
+document.getElementById('btn-bookmark-world')?.addEventListener('click', async () => {
+  if (!world?.meta?.id) return;
+  try {
+    const next = !world.meta.bookmarked;
+    const resp = await fetch(`/api/worlds/${encodeURIComponent(world.meta.id)}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ bookmarked: next }),
+    });
+    const data = await resp.json();
+    if (!resp.ok || !data.ok) throw new Error(data.error || 'Bookmark failed');
+    world.meta.bookmarked = !!data.world?.bookmarked;
+    const catEntry = catalog.find((w) => w.id === world.meta.id);
+    if (catEntry) catEntry.bookmarked = world.meta.bookmarked;
+    syncWorldCacheActions();
+  } catch (err) {
+    window.alert(err.message || 'Bookmark failed (is Stage 2 server running?)');
+  }
+});
+
+document.getElementById('btn-delete-world')?.addEventListener('click', async () => {
+  if (!world?.meta?.id) return;
+  if (!world.meta.planetOrigin && !world.meta.drillOrigin) {
+    window.alert('Only synthesized / drilled worlds can be deleted from here.');
+    return;
+  }
+  if (!window.confirm(`Delete "${world.meta.title || world.meta.id}" from disk?`)) return;
+  try {
+    const resp = await fetch(`/api/worlds/${encodeURIComponent(world.meta.id)}?cascade=1`, { method: 'DELETE' });
+    const data = await resp.json();
+    if (!resp.ok || !data.ok) throw new Error(data.error || 'Delete failed');
+    catalog = catalog.filter((w) => !data.deletedIds.includes(w.id));
+    const select = document.getElementById('world-select');
+    if (select) {
+      select.innerHTML = catalog.map((w) => `<option value="${w.id}">${w.title}</option>`).join('');
+    }
+    const nextId = catalog[0]?.id;
+    if (nextId) await loadWorld(nextId);
+    else window.alert('World deleted. No remaining worlds in catalog.');
+  } catch (err) {
+    window.alert(err.message || 'Delete failed (is Stage 2 server running?)');
+  }
+});
 document.getElementById('sel-drill-zoom')?.addEventListener('change', (e) => {
   drillState.zoomFactor = Number(e.target.value) || 4;
   rebuildDrillBoxOverlay();
@@ -1224,7 +1233,7 @@ const elZone = document.getElementById('stat-zone');
 
 function updateMovement(dt) {
   if (!world) return;
-  const halfSpan = world.meta.worldSpan * 0.48;
+  const halfSpan = walkHalfSpan();
 
   const forwardInput = (keys.has('w') || keys.has('arrowup') ? 1 : 0) - (keys.has('s') || keys.has('arrowdown') ? 1 : 0);
   const rightInput = (keys.has('d') || keys.has('arrowright') ? 1 : 0) - (keys.has('a') || keys.has('arrowleft') ? 1 : 0);
@@ -1306,12 +1315,17 @@ function updateMovement(dt) {
   else if (inWater) speed *= 0.62;
 
   const move = new THREE.Vector3();
+  let hitMapEdge = false;
   if (forwardInput !== 0 || rightInput !== 0) {
     const camFwd = new THREE.Vector3(-Math.sin(camRig.yaw), 0, -Math.cos(camRig.yaw));
     const camRight = new THREE.Vector3(Math.cos(camRig.yaw), 0, -Math.sin(camRig.yaw));
     move.addScaledVector(camFwd, forwardInput).addScaledVector(camRight, rightInput).normalize();
-    player.pos.x = THREE.MathUtils.clamp(player.pos.x + move.x * speed * dt, -halfSpan, halfSpan);
-    player.pos.z = THREE.MathUtils.clamp(player.pos.z + move.z * speed * dt, -halfSpan, halfSpan);
+    const nextX = player.pos.x + move.x * speed * dt;
+    const nextZ = player.pos.z + move.z * speed * dt;
+    const clamped = clampToWalkable(nextX, nextZ);
+    hitMapEdge = clamped.x !== nextX || clamped.z !== nextZ;
+    player.pos.x = clamped.x;
+    player.pos.z = clamped.z;
     player.yaw = Math.atan2(move.x, move.z);
   }
 
@@ -1340,6 +1354,7 @@ function updateMovement(dt) {
   if (cape) cape.rotation.x = 0.2 + (moving ? 0.35 : 0.05) + Math.sin(t * 6) * 0.08;
 
   if (!player.grounded) player.activity = 'JUMPING';
+  else if (hitMapEdge && moving) player.activity = 'MAP EDGE';
   else if (inWater) player.activity = m.river > 0.42 ? 'CROSSING RIVER' : 'WADING';
   else if (climbing) player.activity = 'CLIMBING';
   else if (moving) player.activity = sprint ? 'SPRINTING' : 'WALKING';
@@ -1431,7 +1446,10 @@ function animate() {
     sunLight.position.copy(focus).addScaledVector(sunLight.userData.dir, 360);
   }
 
-  if (terrainMat) terrainMat.uniforms.uTime.value = t;
+  if (terrainMat) {
+    terrainMat.uniforms.uTime.value = t;
+    terrainMat.uniforms.uFocusPos.value.copy(focus);
+  }
   if (waterMat) waterMat.uniforms.uTime.value = t;
   if (riverObj) riverObj.material.uniforms.uTime.value = t;
   if (lakeObj) lakeObj.material.uniforms.uTime.value = t;
@@ -1466,12 +1484,15 @@ async function init() {
   select.value = startId;
 
   await loadWorld(startId);
-  applyPreset('zelda');
+  setCameraMode('third');
+  setStyleMode(0);
+  state.sunElevDeg = 26;
+  document.getElementById('sun-slider').value = '26';
+  updateSun();
   animate();
 }
 
 window.__terragrok = {
-  applyPreset,
   loadWorld,
   teleportTo,
   setCameraMode,

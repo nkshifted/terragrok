@@ -53,6 +53,14 @@ stage2-server:
 viewer:
     cd viewer && npm run dev
 
+# One-command local stack: Stage 2 MPS backend + Vite viewer (Ctrl+C stops both)
+dev:
+    bash scripts/dev.sh
+
+# Fast invariant / regression tests (no MPS / no diffusion model required)
+test:
+    uv run --with pytest pytest tests/ -q
+
 # Remove generated outputs
 clean:
     rm -rf out

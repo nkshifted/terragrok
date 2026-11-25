@@ -43,20 +43,69 @@ export function createTerrainMaterial(
       uVScale: { value: 1.0 },
       uStyleMode: { value: 0 },
       uTime: { value: 0.0 },
+      uFocusPos: { value: new THREE.Vector3(0, 0, 0) },
     },
     vertexShader: /* glsl */ `
+      attribute vec4 aRingData; // (stepSize, snapPeriod, edgeSnapX, edgeSnapZ)
+
+      uniform sampler2D uHeightTex;
+      uniform float uWorldSpan;
+      uniform float uGridSize;
+      uniform float uVScale;
+      uniform vec3 uFocusPos;
+
       varying vec2 vUv;
       varying vec3 vWorldPos;
       varying vec3 vNormalW;
       varying float vElevRaw;
 
+      vec2 xzToHeightUv(vec2 xz) {
+        vec2 uv = clamp(xz / uWorldSpan + 0.5, 0.0, 1.0);
+        uv.y = 1.0 - uv.y;
+        return (uv * (uGridSize - 1.0) + 0.5) / uGridSize;
+      }
+
+      float sampleRawH(vec2 xz) {
+        return texture2D(uHeightTex, xzToHeightUv(xz)).r;
+      }
+
       void main() {
-        vUv = uv;
-        vElevRaw = position.y;
-        vec4 wp = modelMatrix * vec4(position, 1.0);
-        vWorldPos = wp.xyz;
-        vNormalW = normalize(mat3(modelMatrix) * normal);
-        gl_Position = projectionMatrix * viewMatrix * wp;
+        float stepSize = aRingData.x;
+        float snapPeriod = max(aRingData.y, 1.0);
+        vec2 edgeSnap = aRingData.zw;
+        float halfSpan = uWorldSpan * 0.5;
+
+        // Uniform-snap clipmap center: zero vertex swimming & 100% aligned ring borders!
+        vec2 ringCenter = floor(uFocusPos.xz / snapPeriod + 0.5) * snapPeriod;
+        vec2 rawXZ = ringCenter + position.xz;
+        vec2 wxz = clamp(rawXZ, -halfSpan, halfSpan);
+
+        // Zero T-junction cracks: odd outer-edge vertices average their two adjacent even neighbors
+        float hRaw;
+        if (edgeSnap.x > 0.0 || edgeSnap.y > 0.0) {
+          vec2 xzA = clamp(rawXZ - edgeSnap, -halfSpan, halfSpan);
+          vec2 xzB = clamp(rawXZ + edgeSnap, -halfSpan, halfSpan);
+          hRaw = 0.5 * (sampleRawH(xzA) + sampleRawH(xzB));
+        } else {
+          hRaw = sampleRawH(wxz);
+        }
+
+        vec2 planeUv = clamp(wxz / uWorldSpan + 0.5, 0.0, 1.0);
+        planeUv.y = 1.0 - planeUv.y;
+        vUv = planeUv;
+        vElevRaw = hRaw;
+
+        vec3 worldP = vec3(wxz.x, hRaw * uVScale, wxz.y);
+        vWorldPos = worldP;
+
+        float eps = max(stepSize, uWorldSpan / max(uGridSize - 1.0, 1.0));
+        float hL = sampleRawH(clamp(wxz - vec2(eps, 0.0), -halfSpan, halfSpan)) * uVScale;
+        float hR = sampleRawH(clamp(wxz + vec2(eps, 0.0), -halfSpan, halfSpan)) * uVScale;
+        float hD = sampleRawH(clamp(wxz - vec2(0.0, eps), -halfSpan, halfSpan)) * uVScale;
+        float hU = sampleRawH(clamp(wxz + vec2(0.0, eps), -halfSpan, halfSpan)) * uVScale;
+        vNormalW = normalize(vec3(hL - hR, 2.0 * eps, hD - hU));
+
+        gl_Position = projectionMatrix * viewMatrix * vec4(worldP, 1.0);
       }
     `,
     fragmentShader: /* glsl */ `
@@ -166,7 +215,19 @@ export function createTerrainMaterial(
         vec2 uv = xz / uWorldSpan + 0.5;
         uv.y = 1.0 - uv.y; // match PlaneGeometry flipY
         if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) return -50.0;
-        return texture2D(uHeightTex, uv).r * uVScale;
+        vec2 texUv = (uv * (uGridSize - 1.0) + 0.5) / uGridSize;
+        return texture2D(uHeightTex, texUv).r * uVScale;
+      }
+
+      // Full-resolution (1K / 2K / 4K) analytical heightfield normal so distant peaks stay razor-sharp!
+      vec3 computeHeightTexNormal(vec2 xz) {
+        float eps = uWorldSpan / max(uGridSize - 1.0, 1.0);
+        float halfSpan = uWorldSpan * 0.5;
+        float hL = sampleHeightAtWorld(clamp(xz - vec2(eps, 0.0), -halfSpan, halfSpan));
+        float hR = sampleHeightAtWorld(clamp(xz + vec2(eps, 0.0), -halfSpan, halfSpan));
+        float hD = sampleHeightAtWorld(clamp(xz - vec2(0.0, eps), -halfSpan, halfSpan));
+        float hU = sampleHeightAtWorld(clamp(xz + vec2(0.0, eps), -halfSpan, halfSpan));
+        return normalize(vec3(hL - hR, 2.0 * eps, hD - hU));
       }
 
       // Real mountain self-shadowing via heightfield raymarch toward sun
@@ -197,7 +258,8 @@ export function createTerrainMaterial(
         float curvAO = m.b;     // 0 = deep gully, 0.5 = flat, 1 = sharp ridge
         float moisture = m.a;
 
-        vec3 nSmooth = normalize(vNormalW);
+        vec3 nTex = computeHeightTexNormal(vWorldPos.xz);
+        vec3 nSmooth = normalize(mix(normalize(vNormalW), nTex, 0.88));
         vec3 nFlat = normalize(cross(dFdx(vWorldPos), dFdy(vWorldPos)));
         vec3 baseN = (uStyleMode == 1) ? nFlat : nSmooth;
 
@@ -415,7 +477,7 @@ export function createTerrainMaterial(
  * Animated Ocean Water Plane with exact Float32 depth-based turquoise shallows,
  * moving wave ripples, Fresnel sky reflection, and shoreline foam.
  */
-export function createWaterMaterial(heightFloatTex, maskTex, worldSpan) {
+export function createWaterMaterial(heightFloatTex, maskTex, worldSpan, gridSize = 1024) {
   return new THREE.ShaderMaterial({
     transparent: true,
     depthWrite: false,
@@ -423,6 +485,7 @@ export function createWaterMaterial(heightFloatTex, maskTex, worldSpan) {
       uHeightTex: { value: heightFloatTex },
       uMasks: { value: maskTex },
       uWorldSpan: { value: worldSpan },
+      uGridSize: { value: gridSize },
       uSunDir: { value: new THREE.Vector3(0.65, 0.45, 0.45).normalize() },
       uFogColor: { value: new THREE.Color('#a8d0ea') },
       uFogDensity: { value: 0.00044 },
@@ -446,6 +509,7 @@ export function createWaterMaterial(heightFloatTex, maskTex, worldSpan) {
       uniform sampler2D uHeightTex;
       uniform sampler2D uMasks;
       uniform float uWorldSpan;
+      uniform float uGridSize;
       uniform vec3 uSunDir;
       uniform vec3 uFogColor;
       uniform float uFogDensity;
@@ -473,10 +537,11 @@ export function createWaterMaterial(heightFloatTex, maskTex, worldSpan) {
         vec2 uv = vWorldPos.xz / uWorldSpan + 0.5;
         uv.y = 1.0 - uv.y;
         bool inMap = (uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0);
+        vec2 texUv = (uv * (uGridSize - 1.0) + 0.5) / uGridSize;
         // Never draw the y=0 ocean sheet underneath an inland crater lake whose floor dips below sea level!
-        if (inMap && texture2D(uMasks, uv).g > 0.05) discard;
+        if (inMap && texture2D(uMasks, texUv).g > 0.05) discard;
         float terrainH = inMap
-          ? texture2D(uHeightTex, uv).r * uVScale
+          ? texture2D(uHeightTex, texUv).r * uVScale
           : -30.0;
 
         float depthM = max(-terrainH, 0.0);

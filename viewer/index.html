@@ -20,17 +20,12 @@
       </div>
 
       <div class="section">
-        <div class="label">Quick Style Comparison</div>
-        <div class="btn-row">
-          <button class="pill active" data-preset="zelda">Zelda 3D (Walk)</button>
-          <button class="pill" data-preset="hike">1st-Person Hike</button>
-          <button class="pill" data-preset="diorama">Diorama (Isometric)</button>
-        </div>
-      </div>
-
-      <div class="section">
         <div class="label">World (Generated via mise)</div>
         <select id="world-select"></select>
+        <div id="world-cache-actions" class="world-cache-actions" style="display:none;margin-top:6px;">
+          <button id="btn-bookmark-world" class="mini" type="button" title="Bookmark so prune keeps this world">☆ Bookmark</button>
+          <button id="btn-delete-world" class="mini" type="button" title="Delete this synthesized world from disk">Delete</button>
+        </div>
       </div>
 
       <div class="section">
@@ -62,7 +57,9 @@
         </div>
       </div>
 
-      <div class="section">
+      <!-- Drill-down UI hidden: 2K/4K whole-rectangle synthesis + clipmap replaced the map-swap zoom UX.
+           Backend /api/drilldown + JS helpers remain for potential future streaming LOD. Flip hidden off to restore. -->
+      <div class="section" id="section-drilldown" hidden>
         <div class="drill-card">
           <div class="drill-head">
             <span class="label" style="margin:0;">Drill-Down Zoom (AI)</span>

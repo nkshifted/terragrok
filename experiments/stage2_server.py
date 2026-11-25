@@ -24,6 +24,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, unquote, urlparse
 
 import numpy as np
 import torch
@@ -40,8 +41,19 @@ from export_viewer_worlds import (  # noqa: E402
     find_landmarks,
     solve_physical_hydrology,
 )
+from biome_profile import compute_biome_hydrology_profile  # noqa: E402
+from world_cache import (  # noqa: E402
+    VIEWER_WORLDS_DIR,
+    delete_cached_world,
+    list_cached_worlds,
+    patch_cached_world,
+    prune_unbookmarked_worlds,
+)
+from tile_ghost import write_ghost_tile  # noqa: E402
+from tile_stream import TILE_STREAMS  # noqa: E402
 
-VIEWER_WORLDS_DIR = REPO_ROOT / "viewer" / "public" / "worlds"
+# Back-compat alias used throughout this module
+_compute_biome_hydrology_profile = compute_biome_hydrology_profile
 
 
 def _decode_f32(b64_str: str, shape: tuple[int, int]) -> np.ndarray:
@@ -63,85 +75,6 @@ def _inv_signed_sqrt(s: np.ndarray) -> np.ndarray:
     return np.sign(s) * (s * s)
 
 
-def _compute_biome_hydrology_profile(
-    elev: np.ndarray,
-    temp_c: np.ndarray,
-    precip_mm: np.ndarray,
-    res_scale: float,
-) -> dict:
-    """
-    Derive physical liquid runoff, lake/river budgets, absolute moisture, and biome label
-    directly from absolute temperature (°C) and precipitation (mm/yr):
-      - Polar Glaciers (mean T < -3.5°C): 0 liquid rivers, 0 unfrozen lakes
-      - Hot/Cold Arid Deserts (< 240 mm/yr): 0 rivers, 0 lakes (wind-sculpted sand & rock)
-      - Tundra / Dry Steppe: sparse 1-5 rivers, 0-2 lakes
-      - Temperate / Rainforest: full rich alpine lake & river watersheds
-    """
-    land = elev > 0.5
-    if land.any():
-        mean_t = float(np.mean(temp_c[land]))
-        mean_p = float(np.mean(precip_mm[land]))
-    else:
-        mean_t = float(np.mean(temp_c))
-        mean_p = float(np.mean(precip_mm))
-
-    # Liquid fraction: frozen solid below -3°C, fully liquid above +2.5°C
-    freeze_factor = np.clip((temp_c + 3.0) / 5.5, 0.0, 1.0)
-    # Effective runoff after evaporation: bone-dry deserts (< 210 mm/yr) produce ~0 surface runoff;
-    # hotter deserts evaporate even more rainfall before rivers can form!
-    evap_floor = 180.0 + np.clip((temp_c - 10.0) * 8.0, 0.0, 130.0)
-    aridity_factor = np.clip((precip_mm - evap_floor) / 560.0, 0.0, 1.65)
-    runoff_map = (freeze_factor * aridity_factor).astype(np.float32)
-
-    wetness = float(np.mean(runoff_map[land])) if land.any() else float(np.mean(runoff_map))
-
-    if mean_t < -3.5:
-        biome = "Polar Glacier"
-        max_lakes = 0
-        max_rivers = 0
-        min_lake_runoff = 0.35
-    elif wetness < 0.14 or (mean_p < 300.0 and mean_t > 12.0):
-        biome = "Arid Desert"
-        max_lakes = 0
-        max_rivers = 0
-        min_lake_runoff = 0.35
-    elif mean_t < 2.5 and wetness < 0.45:
-        biome = "Arctic Tundra"
-        max_lakes = max(0, int(round(wetness * 6)))
-        max_rivers = max(1, int(round(wetness * 10)))
-        min_lake_runoff = 0.16
-    elif wetness < 0.36:
-        biome = "Dry Steppe"
-        max_lakes = max(0, int(round((wetness - 0.14) * 5)))
-        max_rivers = max(1, int(round((wetness - 0.08) * 10)))
-        min_lake_runoff = 0.22
-    elif mean_t > 18.0 and mean_p > 1050.0:
-        biome = "Tropical Rainforest"
-        max_lakes = 10
-        max_rivers = 22
-        min_lake_runoff = 0.15
-    else:
-        biome = "Temperate Highlands"
-        t_norm = float(np.clip((wetness - 0.30) / 0.65, 0.0, 1.0))
-        max_lakes = int(round(3 + t_norm * 7))
-        max_rivers = int(round(6 + t_norm * 14))
-        min_lake_runoff = 0.15
-
-    # Absolute moisture (NOT stretched per patch!): deserts stay dry (<0.12), glaciers stay 0.0!
-    abs_moist = np.clip((precip_mm - 140.0) / 920.0, 0.02, 0.96) * np.clip((temp_c + 3.5) / 7.0, 0.0, 1.0)
-
-    return {
-        "biome": biome,
-        "mean_t": mean_t,
-        "mean_p": mean_p,
-        "wetness": wetness,
-        "runoff_map": runoff_map,
-        "abs_moist": abs_moist.astype(np.float32),
-        "max_lakes": max_lakes,
-        "max_spring_rivers": max_rivers,
-        "min_lake_runoff": min_lake_runoff,
-        "min_lake_cells": int(round(28 * res_scale)),
-    }
 
 
 def _apply_biome_surface_refinement(
@@ -155,40 +88,113 @@ def _apply_biome_surface_refinement(
     Biome-aware micro-terrain refinement:
       - Hot arid deserts: smooth wind-sculpted sand dune ripples instead of rocky alpine chatter
       - Polar glaciers: sweeping smooth glacial snowfields & crevasse swells
-      - Temperate / alpine / coastal rock: full crag & gully micro-detail
+      - Temperate / alpine / coastal rock: crag & gully micro-detail at 1K (at 2K/4K Terrain Diffusion
+        already synthesizes crisp dendritic canyon walls & ridges natively at 1.17–2.34 m/px!)
     """
-    craggy = apply_micro_detail_refinement(elev_viewer, world_span_m=world_span_m, seed=seed)
+    ny, nx = elev_viewer.shape
+    if nx <= 1024:
+        craggy = apply_micro_detail_refinement(elev_viewer, world_span_m=world_span_m, seed=seed)
+    else:
+        craggy = elev_viewer.copy()
 
     desert_w = np.clip((temp_c - 12.0) / 8.0, 0.0, 1.0) * np.clip((340.0 - precip_mm) / 180.0, 0.0, 1.0)
     glacier_w = np.clip((-2.5 - temp_c) / 4.5, 0.0, 1.0)
     land = (elev_viewer > 2.0).astype(np.float32)
 
-    out = craggy.copy()
+    out = craggy
     if float(desert_w.max()) > 0.05:
-        ny, nx = elev_viewer.shape
         yy, xx = np.mgrid[0:ny, 0:nx].astype(np.float32)
         # Wind-sculpted barchan/transverse dune waves at 2 natural scales
         ang = (seed % 360) * np.pi / 180.0
-        u = (xx * np.cos(ang) + yy * np.sin(ang)) * (world_span_m / max(nx, 1))
-        v = (-xx * np.sin(ang) + yy * np.cos(ang)) * (world_span_m / max(nx, 1))
+        cell_m = world_span_m / max(nx, 1)
+        u = (xx * np.cos(ang) + yy * np.sin(ang)) * cell_m
+        v = (-xx * np.sin(ang) + yy * np.cos(ang)) * cell_m
+        sigma_scale = max(1.0, nx / 1024.0)
         warp = gaussian_filter(
             np.sin(u * 0.011 + np.sin(v * 0.007) * 2.2) * 3.8
             + np.sin(u * 0.032 + np.cos(v * 0.019) * 1.4) * 1.4,
-            sigma=1.5,
+            sigma=1.5 * sigma_scale,
         )
         # Only place dunes on gentle-to-moderate desert floors (preserve rocky mesas on steep cliffs!)
         gy, gx = np.gradient(elev_viewer, world_span_m / max(nx - 1, 1))
         flat_desert = np.clip(1.0 - np.hypot(gx, gy) / 0.42, 0.0, 1.0)
-        sand_surface = gaussian_filter(elev_viewer, sigma=2.5, mode="nearest") + warp * flat_desert
+        sand_surface = gaussian_filter(elev_viewer, sigma=2.2 * sigma_scale, mode="nearest") + warp * flat_desert
         blend = desert_w * flat_desert * land * 0.85
         out = out * (1.0 - blend) + sand_surface * blend
 
     if float(glacier_w.max()) > 0.05:
-        smooth_ice = gaussian_filter(elev_viewer, sigma=2.2, mode="nearest")
+        sigma_scale = max(1.0, nx / 1024.0)
+        smooth_ice = gaussian_filter(elev_viewer, sigma=2.0 * sigma_scale, mode="nearest")
         blend = glacier_w * land * 0.72
         out = out * (1.0 - blend) + smooth_ice * blend
 
     return out.astype(np.float32)
+
+
+def solve_hydrology_multires(
+    elev: np.ndarray,
+    world_span_m: float,
+    hydro_prof: dict,
+    min_lake_depth_m: float = 0.55,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, list, list, int]:
+    """
+    Fast multi-resolution physical hydrology:
+      - For <= 1024x1024: solves Landlab LakeMapperBarnes + Fastscapelib directly on native grid.
+      - For 2048x2048 / 4096x4096: solves exact lake/river topology on a 1024x1024 grid (~5s instead
+        of 25-120s!), then applies the exact riverbed carve & lake-basin delta onto the full 2K/4K
+        neural terrain while preserving 100% of native 1.17-2.34 m/px ridge & canyon detail!
+    Returns: (carved, riv_u8, lak_u8, lakes_data, rivers_data, lake_grid_size)
+    """
+    out_n = elev.shape[0]
+    if out_n <= 1024:
+        carved, riv_u8, lak_u8, lakes_data, rivers_data = solve_physical_hydrology(
+            elev=elev,
+            world_span_m=world_span_m,
+            min_lake_cells=hydro_prof["min_lake_cells"],
+            min_lake_depth_m=min_lake_depth_m,
+            max_spring_rivers=hydro_prof["max_spring_rivers"],
+            runoff_map=hydro_prof["runoff_map"],
+            max_lakes=hydro_prof["max_lakes"],
+            min_lake_runoff=hydro_prof["min_lake_runoff"],
+        )
+        return carved, riv_u8, lak_u8, lakes_data, rivers_data, out_n
+
+    # Decoupled 1024 solve -> high-res delta carve (<0.6s upsample!)
+    hydro_n = 1024
+    down = hydro_n / float(out_n)
+    elev_1k = zoom(elev, down, order=1).astype(np.float32)
+    runoff_1k = zoom(hydro_prof["runoff_map"], down, order=1).astype(np.float32)
+    min_cells_1k = max(16, int(round(hydro_prof["min_lake_cells"] * (down ** 2))))
+
+    carved_1k, riv_1k, lak_1k, lakes_data, rivers_data = solve_physical_hydrology(
+        elev=elev_1k,
+        world_span_m=world_span_m,
+        min_lake_cells=min_cells_1k,
+        min_lake_depth_m=min_lake_depth_m,
+        max_spring_rivers=hydro_prof["max_spring_rivers"],
+        runoff_map=runoff_1k,
+        max_lakes=hydro_prof["max_lakes"],
+        min_lake_runoff=hydro_prof["min_lake_runoff"],
+    )
+
+    if len(lakes_data) == 0 and len(rivers_data) == 0:
+        zeros = np.zeros((out_n, out_n), dtype=np.uint8)
+        return elev.copy(), zeros, zeros.copy(), lakes_data, rivers_data, hydro_n
+
+    up = out_n / float(hydro_n)
+    carve_delta_1k = (carved_1k - elev_1k).astype(np.float32)
+    carve_delta_hi = zoom(carve_delta_1k, up, order=1).astype(np.float32)
+    riv_hi = np.clip(zoom(riv_1k.astype(np.float32), up, order=1), 0, 255).astype(np.uint8)
+    lak_hi = np.clip(zoom(lak_1k.astype(np.float32), up, order=1), 0, 255).astype(np.uint8)
+
+    carved = (elev + carve_delta_hi).astype(np.float32)
+    # Keep alpine lakebeds cleanly below flat lake surfaces without high-res micro-bumps poking through
+    if int(lak_hi.max()) > 100:
+        carved_1k_up = zoom(carved_1k, up, order=1).astype(np.float32)
+        lake_blend = np.clip((lak_hi.astype(np.float32) - 90.0) / 110.0, 0.0, 1.0)
+        carved = (carved * (1.0 - lake_blend) + np.minimum(carved, carved_1k_up) * lake_blend).astype(np.float32)
+
+    return carved, riv_hi, lak_hi, lakes_data, rivers_data, hydro_n
 
 
 def _relax_angle_of_repose(
@@ -551,11 +557,12 @@ class WarmStage2Engine:
                 elev_viewer,
             ).astype(np.float32)
             # Talus / angle-of-repose relaxation (~52° max macro cliff) before micro-crag refinement
+            repose_iters = 14 if out_n <= 1024 else (8 if out_n <= 2048 else 5)
             elev_viewer = _relax_angle_of_repose(
                 elev_viewer,
                 cell_size_m=world_span_m / out_n,
                 max_slope_deg=52.0,
-                iterations=14,
+                iterations=repose_iters,
             )
 
             # Preserve Stage 1 planetary climate mean EXACTLY, adding ONLY TD30m's zero-mean local spatial
@@ -590,22 +597,18 @@ class WarmStage2Engine:
             )
 
             t_h0 = time.perf_counter()
-            carved, riv_u8, lak_u8, lakes_data, rivers_data = solve_physical_hydrology(
+            carved, riv_u8, lak_u8, lakes_data, rivers_data, lake_grid_size = solve_hydrology_multires(
                 elev=elev_refined,
                 world_span_m=world_span_m,
-                min_lake_cells=hydro_prof["min_lake_cells"],
+                hydro_prof=hydro_prof,
                 min_lake_depth_m=0.55,
-                max_spring_rivers=hydro_prof["max_spring_rivers"],
-                runoff_map=hydro_prof["runoff_map"],
-                max_lakes=hydro_prof["max_lakes"],
-                min_lake_runoff=hydro_prof["min_lake_runoff"],
             )
             t_hydro = time.perf_counter() - t_h0
 
             self.status.update(
                 {
                     "phase": "exporting",
-                    "message": "Writing 3D viewer world & updating catalog…",
+                    "message": f"Writing {out_n}×{out_n} 3D world & updating catalog…",
                     "progress": 0.94,
                 }
             )
@@ -613,22 +616,49 @@ class WarmStage2Engine:
             coord_slug = _format_coord_slug(lat_deg, lon_deg)
             coord_label = coord_slug.replace("_", " ").replace("N", "°N").replace("S", "°S").replace("E", "°E").replace("W", "°W")
             safe_arch = re.sub(r"[^a-z0-9]", "", archetype.lower())[:8] or "earth"
-            world_id = f"planet_s{seed}_{safe_arch}_{coord_slug.lower()}"
+            res_tag = f"{out_n // 1024}K" if out_n >= 1024 else f"{out_n}px"
+            # Include resolution in world id so 1K/2K/4K of the same spot can coexist
+            world_id = f"planet_s{seed}_{safe_arch}_{coord_slug.lower()}_{res_tag.lower()}"
 
             VIEWER_WORLDS_DIR.mkdir(parents=True, exist_ok=True)
-            curv_u8 = compute_curvature_ao(carved)
+            # Curvature AO is a shading cue — compute at <=1024 then upsample for 2K/4K speed
+            if out_n > 1024:
+                elev_ao = zoom(carved, 1024.0 / out_n, order=1).astype(np.float32)
+                curv_1k = compute_curvature_ao(elev_ao)
+                curv_u8 = np.clip(zoom(curv_1k.astype(np.float32), out_n / 1024.0, order=1), 0, 255).astype(np.uint8)
+            else:
+                curv_u8 = compute_curvature_ao(carved)
 
+            # Climate varies smoothly over km -> pack at <=512x512 (1 MB max even for 4K worlds!)
+            climate_n = min(out_n, 512)
             temp_range = [-16.0, 32.0]
             precip_range = [0.0, 1800.0]
-            t_u8 = np.clip((temp_c - temp_range[0]) / (temp_range[1] - temp_range[0]) * 255.0, 0, 255).astype(np.uint8)
-            p_u8 = np.clip((precip_mm - precip_range[0]) / (precip_range[1] - precip_range[0]) * 255.0, 0, 255).astype(np.uint8)
-            s_u8 = np.clip(t_season / max(float(np.percentile(t_season, 98)), 1.0) * 255.0, 0, 255).astype(np.uint8)
-            clim_rgba = np.stack([t_u8, p_u8, s_u8, np.full((out_n, out_n), 255, dtype=np.uint8)], axis=-1)
+            if climate_n < out_n:
+                c_scale = climate_n / float(out_n)
+                t_c_sm = zoom(temp_c, c_scale, order=1)
+                p_c_sm = zoom(precip_mm, c_scale, order=1)
+                s_c_sm = zoom(t_season, c_scale, order=1)
+            else:
+                t_c_sm, p_c_sm, s_c_sm = temp_c, precip_mm, t_season
+            t_u8 = np.clip((t_c_sm - temp_range[0]) / (temp_range[1] - temp_range[0]) * 255.0, 0, 255).astype(np.uint8)
+            p_u8 = np.clip((p_c_sm - precip_range[0]) / (precip_range[1] - precip_range[0]) * 255.0, 0, 255).astype(np.uint8)
+            s_u8 = np.clip(s_c_sm / max(float(np.percentile(s_c_sm, 98)), 1.0) * 255.0, 0, 255).astype(np.uint8)
+            clim_rgba = np.stack([t_u8, p_u8, s_u8, np.full((climate_n, climate_n), 255, dtype=np.uint8)], axis=-1)
             clim_rgba.tofile(VIEWER_WORLDS_DIR / f"{world_id}.climate.u8")
 
             # Absolute biome moisture + riparian wetness ONLY where real rivers/lakes exist!
             wet_seed = np.clip((riv_u8.astype(np.float32) + lak_u8.astype(np.float32)) / 255.0, 0.0, 1.0)
-            moisture = np.clip(hydro_prof["abs_moist"] + gaussian_filter(wet_seed, sigma=10.0) * 0.75, 0.0, 1.0)
+            if wet_seed.max() > 0.01:
+                wet_sigma = 10.0 * (out_n / 1024.0)
+                if out_n > 1024:
+                    # Fast downsampled Gaussian blur for riparian moisture halo (<0.15s vs 2s at 4K)
+                    wet_1k = gaussian_filter(zoom(wet_seed, 1024.0 / out_n, order=1), sigma=10.0)
+                    wet_halo = zoom(wet_1k, out_n / 1024.0, order=1)
+                else:
+                    wet_halo = gaussian_filter(wet_seed, sigma=wet_sigma)
+            else:
+                wet_halo = 0.0
+            moisture = np.clip(hydro_prof["abs_moist"] + wet_halo * 0.75, 0.0, 1.0)
 
             masks = np.stack([riv_u8, lak_u8, curv_u8, (moisture * 255.0).astype(np.uint8)], axis=-1)
             carved.astype(np.float32).tofile(VIEWER_WORLDS_DIR / f"{world_id}.height.f32")
@@ -637,11 +667,16 @@ class WarmStage2Engine:
             (VIEWER_WORLDS_DIR / f"{world_id}.lakes.json").write_text(json.dumps(lakes_data))
 
             landmarks = find_landmarks(carved, riv_u8, lak_u8, lakes_data, rivers_data, world_span_m)
+            m_per_px = world_span_m / out_n
             world_meta = {
                 "id": world_id,
-                "title": f"Planet #{seed} · {coord_label} ({biome_label})",
-                "subtitle": f"{biome_label} ({hydro_prof['mean_t']:.0f}°C, {hydro_prof['mean_p']:.0f}mm) · IoU {iou*100:.0f}%",
+                "title": f"Planet #{seed} · {coord_label} ({biome_label} · {res_tag})",
+                "subtitle": f"{biome_label} ({hydro_prof['mean_t']:.0f}°C, {hydro_prof['mean_p']:.0f}mm) · {res_tag} ({m_per_px:.2f} m/px) · IoU {iou*100:.0f}%",
                 "size": out_n,
+                "climateSize": climate_n,
+                "lakeGridSize": lake_grid_size,
+                "resolution": res_tag,
+                "biome": biome_label,
                 "worldSpan": world_span_m,
                 "minElev": round(float(carved.min()), 2),
                 "maxElev": round(float(carved.max()), 2),
@@ -690,6 +725,10 @@ class WarmStage2Engine:
                 "worldId": world_id,
                 "title": world_meta["title"],
                 "coordLabel": coord_label,
+                "resolution": res_tag,
+                "gridSize": out_n,
+                "mPerPx": round(m_per_px, 2),
+                "biome": biome_label,
                 "iouPct": round(iou * 100.0, 1),
                 "elevCorr": round(corr, 3),
                 "landPct": round(float(gen_land.mean() * 100.0), 1),
@@ -721,13 +760,21 @@ class WarmStage2Engine:
             parent_span = float(parent_meta["worldSpan"])
             parent_h = np.fromfile(parent_height_path, dtype=np.float32).reshape((parent_size, parent_size))
 
-            # Optional parent climate
+            # Optional parent climate (supports compact climateSize <= 512 on 2K/4K parents!)
             parent_clim_path = VIEWER_WORLDS_DIR / f"{parent_id}.climate.u8"
-            parent_clim = (
-                np.fromfile(parent_clim_path, dtype=np.uint8).reshape((parent_size, parent_size, 4))
-                if parent_clim_path.exists()
-                else None
-            )
+            parent_clim_size = int(parent_meta.get("climateSize", parent_size))
+            if parent_clim_path.exists():
+                raw_clim = np.fromfile(parent_clim_path, dtype=np.uint8).reshape((parent_clim_size, parent_clim_size, 4))
+                if parent_clim_size != parent_size:
+                    c_up = parent_size / float(parent_clim_size)
+                    parent_clim = np.stack(
+                        [np.clip(zoom(raw_clim[:, :, ch].astype(np.float32), c_up, order=1), 0, 255).astype(np.uint8) for ch in range(4)],
+                        axis=-1,
+                    )
+                else:
+                    parent_clim = raw_clim
+            else:
+                parent_clim = None
             t_range = parent_meta.get("tempRange", [-12.0, 28.0])
             p_range = parent_meta.get("precipRange", [0.0, 1800.0])
 
@@ -1055,7 +1102,8 @@ def make_handler(engine: WarmStage2Engine):
     class Stage2Handler(BaseHTTPRequestHandler):
         def log_message(self, format, *args):
             # Quiet polling logs for /api/status and /api/health
-            if self.path in ("/api/status", "/api/health"):
+            path = urlparse(self.path).path
+            if path in ("/api/status", "/api/health", "/api/tiles/status"):
                 return
             super().log_message(format, *args)
 
@@ -1065,20 +1113,32 @@ def make_handler(engine: WarmStage2Engine):
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Access-Control-Allow-Origin", "*")
-            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
             self.send_header("Access-Control-Allow-Headers", "Content-Type")
             self.end_headers()
             self.wfile.write(body)
 
+        def _read_json_body(self) -> dict:
+            length = int(self.headers.get("Content-Length", "0"))
+            if length <= 0:
+                return {}
+            raw = self.rfile.read(length)
+            if not raw:
+                return {}
+            return json.loads(raw.decode("utf-8"))
+
         def do_OPTIONS(self):
             self.send_response(204)
             self.send_header("Access-Control-Allow-Origin", "*")
-            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
             self.send_header("Access-Control-Allow-Headers", "Content-Type")
             self.end_headers()
 
         def do_GET(self):
-            if self.path == "/api/health":
+            parsed = urlparse(self.path)
+            path = parsed.path
+            qs = parse_qs(parsed.query)
+            if path == "/api/health":
                 self._send_json(
                     200,
                     {
@@ -1090,20 +1150,95 @@ def make_handler(engine: WarmStage2Engine):
                         "error": engine.load_error,
                     },
                 )
-            elif self.path == "/api/status":
+            elif path == "/api/status":
                 self._send_json(200, {"ready": engine.ready, "device": engine.device, **engine.status})
+            elif path == "/api/worlds":
+                seed = qs.get("seed", [None])[0]
+                archetype = qs.get("archetype", [None])[0]
+                seed_i = int(seed) if seed not in (None, "") else None
+                self._send_json(200, list_cached_worlds(seed=seed_i, archetype=archetype or None))
+            elif path == "/api/tiles/status":
+                home = qs.get("homeWorldId", [None])[0]
+                if not home:
+                    self._send_json(400, {"ok": False, "error": "homeWorldId required"})
+                else:
+                    self._send_json(200, TILE_STREAMS.status(home))
             else:
-                self._send_json(404, {"error": f"Unknown endpoint {self.path}"})
+                self._send_json(404, {"error": f"Unknown endpoint {path}"})
 
         def do_POST(self):
-            if self.path not in ("/api/synthesize", "/api/drilldown"):
-                self._send_json(404, {"error": f"Unknown endpoint {self.path}"})
+            parsed = urlparse(self.path)
+            path = parsed.path
+            if path == "/api/worlds/prune":
+                try:
+                    payload = self._read_json_body()
+                    seed = payload.get("seed")
+                    seed_i = int(seed) if seed not in (None, "") else None
+                    result = prune_unbookmarked_worlds(
+                        seed=seed_i,
+                        archetype=payload.get("archetype"),
+                    )
+                    self._send_json(200, result)
+                except Exception as exc:
+                    self._send_json(500, {"ok": False, "error": str(exc)})
+                return
+            if path == "/api/tiles/stream":
+                try:
+                    payload = self._read_json_body()
+                    result = TILE_STREAMS.start_stream(
+                        home_world_id=str(payload["homeWorldId"]),
+                        seed=int(payload["seed"]),
+                        lat_deg=float(payload["latDeg"]),
+                        lon_deg=float(payload["lonDeg"]),
+                        span_deg=float(payload.get("spanDeg", 46.0)),
+                        max_ring=int(payload.get("maxRing", 1)),
+                    )
+                    print(
+                        f"[Stage2] Tile stream {result['homeWorldId']}: "
+                        f"{len(result['neighbors'])} neighbors, {len(result['pendingGhost'])} ghosts pending",
+                        flush=True,
+                    )
+                    self._send_json(200, result)
+                except Exception as exc:
+                    self._send_json(500, {"ok": False, "error": str(exc)})
+                return
+            if path == "/api/tiles/ghost":
+                try:
+                    payload = self._read_json_body()
+                    size = int(payload.get("size", 256))
+                    elev = _decode_f32(payload["elev"], (size, size))
+                    # Scale Stage-1 DEM-ish meters into viewer relief (~same as synth v_scale ballpark)
+                    land = elev > 0
+                    if land.any():
+                        peak = float(np.percentile(elev[land], 99.0))
+                        v_scale = min(420.0 / max(peak, 1550.0), 0.28)
+                    else:
+                        v_scale = 0.2
+                    elev_viewer = np.where(land, elev * v_scale, np.maximum(elev * 0.05, -55.0)).astype(np.float32)
+                    result = write_ghost_tile(
+                        elev_viewer,
+                        seed=int(payload["seed"]),
+                        lat_deg=float(payload["latDeg"]),
+                        lon_deg=float(payload["lonDeg"]),
+                        span_deg=float(payload.get("spanDeg", 46.0)),
+                        home_world_id=str(payload["homeWorldId"]),
+                        qi=int(payload.get("qi", 0)),
+                        qj=int(payload.get("qj", 0)),
+                        ring=int(payload.get("ring", 1)),
+                        world_span_m=float(payload.get("worldSpan", 4800.0)),
+                    )
+                    TILE_STREAMS.mark_ghost_done(str(payload["homeWorldId"]), result["tileId"], result["world"])
+                    print(f"[Stage2] Ghost tile {result['tileId']} (ring {payload.get('ring', 1)})", flush=True)
+                    self._send_json(200, result)
+                except Exception as exc:
+                    self._send_json(500, {"ok": False, "error": str(exc)})
+                return
+            if path not in ("/api/synthesize", "/api/drilldown"):
+                self._send_json(404, {"error": f"Unknown endpoint {path}"})
                 return
             try:
-                length = int(self.headers.get("Content-Length", "0"))
-                raw = self.rfile.read(length)
-                payload = json.loads(raw.decode("utf-8"))
-                if self.path == "/api/drilldown":
+                payload = self._read_json_body()
+                if path == "/api/drilldown":
                     result = engine.drilldown(payload)
                 else:
                     result = engine.synthesize(payload)
@@ -1111,6 +1246,44 @@ def make_handler(engine: WarmStage2Engine):
             except Exception as exc:
                 engine.status.update({"busy": False, "phase": "error", "message": str(exc)})
                 print(f"[Stage2] Synthesis error: {exc}", flush=True)
+                self._send_json(500, {"ok": False, "error": str(exc)})
+
+        def do_DELETE(self):
+            parsed = urlparse(self.path)
+            path = parsed.path
+            m = re.fullmatch(r"/api/worlds/([^/]+)", path)
+            if not m:
+                self._send_json(404, {"error": f"Unknown endpoint {path}"})
+                return
+            world_id = unquote(m.group(1))
+            qs = parse_qs(parsed.query)
+            cascade = (qs.get("cascade", ["1"])[0] or "1") not in ("0", "false", "False")
+            try:
+                result = delete_cached_world(world_id, cascade=cascade)
+                print(f"[Stage2] Deleted world {world_id} (cascade={cascade}) → {result['deletedIds']}", flush=True)
+                self._send_json(200, result)
+            except FileNotFoundError as exc:
+                self._send_json(404, {"ok": False, "error": str(exc)})
+            except Exception as exc:
+                self._send_json(500, {"ok": False, "error": str(exc)})
+
+        def do_PATCH(self):
+            parsed = urlparse(self.path)
+            path = parsed.path
+            m = re.fullmatch(r"/api/worlds/([^/]+)", path)
+            if not m:
+                self._send_json(404, {"error": f"Unknown endpoint {path}"})
+                return
+            world_id = unquote(m.group(1))
+            try:
+                payload = self._read_json_body()
+                result = patch_cached_world(world_id, payload)
+                self._send_json(200, result)
+            except FileNotFoundError as exc:
+                self._send_json(404, {"ok": False, "error": str(exc)})
+            except ValueError as exc:
+                self._send_json(400, {"ok": False, "error": str(exc)})
+            except Exception as exc:
                 self._send_json(500, {"ok": False, "error": str(exc)})
 
     return Stage2Handler

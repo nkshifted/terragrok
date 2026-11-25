@@ -797,18 +797,33 @@ def find_landmarks(
     else:
         rr, rc = pr, pc
 
-    # 4. Open scenic plains
-    plains_mask = land & (rivers_mask < 30) & (elev > 10.0) & (elev < elev.max() * 0.25) & (slope_deg < 14.0)
-    plains_pts = np.argwhere(plains_mask)
-    if len(plains_pts) == 0:
-        plains_pts = np.argwhere(land & (rivers_mask < 30) & (elev > 6.0) & (slope_deg < 22.0))
-    if len(plains_pts) > 0:
-        peak_vec = np.array([pr, pc], dtype=np.float64)
-        dists = np.linalg.norm(plains_pts - peak_vec, axis=1)
-        best = plains_pts[int(np.argmin(np.abs(dists - 115.0)))]
+    # 4. Spawn plains — prefer walkable open ground nearest the map CENTER
+    # Stay well inside the walkable AABB (viewer clamps ~±49% of span) so spawn isn't an "invisible wall"
+    center = np.array([ny * 0.5, nx * 0.5], dtype=np.float64)
+    max_h = float(elev.max()) if elev.size else 1.0
+    mountain_ceil = max(max_h * 0.42, 55.0)  # stay well below alpine peaks
+    rr_idx, cc_idx = np.indices((ny, nx))
+    edge_frac = np.minimum(
+        np.minimum(rr_idx, ny - 1 - rr_idx) / max(ny - 1, 1),
+        np.minimum(cc_idx, nx - 1 - cc_idx) / max(nx - 1, 1),
+    )
+    inland = edge_frac >= 0.12  # ≥12% of map from any rim
+    soft_inland = edge_frac >= 0.06
+    spawn_tiers = [
+        land & inland & (rivers_mask < 30) & (elev > 6.0) & (elev < mountain_ceil) & (slope_deg < 12.0),
+        land & inland & (rivers_mask < 40) & (elev > 4.0) & (elev < mountain_ceil) & (slope_deg < 18.0),
+        land & soft_inland & (lake_mask < 128) & (elev > 3.0) & (elev < max(max_h * 0.55, 80.0)) & (slope_deg < 26.0),
+        land & soft_inland & (elev > 3.0) & (slope_deg < 30.0),
+    ]
+    plr, plc = int(ny // 2), int(nx // 2)
+    for mask in spawn_tiers:
+        plains_pts = np.argwhere(mask)
+        if len(plains_pts) == 0:
+            continue
+        dists = np.linalg.norm(plains_pts.astype(np.float64) - center, axis=1)
+        best = plains_pts[int(np.argmin(dists))]
         plr, plc = int(best[0]), int(best[1])
-    else:
-        plr, plc = ny // 2, nx // 2
+        break
 
     # 5. River Estuary / Coastline (right where a major river meets the sea, or sandy beach if dry!)
     if sea_rivers:

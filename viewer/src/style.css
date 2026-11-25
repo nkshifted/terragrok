@@ -36,6 +36,14 @@ body {
   box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
 }
 
+.world-cache-actions {
+  display: flex;
+  gap: 6px;
+}
+.world-cache-actions .mini {
+  flex: 1;
+}
+
 #hud-left {
   top: 14px;
   left: 14px;
@@ -244,6 +252,12 @@ body.hud-hidden #controls-help {
   display: flex;
   flex-direction: column;
   gap: 6px;
+}
+
+/* Author .section { display:flex } would otherwise override the UA [hidden] rule */
+.section[hidden],
+#section-drilldown[hidden] {
+  display: none !important;
 }
 
 .label {

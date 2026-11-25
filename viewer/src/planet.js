@@ -92,6 +92,8 @@ const genState = {
 
 const stage2 = {
   targetDir: new THREE.Vector3(0, 0, 1),
+  /** False until the user clicks the globe (or picks an explored chip). No cyan box on bare planet rolls. */
+  targetSet: false,
   spanDeg: 46,
   serverReady: false,
   serverDevice: 'mps',
@@ -702,7 +704,7 @@ function rebuildTargetPatchOverlay() {
     });
     targetPatchGroup = null;
   }
-  if (!currentPlanet || !stage2.targetDir || stage2.activeCached) return;
+  if (!currentPlanet || !stage2.targetSet || !stage2.targetDir || stage2.activeCached) return;
 
   const R = currentPlanet.meta.radius;
   const { c, east, north } = tangentBasisForDir(stage2.targetDir);
@@ -940,6 +942,7 @@ function selectExploredRegion(reg, { justSynthesized = false, synthData = null }
   if (!reg?.planetOrigin) return;
   const o = reg.planetOrigin;
   stage2.activeCached = reg;
+  stage2.targetSet = true;
   stage2.targetDir.copy(dirFromLatLon(o.latDeg, o.lonDeg));
   stage2.spanDeg = Number(o.spanDeg) || stage2.spanDeg;
   const selSpan = document.getElementById('sel-stage2-span');
@@ -1065,59 +1068,166 @@ function rebuildCachedFootprintsOverlay() {
   scene.add(cachedFootprintsGroup);
 }
 
+async function apiPatchWorld(worldId, patch) {
+  const resp = await fetch(`/api/worlds/${encodeURIComponent(worldId)}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(patch),
+  });
+  const data = await resp.json();
+  if (!resp.ok || !data.ok) throw new Error(data.error || `PATCH failed (${resp.status})`);
+  return data.world;
+}
+
+async function apiDeleteWorld(worldId) {
+  const resp = await fetch(`/api/worlds/${encodeURIComponent(worldId)}?cascade=1`, { method: 'DELETE' });
+  const data = await resp.json();
+  if (!resp.ok || !data.ok) throw new Error(data.error || `DELETE failed (${resp.status})`);
+  return data;
+}
+
+async function apiPruneUnbookmarked() {
+  const resp = await fetch('/api/worlds/prune', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ seed: genState.seed, archetype: genState.archetype }),
+  });
+  const data = await resp.json();
+  if (!resp.ok || !data.ok) throw new Error(data.error || `Prune failed (${resp.status})`);
+  return data;
+}
+
 function renderCachedRegionChips() {
   const wrap = document.getElementById('cached-chips');
   const title = document.getElementById('cached-chips-title');
   const list = document.getElementById('cached-chips-list');
+  const footer = document.getElementById('cached-footer');
+  const diskLabel = document.getElementById('cached-disk-label');
   if (!wrap || !title || !list) return;
 
   if (!stage2.cachedRegions.length) {
     wrap.style.display = 'none';
     list.innerHTML = '';
+    if (footer) footer.style.display = 'none';
     return;
   }
   wrap.style.display = 'block';
   title.textContent = `Explored on This Planet (${stage2.cachedRegions.length})`;
   list.innerHTML = '';
   const activeId = stage2.activeCached?.id || null;
+  let totalMB = 0;
 
   stage2.cachedRegions.forEach((reg) => {
     const o = reg.planetOrigin;
     const latStr = `${Math.abs(o.latDeg).toFixed(0)}°${o.latDeg >= 0 ? 'N' : 'S'}`;
     const lonStr = `${Math.abs(o.lonDeg).toFixed(0)}°${o.lonDeg >= 0 ? 'E' : 'W'}`;
+    const resTag = reg.resolution ? ` · ${reg.resolution}` : '';
+    const mb = Number(reg.diskMB) || 0;
+    totalMB += mb;
+
+    const row = document.createElement('div');
+    row.className = 'cached-chip-row';
+
     const btn = document.createElement('button');
     btn.className = reg.id === activeId ? 'cached-chip active' : 'cached-chip';
-    btn.textContent = `★ ${latStr} ${lonStr} (${o.spanDeg || 46}°)`;
-    btn.title = 'Click to focus & enter this explored zone';
+    const star = reg.bookmarked ? '★' : '☆';
+    btn.textContent = `${star} ${latStr} ${lonStr}${resTag}${mb ? ` · ${mb.toFixed(0)}MB` : ''}`;
+    btn.title = 'Click to focus & enter · double-click to rename';
     btn.addEventListener('click', () => {
       const dir = dirFromLatLon(o.latDeg, o.lonDeg);
       selectExploredRegion(reg);
-      // Swing orbit camera smoothly to face this explored region
       setMode('orbit');
       nav.orbitYaw = Math.atan2(dir.x, dir.z);
       nav.orbitPitch = Math.asin(THREE.MathUtils.clamp(dir.y, -0.85, 0.85));
     });
-    list.appendChild(btn);
+    btn.addEventListener('dblclick', async (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      const next = window.prompt('Rename explored region:', reg.title || `${latStr} ${lonStr}`);
+      if (!next || !next.trim()) return;
+      try {
+        const updated = await apiPatchWorld(reg.id, { title: next.trim() });
+        Object.assign(reg, updated);
+        renderCachedRegionChips();
+        syncStage2ActionUI();
+      } catch (err) {
+        window.alert(err.message || 'Rename failed');
+      }
+    });
+
+    const bookmarkBtn = document.createElement('button');
+    bookmarkBtn.className = reg.bookmarked ? 'cached-chip-action starred' : 'cached-chip-action';
+    bookmarkBtn.type = 'button';
+    bookmarkBtn.textContent = reg.bookmarked ? '★' : '☆';
+    bookmarkBtn.title = reg.bookmarked ? 'Remove bookmark' : 'Bookmark (survives prune)';
+    bookmarkBtn.addEventListener('click', async (ev) => {
+      ev.stopPropagation();
+      try {
+        const updated = await apiPatchWorld(reg.id, { bookmarked: !reg.bookmarked });
+        Object.assign(reg, updated);
+        renderCachedRegionChips();
+      } catch (err) {
+        window.alert(err.message || 'Bookmark failed');
+      }
+    });
+
+    const delBtn = document.createElement('button');
+    delBtn.className = 'cached-chip-action danger';
+    delBtn.type = 'button';
+    delBtn.textContent = '✕';
+    delBtn.title = 'Delete this explored region from disk';
+    delBtn.addEventListener('click', async (ev) => {
+      ev.stopPropagation();
+      if (!window.confirm(`Delete cached world "${reg.title || reg.id}"?`)) return;
+      try {
+        await apiDeleteWorld(reg.id);
+        if (stage2.activeCached?.id === reg.id) {
+          stage2.activeCached = null;
+          stage2.justSynthesizedId = null;
+          stage2.justSynthesizedMeta = null;
+        }
+        await loadCachedRegionsForPlanet();
+      } catch (err) {
+        window.alert(err.message || 'Delete failed');
+      }
+    });
+
+    row.appendChild(btn);
+    row.appendChild(bookmarkBtn);
+    row.appendChild(delBtn);
+    list.appendChild(row);
   });
+
+  if (footer && diskLabel) {
+    footer.style.display = 'flex';
+    diskLabel.textContent = `Cache: ${totalMB.toFixed(0)} MB · ${stage2.cachedRegions.length} region${stage2.cachedRegions.length === 1 ? '' : 's'}`;
+  }
 }
 
 async function loadCachedRegionsForPlanet({ focusFreshId = null, freshData = null } = {}) {
   if (!currentPlanet) return;
   try {
-    const resp = await fetch('/worlds/synthesized_catalog.json', { cache: 'no-store' });
-    if (!resp.ok) {
-      stage2.cachedRegions = [];
+    // Prefer Stage 2 cache API (includes disk sizes); fall back to static catalog JSON
+    let all = [];
+    const apiResp = await fetch(
+      `/api/worlds?seed=${encodeURIComponent(genState.seed)}&archetype=${encodeURIComponent(genState.archetype)}`,
+      { cache: 'no-store' }
+    );
+    if (apiResp.ok) {
+      const data = await apiResp.json();
+      all = Array.isArray(data.worlds) ? data.worlds : [];
     } else {
-      const all = await resp.json();
-      const targetSeed = Number(genState.seed);
-      const resolvedArch = currentPlanet.meta?.archetype || genState.archetype;
-      stage2.cachedRegions = (Array.isArray(all) ? all : []).filter((w) => {
-        if (!w || !w.planetOrigin || w.drillOrigin) return false;
-        const o = w.planetOrigin;
-        if (Number(o.seed) !== targetSeed) return false;
-        return o.archetype === genState.archetype || o.archetype === resolvedArch;
-      });
+      const resp = await fetch('/worlds/synthesized_catalog.json', { cache: 'no-store' });
+      if (resp.ok) all = await resp.json();
     }
+    const targetSeed = Number(genState.seed);
+    const resolvedArch = currentPlanet.meta?.archetype || genState.archetype;
+    stage2.cachedRegions = (Array.isArray(all) ? all : []).filter((w) => {
+      if (!w || !w.planetOrigin || w.drillOrigin) return false;
+      const o = w.planetOrigin;
+      if (Number(o.seed) !== targetSeed) return false;
+      return o.archetype === genState.archetype || o.archetype === resolvedArch;
+    });
   } catch {
     stage2.cachedRegions = [];
   }
@@ -1131,22 +1241,31 @@ async function loadCachedRegionsForPlanet({ focusFreshId = null, freshData = nul
     }
   }
 
-  // Case 2: Re-evaluate whether the current target overlaps >= 75% with an existing explored zone
-  const match = findOverlappingExploredRegion(stage2.targetDir, stage2.spanDeg, 0.75);
-  if (match) {
-    selectExploredRegion(match.reg);
-    return;
+  // Case 2: Only snap when the user already picked a target (never auto-select on a fresh planet roll)
+  if (stage2.targetSet) {
+    const match = findOverlappingExploredRegion(stage2.targetDir, stage2.spanDeg, 0.75);
+    if (match) {
+      selectExploredRegion(match.reg);
+      return;
+    }
   }
 
   stage2.activeCached = null;
   rebuildTargetPatchOverlay();
   rebuildCachedFootprintsOverlay();
+  updateStage2TargetInfo();
   syncStage2ActionUI();
 }
 
 function updateStage2TargetInfo() {
   const el = document.getElementById('stage2-target-info');
   if (!el || !currentPlanet) return;
+  if (!stage2.targetSet) {
+    el.innerHTML =
+      `<strong>No patch selected</strong><br/>` +
+      `Click a continent or coast to place the Stage 2 target square.`;
+    return;
+  }
   const { c, east, north } = tangentBasisForDir(stage2.targetDir);
   const halfRad = THREE.MathUtils.degToRad(stage2.spanDeg * 0.5);
   const tmp = new THREE.Vector3();
@@ -1204,10 +1323,22 @@ function updateStage2TargetInfo() {
     note;
 }
 
+function clearStage2Target() {
+  stage2.targetSet = false;
+  stage2.activeCached = null;
+  stage2.justSynthesizedId = null;
+  stage2.justSynthesizedMeta = null;
+  rebuildTargetPatchOverlay();
+  rebuildCachedFootprintsOverlay();
+  updateStage2TargetInfo();
+  syncStage2ActionUI();
+}
+
 function setStage2Target(unitDir, { forceNew = false } = {}) {
   stage2.justSynthesizedId = null;
   stage2.justSynthesizedMeta = null;
   const dir = unitDir.clone().normalize();
+  stage2.targetSet = true;
   if (!forceNew) {
     const match = findOverlappingExploredRegion(dir, stage2.spanDeg, 0.75);
     if (match) {
@@ -1233,11 +1364,99 @@ function float32ToBase64(f32) {
   return btoa(binary);
 }
 
+/** Sample Stage-1 elev (Earth-DEM meters) on a tangent square — used for ghost neighbor tiles. */
+function sampleStage1ElevGrid(latDeg, lonDeg, spanDeg, gridSize = 256) {
+  const center = dirFromLatLon(latDeg, lonDeg);
+  const { c, east, north } = tangentBasisForDir(center);
+  const totalSpanRad = THREE.MathUtils.degToRad(spanDeg);
+  const elev = new Float32Array(gridSize * gridSize);
+  const tmp = new THREE.Vector3();
+  const maxRef = Math.max(240.0 * genState.reliefScale, 120.0);
+  for (let r = 0; r < gridSize; r++) {
+    const ty = ((gridSize - 1) * 0.5 - r) * (totalSpanRad / gridSize);
+    for (let col = 0; col < gridSize; col++) {
+      const tx = (col - (gridSize - 1) * 0.5) * (totalSpanRad / gridSize);
+      projectTangentToUnitDir(c, east, north, tx, ty, tmp);
+      const s = sampleSphereSurface(tmp);
+      const idx = r * gridSize + col;
+      if (s.elev > 0) {
+        const norm = Math.min(1.25, s.elev / maxRef);
+        elev[idx] = 15.0 + Math.pow(norm, 1.15) * 3300.0;
+      } else {
+        const dNorm = Math.min(1.0, -s.elev / 260.0);
+        elev[idx] = -(60.0 + dNorm * 2800.0);
+      }
+    }
+  }
+  return elev;
+}
+
+async function kickoffTileStreamGhosts({ homeWorldId, seed, latDeg, lonDeg, spanDeg, worldSpan = 4800 }) {
+  const resp = await fetch('/api/tiles/stream', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      homeWorldId,
+      seed,
+      latDeg,
+      lonDeg,
+      spanDeg,
+      maxRing: 1,
+    }),
+  });
+  const plan = await resp.json();
+  if (!resp.ok || !plan.ok) throw new Error(plan.error || 'tile stream failed');
+  const pending = new Set(plan.pendingGhost || []);
+  for (const n of plan.neighbors || []) {
+    if (!pending.has(n.tileId)) continue;
+    const elev = sampleStage1ElevGrid(n.latDeg, n.lonDeg, spanDeg, 256);
+    const gResp = await fetch('/api/tiles/ghost', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        homeWorldId,
+        seed,
+        latDeg: n.latDeg,
+        lonDeg: n.lonDeg,
+        spanDeg,
+        qi: n.qi,
+        qj: n.qj,
+        ring: n.ring,
+        size: 256,
+        worldSpan,
+        elev: float32ToBase64(elev),
+      }),
+    });
+    const gData = await gResp.json();
+    if (!gResp.ok || !gData.ok) {
+      console.warn('[tile-stream] ghost failed', n.tileId, gData.error);
+    }
+  }
+}
+
+function getStage2ResolutionConfig() {
+  const res = (document.getElementById('sel-stage2-resolution')?.value || '2k').toLowerCase();
+  if (res === '4k') {
+    return { resolution: '4k', coarseSize: 32, outN: 4096, label: '4K Ultra', synthLabel: '✨ Synthesize 4K Ultra Terrain Here', eta: '~73s' };
+  }
+  if (res === '1k') {
+    return { resolution: '1k', coarseSize: 8, outN: 1024, label: '1K Preview', synthLabel: '✨ Synthesize 1K AI Terrain Here', eta: '~13s' };
+  }
+  return { resolution: '2k', coarseSize: 16, outN: 2048, label: '2K Sharp', synthLabel: '✨ Synthesize 2K AI Terrain Here', eta: '~25s' };
+}
+
+function syncStage2SynthButtonLabel() {
+  const btn = document.getElementById('btn-synthesize');
+  if (!btn || stage2.synthesizing) return;
+  btn.textContent = getStage2ResolutionConfig().synthLabel;
+}
+
 function extractStage2Payload() {
-  const coarseSize = 8;
+  const { resolution, coarseSize } = getStage2ResolutionConfig();
   const padding = 64;
-  const fullCoarse = coarseSize + 2 * padding; // 136x136
-  const refSize = 256; // High-res exact globe reference for Laplacian Coastline Lock!
+  const fullCoarse = coarseSize + 2 * padding;
+  // Keep Laplacian coastline reference at 256 for 1K/2K; bump to 512 for 4K Ultra
+  const refSize = coarseSize >= 32 ? 512 : 256;
 
   const { c, east, north } = tangentBasisForDir(stage2.targetDir);
   const cellStepRad = THREE.MathUtils.degToRad(stage2.spanDeg) / coarseSize;
@@ -1286,6 +1505,7 @@ function extractStage2Payload() {
     seed: genState.seed,
     archetype: genState.archetype,
     seaLevelBias: genState.seaLevelBias,
+    resolution,
     quality: document.getElementById('sel-stage2-quality')?.value || 'high',
     fidelity: document.getElementById('sel-stage2-fidelity')?.value || 'exact',
     latDeg: Number(latDeg.toFixed(2)),
@@ -1333,6 +1553,10 @@ async function pollStage2Health() {
 
 async function synthesizeStage2Target() {
   if (stage2.synthesizing || !currentPlanet) return;
+  if (!stage2.targetSet) {
+    window.alert('Click the globe first to place a Stage 2 target square.');
+    return;
+  }
   const btn = document.getElementById('btn-synthesize');
   const resynthBtn = document.getElementById('btn-resynth');
   const progWrap = document.getElementById('synth-progress-wrap');
@@ -1385,6 +1609,15 @@ async function synthesizeStage2Target() {
     progWrap.style.display = 'none';
     // Immediately refresh cached footprints and transition into ONE single "Explore Synthesized 3D World" card!
     await loadCachedRegionsForPlanet({ focusFreshId: data.worldId, freshData: data });
+    // Phase 1 tile stream: bake Stage-1 ghost neighbors in the background (does not block Enter)
+    kickoffTileStreamGhosts({
+      homeWorldId: data.worldId,
+      seed: payload.seed,
+      latDeg: payload.latDeg,
+      lonDeg: payload.lonDeg,
+      spanDeg: payload.spanDeg,
+      worldSpan: 4800,
+    }).catch((e) => console.warn('[tile-stream]', e));
   } catch (err) {
     progFill.style.width = '100%';
     progText.innerHTML =
@@ -1396,7 +1629,7 @@ async function synthesizeStage2Target() {
     stage2.synthesizing = false;
     if (btn) {
       btn.disabled = false;
-      btn.textContent = '✨ Synthesize 30m AI Terrain Here';
+      syncStage2SynthButtonLabel();
     }
     if (resynthBtn) resynthBtn.disabled = false;
     pollStage2Health();
@@ -1608,20 +1841,17 @@ function generatePlanetFromState(customSeed = null) {
   buildPlanetMesh();
   refreshContinentButtons();
 
-  stage2.activeCached = null;
-  stage2.justSynthesizedId = null;
-  stage2.justSynthesizedMeta = null;
+  // Drop prior planet's cache list immediately so stale footprints / 75% snap can't fire mid-roll
+  stage2.cachedRegions = [];
   const progWrap = document.getElementById('synth-progress-wrap');
   if (progWrap) progWrap.style.display = 'none';
-  // Aim orbit camera + Stage 2 target reticle toward the planet's largest continent so every roll opens on dramatic geography!
+  // Aim the orbit camera at the largest continent for drama — but do NOT pre-place the cyan Stage 2 square
   if (currentPlanet.meta.landmasses.length > 0) {
     const d = currentPlanet.meta.landmasses[0].dir;
     nav.orbitYaw = Math.atan2(d[0], d[2]);
     nav.orbitPitch = THREE.MathUtils.clamp(Math.asin(Math.max(-0.8, Math.min(0.8, d[1]))), -0.75, 0.75);
-    setStage2Target(new THREE.Vector3(...d));
-  } else {
-    setStage2Target(new THREE.Vector3(0, 0, 1));
   }
+  clearStage2Target();
 
   const m = currentPlanet.meta;
   document.getElementById('planet-subtitle').textContent =
@@ -1725,7 +1955,7 @@ document.getElementById('chk-poles').addEventListener('change', (e) => {
 
 document.getElementById('sel-stage2-span').addEventListener('change', (e) => {
   stage2.spanDeg = Number(e.target.value) || 46;
-  setStage2Target(stage2.targetDir);
+  if (stage2.targetSet) setStage2Target(stage2.targetDir);
 });
 
 document.getElementById('btn-target-explorer').addEventListener('click', () => {
@@ -1740,6 +1970,27 @@ document.getElementById('btn-synthesize').addEventListener('click', () => {
 
 document.getElementById('btn-resynth')?.addEventListener('click', () => {
   synthesizeStage2Target();
+});
+
+document.getElementById('sel-stage2-resolution')?.addEventListener('change', () => {
+  syncStage2SynthButtonLabel();
+});
+syncStage2SynthButtonLabel();
+
+document.getElementById('btn-prune-cache')?.addEventListener('click', async () => {
+  if (!window.confirm('Delete all non-bookmarked explored regions on this planet? Bookmarked ★ regions are kept.')) {
+    return;
+  }
+  try {
+    const result = await apiPruneUnbookmarked();
+    stage2.activeCached = null;
+    stage2.justSynthesizedId = null;
+    stage2.justSynthesizedMeta = null;
+    await loadCachedRegionsForPlanet();
+    window.alert(`Pruned ${result.deletedCount || 0} region(s). ${result.remaining || 0} remaining (${result.totalMB || 0} MB).`);
+  } catch (err) {
+    window.alert(err.message || 'Prune failed (is Stage 2 server running?)');
+  }
 });
 
 // ---------- HUD & Live Magnetic Compass ----------
@@ -1758,7 +2009,8 @@ function updateNavigation(dt) {
   const R = currentPlanet.meta.radius;
 
   if (nav.mode === 'orbit') {
-    if (!pointerDown) nav.orbitYaw += dt * 0.025;
+    const autoSpin = document.getElementById('chk-autospin')?.checked;
+    if (autoSpin && !pointerDown) nav.orbitYaw += dt * 0.025;
     const cp = Math.cos(nav.orbitPitch);
     camera.position.set(
       Math.sin(nav.orbitYaw) * cp * nav.orbitDist,

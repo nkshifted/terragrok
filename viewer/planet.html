@@ -300,6 +300,55 @@
         color: #ffffff;
         box-shadow: 0 0 8px rgba(251, 191, 36, 0.38);
       }
+      .cached-chip-row {
+        display: inline-flex;
+        align-items: center;
+        gap: 2px;
+      }
+      .cached-chip-action {
+        padding: 2px 5px;
+        border-radius: 4px;
+        font-size: 10px;
+        line-height: 1.2;
+        background: rgba(15, 23, 42, 0.55);
+        border: 1px solid rgba(148, 163, 184, 0.35);
+        color: #cbd5e1;
+        cursor: pointer;
+      }
+      .cached-chip-action:hover {
+        background: rgba(30, 41, 59, 0.9);
+        color: #f8fafc;
+      }
+      .cached-chip-action.danger:hover {
+        border-color: rgba(248, 113, 113, 0.7);
+        color: #fecaca;
+      }
+      .cached-chip-action.starred {
+        color: #fde047;
+        border-color: rgba(250, 204, 21, 0.55);
+      }
+      .cached-footer {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 6px;
+        margin-top: 6px;
+        font-size: 10px;
+        color: rgba(253, 230, 138, 0.75);
+      }
+      .cached-footer button {
+        padding: 3px 7px;
+        border-radius: 5px;
+        font-size: 10px;
+        background: rgba(15, 23, 42, 0.65);
+        border: 1px solid rgba(148, 163, 184, 0.35);
+        color: #cbd5e1;
+        cursor: pointer;
+      }
+      .cached-footer button:hover {
+        background: rgba(30, 41, 59, 0.95);
+        color: #f8fafc;
+      }
     </style>
   </head>
   <body>
@@ -377,17 +426,24 @@
           </div>
           <div id="stage2-synth-controls">
             <div style="display:flex;gap:6px;margin-bottom:6px;">
-              <select id="sel-stage2-fidelity" style="flex:1.25;min-width:0;padding:5px 6px;border-radius:6px;background:rgba(10,18,32,0.92);color:#dce9fa;border:1px solid rgba(130,180,240,0.28);font-size:11px;" title="Exact Coast = preserves all islands & bays via Laplacian Lock · Creative AI = pure unguided diffusion">
+              <select id="sel-stage2-fidelity" style="flex:1.15;min-width:0;padding:5px 6px;border-radius:6px;background:rgba(10,18,32,0.92);color:#dce9fa;border:1px solid rgba(130,180,240,0.28);font-size:11px;" title="Exact Coast = preserves all islands & bays via Laplacian Lock · Creative AI = pure unguided diffusion">
                 <option value="exact" selected>Exact Coast</option>
                 <option value="balanced">Balanced</option>
                 <option value="creative">Creative AI</option>
               </select>
-              <select id="sel-stage2-quality" style="flex:1;min-width:0;padding:5px 6px;border-radius:6px;background:rgba(10,18,32,0.92);color:#dce9fa;border:1px solid rgba(130,180,240,0.28);font-size:11px;" title="High = full 2-step BF16 (~13s total, r=1.000) · Fast = 1-step BF16 (~10s total, r=0.996)">
-                <option value="high" selected>High (~13s)</option>
-                <option value="fast">Fast (~10s)</option>
+              <select id="sel-stage2-resolution" style="flex:1.35;min-width:0;padding:5px 6px;border-radius:6px;background:rgba(10,18,32,0.92);color:#dce9fa;border:1px solid rgba(130,180,240,0.28);font-size:11px;" title="1K = 4.69 m/px (~13s) · 2K = 2.34 m/px (~25s, recommended) · 4K Ultra = 1.17 m/px (~73s)">
+                <option value="1k">1K Preview (~13s)</option>
+                <option value="2k" selected>2K Sharp (~25s)</option>
+                <option value="4k">4K Ultra (~73s)</option>
               </select>
             </div>
-            <button id="btn-synthesize" class="btn-synth">✨ Synthesize 30m AI Terrain Here</button>
+            <div style="display:flex;gap:6px;margin-bottom:6px;">
+              <select id="sel-stage2-quality" style="flex:1;min-width:0;padding:5px 6px;border-radius:6px;background:rgba(10,18,32,0.92);color:#dce9fa;border:1px solid rgba(130,180,240,0.28);font-size:11px;" title="High = 2-step BF16 diffusion · Fast = 1-step BF16 (slightly softer, ~20% quicker)">
+                <option value="high" selected>Diffusion: High</option>
+                <option value="fast">Diffusion: Fast</option>
+              </select>
+            </div>
+            <button id="btn-synthesize" class="btn-synth">✨ Synthesize 2K AI Terrain Here</button>
           </div>
           <div id="synth-progress-wrap" class="synth-progress-wrap">
             <div class="synth-progress-bar"><div id="synth-progress-fill" class="synth-progress-fill"></div></div>
@@ -396,6 +452,10 @@
           <div id="cached-chips" class="cached-chips">
             <div id="cached-chips-title" class="cached-chips-title">Explored Regions (Gold)</div>
             <div id="cached-chips-list" class="cached-chips-list"></div>
+            <div id="cached-footer" class="cached-footer" style="display:none;">
+              <span id="cached-disk-label">Cache: —</span>
+              <button id="btn-prune-cache" type="button" title="Delete all non-bookmarked explored regions on this planet">Prune unbookmarked</button>
+            </div>
           </div>
         </div>
       </div>
@@ -428,6 +488,10 @@
         <label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-top:2px;">
           <input id="chk-poles" type="checkbox" checked style="width:auto;" />
           <span>Show Magnetic &amp; Spin Poles</span>
+        </label>
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-top:2px;">
+          <input id="chk-autospin" type="checkbox" style="width:auto;" />
+          <span>Auto-spin globe in orbit mode</span>
         </label>
       </div>
     </aside>

@@ -11,11 +11,22 @@ import * as THREE from 'three';
 export function buildWorldProps(worldData, vScale = 1.0) {
   const group = new THREE.Group();
   const { size, worldSpan, maxElev, hasClimate, tempRange, precipRange } = worldData.meta;
+  const climateSize = worldData.meta.climateSize || size;
   const { heights, masks, climate } = worldData;
   const cellSize = worldSpan / (size - 1);
   const spanFactor = Math.min(Math.max(worldSpan / 2400, 1.0), 2.1);
   const maxTrees = Math.round(5200 * spanFactor);
   const maxRocks = Math.round(3400 * spanFactor);
+
+  const sampleClimateAt = (gx, gy) => {
+    if (!hasClimate || !climate) return null;
+    const cu = Math.max(0, Math.min(climateSize - 1, Math.round((gx / Math.max(size - 1, 1)) * (climateSize - 1))));
+    const cv = Math.max(0, Math.min(climateSize - 1, Math.round((gy / Math.max(size - 1, 1)) * (climateSize - 1))));
+    const cIdx = (cv * climateSize + cu) * 4;
+    const tempC = tempRange[0] + (climate[cIdx] / 255) * (tempRange[1] - tempRange[0]);
+    const pMm = precipRange[0] + (climate[cIdx + 1] / 255) * (precipRange[1] - precipRange[0]);
+    return { tempC, pMm };
+  };
 
   let s = 4242;
   const rand = () => {
@@ -49,12 +60,12 @@ export function buildWorldProps(worldData, vScale = 1.0) {
 
     let tempC = 14.0 - hNorm * 18.0;
     let precipNorm = moisture;
-    if (hasClimate && climate) {
-      tempC = tempRange[0] + (climate[mIdx] / 255) * (tempRange[1] - tempRange[0]);
-      const pMm = precipRange[0] + (climate[mIdx + 1] / 255) * (precipRange[1] - precipRange[0]);
-      precipNorm = Math.min(Math.max(pMm / 650, 0), 1);
+    const clim = sampleClimateAt(gx, gy);
+    if (clim) {
+      tempC = clim.tempC;
+      precipNorm = Math.min(Math.max(clim.pMm / 650, 0), 1);
       // Natural freezing timberline (~2.0 C) & true desert/arid cutoff (<260 mm/yr -> 0 trees!)
-      if (tempC < 2.0 || pMm < 260.0 || moisture < 0.16) continue;
+      if (tempC < 2.0 || clim.pMm < 260.0 || moisture < 0.16) continue;
       const treeProb = THREE.MathUtils.smoothstep(Math.max(precipNorm, moisture * 0.75), 0.24, 0.70) * 0.92;
       if (rand() > treeProb) continue;
     } else {
@@ -75,7 +86,7 @@ export function buildWorldProps(worldData, vScale = 1.0) {
     const item = { wx, wz, baseElev: elev, scale, moisture, hNorm, rotY: rand() * Math.PI * 2 };
 
     // Warm moist zones get lush broadleafs; cool/boreal slopes get multi-tier conifers
-    if (hasClimate && climate) {
+    if (clim) {
       if (tempC > 8.5 && Math.max(precipNorm, moisture) > 0.36 && rand() < 0.64) {
         broadleafs.push(item);
       } else {
