@@ -52,7 +52,7 @@
 
 - [x] `POST /api/tiles/stream` plans ring neighbors via `tile_grid` (ghost upload is client-driven in Phase 1)
 - [x] `GET /api/tiles/status?homeWorldId=` → `{ pending, active, done }`
-- [ ] Phase 2+: MPS 1K neighbor queue on worker (not in Phase 1)
+- [x] Phase 2: MPS 1K neighbor queue via `/api/tiles/enqueue` (priority 10)
 - [x] Ghost path does not use MPS — interactive synthesize unaffected
 
 ### Task 4: Explorer ghost rim

@@ -660,17 +660,25 @@ canvas.addEventListener(
 );
 
 // ---------- Terrain Sampling / Walk Bounds ----------
-/** Playable half-extent — match the visual clipmap rim (±worldSpan/2), minus 1 m for float safety. */
+/** Playable bounds: home tile, expanded when Phase-2 1K neighbors commit. */
+function walkBounds() {
+  if (!world) return { minX: 0, maxX: 0, minZ: 0, maxZ: 0 };
+  if (tileStream) return tileStream.walkBounds();
+  const lim = Math.max(0, world.meta.worldSpan * 0.5 - 1);
+  return { minX: -lim, maxX: lim, minZ: -lim, maxZ: lim };
+}
+
 function walkHalfSpan() {
   if (!world) return 0;
-  return Math.max(0, world.meta.worldSpan * 0.5 - 1);
+  const b = walkBounds();
+  return Math.max(b.maxX, -b.minX, b.maxZ, -b.minZ);
 }
 
 function clampToWalkable(x, z) {
-  const lim = walkHalfSpan();
+  const b = walkBounds();
   return {
-    x: THREE.MathUtils.clamp(x, -lim, lim),
-    z: THREE.MathUtils.clamp(z, -lim, lim),
+    x: THREE.MathUtils.clamp(x, b.minX, b.maxX),
+    z: THREE.MathUtils.clamp(z, b.minZ, b.maxZ),
   };
 }
 
@@ -686,6 +694,13 @@ function worldToGrid(x, z) {
 
 function sampleHeight(x, z) {
   if (!world) return 0;
+  const span = world.meta.worldSpan;
+  const half = span * 0.5;
+  // Phase 2: outside the home tile, sample walkable neighbor heightfields
+  if (tileStream && (Math.abs(x) > half - 1e-3 || Math.abs(z) > half - 1e-3)) {
+    const raw = tileStream.sampleNeighborRaw(x, z);
+    if (raw != null) return raw * state.vScale;
+  }
   const { size } = world.meta;
   const { u, v } = worldToGrid(x, z);
   const x0 = Math.floor(u);
@@ -956,6 +971,9 @@ async function loadWorld(worldId) {
     tileStream = createTileStreamController({
       scene,
       getVScale: () => state.vScale,
+      onWalkableChange: () => {
+        // Bounds refresh on next movement frame via walkBounds()
+      },
     });
   }
   if (meta.planetOrigin) tileStream.start(meta);

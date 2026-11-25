@@ -1408,28 +1408,57 @@ async function kickoffTileStreamGhosts({ homeWorldId, seed, latDeg, lonDeg, span
   if (!resp.ok || !plan.ok) throw new Error(plan.error || 'tile stream failed');
   const pending = new Set(plan.pendingGhost || []);
   for (const n of plan.neighbors || []) {
-    if (!pending.has(n.tileId)) continue;
-    const elev = sampleStage1ElevGrid(n.latDeg, n.lonDeg, spanDeg, 256);
-    const gResp = await fetch('/api/tiles/ghost', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
+    // Always try ghost if missing; then enqueue 1K background synth
+    if (pending.has(n.tileId)) {
+      const elev = sampleStage1ElevGrid(n.latDeg, n.lonDeg, spanDeg, 256);
+      const gResp = await fetch('/api/tiles/ghost', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          homeWorldId,
+          seed,
+          latDeg: n.latDeg,
+          lonDeg: n.lonDeg,
+          spanDeg,
+          qi: n.qi,
+          qj: n.qj,
+          ring: n.ring,
+          size: 256,
+          worldSpan,
+          elev: float32ToBase64(elev),
+        }),
+      });
+      const gData = await gResp.json();
+      if (!gResp.ok || !gData.ok) {
+        console.warn('[tile-stream] ghost failed', n.tileId, gData.error);
+      }
+    }
+
+    // Phase 2: queue 1K AI synth (lower priority than interactive) using live Stage-1 conditioning
+    try {
+      const payload = extractStage2PayloadAt(n.latDeg, n.lonDeg, spanDeg, {
+        resolution: '1k',
+        coarseSize: 8,
+        quality: 'fast',
+      });
+      payload.forceWorldId = n.tileId;
+      payload.tileOrigin = {
         homeWorldId,
-        seed,
-        latDeg: n.latDeg,
-        lonDeg: n.lonDeg,
-        spanDeg,
         qi: n.qi,
         qj: n.qj,
         ring: n.ring,
-        size: 256,
-        worldSpan,
-        elev: float32ToBase64(elev),
-      }),
-    });
-    const gData = await gResp.json();
-    if (!gResp.ok || !gData.ok) {
-      console.warn('[tile-stream] ghost failed', n.tileId, gData.error);
+      };
+      const qResp = await fetch('/api/tiles/enqueue', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const qData = await qResp.json();
+      if (!qResp.ok || !qData.ok) {
+        console.warn('[tile-stream] enqueue failed', n.tileId, qData.error);
+      }
+    } catch (err) {
+      console.warn('[tile-stream] enqueue error', n.tileId, err);
     }
   }
 }
@@ -1451,15 +1480,18 @@ function syncStage2SynthButtonLabel() {
   btn.textContent = getStage2ResolutionConfig().synthLabel;
 }
 
-function extractStage2Payload() {
-  const { resolution, coarseSize } = getStage2ResolutionConfig();
+function extractStage2PayloadAt(latDeg, lonDeg, spanDeg, opts = {}) {
+  const resolution = opts.resolution || getStage2ResolutionConfig().resolution;
+  const coarseSize =
+    opts.coarseSize ||
+    (resolution === '4k' ? 32 : resolution === '1k' ? 8 : 16);
   const padding = 64;
   const fullCoarse = coarseSize + 2 * padding;
-  // Keep Laplacian coastline reference at 256 for 1K/2K; bump to 512 for 4K Ultra
   const refSize = coarseSize >= 32 ? 512 : 256;
 
-  const { c, east, north } = tangentBasisForDir(stage2.targetDir);
-  const cellStepRad = THREE.MathUtils.degToRad(stage2.spanDeg) / coarseSize;
+  const center = dirFromLatLon(latDeg, lonDeg);
+  const { c, east, north } = tangentBasisForDir(center);
+  const cellStepRad = THREE.MathUtils.degToRad(spanDeg) / coarseSize;
   const tmp = new THREE.Vector3();
 
   const sampleGrid = (gridSize, totalSpanRad, withStd) => {
@@ -1476,7 +1508,6 @@ function extractStage2Payload() {
         projectTangentToUnitDir(c, east, north, tx, ty, tmp);
         const s = sampleSphereSurface(tmp);
         const idx = r * gridSize + col;
-        // Map planet elevation [0..240] -> Earth DEM meters [15..3315], ocean -> [-2860..-60]
         const maxRef = Math.max(240.0 * genState.reliefScale, 120.0);
         if (s.elev > 0) {
           const norm = Math.min(1.25, s.elev / maxRef);
@@ -1498,19 +1529,17 @@ function extractStage2Payload() {
 
   const coarse = sampleGrid(fullCoarse, fullCoarse * cellStepRad, true);
   const ref = sampleGrid(refSize, coarseSize * cellStepRad, false);
-  const latDeg = THREE.MathUtils.radToDeg(Math.asin(THREE.MathUtils.clamp(c.y, -1, 1)));
-  const lonDeg = THREE.MathUtils.radToDeg(Math.atan2(c.x, c.z));
 
   return {
     seed: genState.seed,
     archetype: genState.archetype,
     seaLevelBias: genState.seaLevelBias,
     resolution,
-    quality: document.getElementById('sel-stage2-quality')?.value || 'high',
-    fidelity: document.getElementById('sel-stage2-fidelity')?.value || 'exact',
+    quality: opts.quality || document.getElementById('sel-stage2-quality')?.value || 'high',
+    fidelity: opts.fidelity || document.getElementById('sel-stage2-fidelity')?.value || 'exact',
     latDeg: Number(latDeg.toFixed(2)),
     lonDeg: Number(lonDeg.toFixed(2)),
-    spanDeg: stage2.spanDeg,
+    spanDeg,
     coarseSize,
     padding,
     refSize,
@@ -1523,6 +1552,14 @@ function extractStage2Payload() {
     refTemp: float32ToBase64(ref.temp),
     refPrecip: float32ToBase64(ref.precip),
   };
+}
+
+function extractStage2Payload() {
+  const latDeg = THREE.MathUtils.radToDeg(
+    Math.asin(THREE.MathUtils.clamp(stage2.targetDir.y, -1, 1))
+  );
+  const lonDeg = THREE.MathUtils.radToDeg(Math.atan2(stage2.targetDir.x, stage2.targetDir.z));
+  return extractStage2PayloadAt(latDeg, lonDeg, stage2.spanDeg);
 }
 
 async function pollStage2Health() {

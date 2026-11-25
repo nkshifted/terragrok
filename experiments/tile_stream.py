@@ -88,6 +88,39 @@ class TileStreamRegistry:
             }
             sess["done"].append(entry)
 
+    def mark_synth_done(self, home_world_id: str, tile_id_str: str, info: dict) -> None:
+        with self._lock:
+            sess = self._sessions.get(home_world_id)
+            if not sess:
+                # Still record via a lightweight session so status/fromCatalog works mid-flight
+                sess = {
+                    "homeWorldId": home_world_id,
+                    "planned": [],
+                    "pendingGhost": [],
+                    "done": [],
+                    "active": None,
+                }
+                self._sessions[home_world_id] = sess
+            sess["done"] = [d for d in sess["done"] if d.get("tileId") != tile_id_str]
+            sess["done"].append(
+                {
+                    "tileId": tile_id_str,
+                    "quality": str(info.get("quality") or "1k").lower(),
+                    "qi": info.get("qi"),
+                    "qj": info.get("qj"),
+                    "ring": info.get("ring"),
+                    "latDeg": info.get("latDeg"),
+                    "lonDeg": info.get("lonDeg"),
+                    "walkable": True,
+                }
+            )
+            sess["active"] = None
+            print(
+                f"[TileStream] {tile_id_str} → {info.get('quality')} "
+                f"(qi={info.get('qi')}, qj={info.get('qj')}) for {home_world_id}",
+                flush=True,
+            )
+
     def status(self, home_world_id: str) -> dict[str, Any]:
         with self._lock:
             sess = self._sessions.get(home_world_id)

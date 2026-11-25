@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import base64
 import gc
+import itertools
 import json
 import os
 import queue
@@ -321,8 +322,9 @@ class WarmStage2Engine:
         self.ready = False
         self.load_error: str | None = None
         self.lock = threading.Lock()
-        # Dedicated single worker thread so PyTorch MPS / Metal ALWAYS runs on the exact same OS thread!
-        self._job_queue: queue.Queue = queue.Queue()
+        # PriorityQueue: 0 = interactive synthesize/drilldown, 10 = background tile synth
+        self._job_queue: queue.PriorityQueue = queue.PriorityQueue()
+        self._job_seq = itertools.count()
         self.status = {
             "busy": False,
             "phase": "initializing",
@@ -335,19 +337,41 @@ class WarmStage2Engine:
     def start_worker(self):
         threading.Thread(target=self._worker_loop, daemon=True, name="stage2-mps-worker").start()
 
+    def _put_job(self, priority: int, kind: str, payload: dict, done_evt, holder: dict):
+        self._job_queue.put((priority, next(self._job_seq), kind, payload, done_evt, holder))
+
     def _worker_loop(self):
         self.load_model()
         while True:
-            kind, payload, done_evt, holder = self._job_queue.get()
+            _prio, _seq, kind, payload, done_evt, holder = self._job_queue.get()
             try:
                 if kind == "drilldown":
                     holder["result"] = self._drilldown_on_worker(payload)
                 else:
                     holder["result"] = self._synthesize_on_worker(payload)
+                    if kind == "tile_synth" and holder.get("result", {}).get("ok"):
+                        to = payload.get("tileOrigin") or {}
+                        home = to.get("homeWorldId")
+                        if home:
+                            TILE_STREAMS.mark_synth_done(
+                                home,
+                                holder["result"]["worldId"],
+                                {
+                                    "qi": to.get("qi"),
+                                    "qj": to.get("qj"),
+                                    "ring": to.get("ring"),
+                                    "quality": holder["result"].get("resolution", "1K").lower(),
+                                    "latDeg": payload.get("latDeg"),
+                                    "lonDeg": payload.get("lonDeg"),
+                                },
+                            )
             except Exception as exc:
                 holder["error"] = exc
+                if kind == "tile_synth":
+                    print(f"[Stage2] Background tile synth failed: {exc}", flush=True)
             finally:
-                done_evt.set()
+                if done_evt is not None:
+                    done_evt.set()
                 self._job_queue.task_done()
 
     def synthesize(self, payload: dict) -> dict:
@@ -355,7 +379,7 @@ class WarmStage2Engine:
             raise RuntimeError(self.load_error or "Terrain Diffusion 30m model is still warming up.")
         done_evt = threading.Event()
         holder: dict = {}
-        self._job_queue.put(("synthesize", payload, done_evt, holder))
+        self._put_job(0, "synthesize", payload, done_evt, holder)
         done_evt.wait()
         if "error" in holder:
             raise holder["error"]
@@ -366,11 +390,26 @@ class WarmStage2Engine:
             raise RuntimeError(self.load_error or "Terrain Diffusion 30m model is still warming up.")
         done_evt = threading.Event()
         holder: dict = {}
-        self._job_queue.put(("drilldown", payload, done_evt, holder))
+        self._put_job(0, "drilldown", payload, done_evt, holder)
         done_evt.wait()
         if "error" in holder:
             raise holder["error"]
         return holder["result"]
+
+    def enqueue_tile_synth(self, payload: dict) -> dict:
+        """Fire-and-forget 1K/2K neighbor synth (lower priority than interactive)."""
+        if not self.ready or self.world is None:
+            raise RuntimeError(self.load_error or "Terrain Diffusion 30m model is still warming up.")
+        self._put_job(10, "tile_synth", payload, None, {})
+        to = payload.get("tileOrigin") or {}
+        return {
+            "ok": True,
+            "queued": True,
+            "tileId": payload.get("forceWorldId"),
+            "homeWorldId": to.get("homeWorldId"),
+            "qi": to.get("qi"),
+            "qj": to.get("qj"),
+        }
 
     def load_model(self):
         t0 = time.perf_counter()
@@ -618,7 +657,10 @@ class WarmStage2Engine:
             safe_arch = re.sub(r"[^a-z0-9]", "", archetype.lower())[:8] or "earth"
             res_tag = f"{out_n // 1024}K" if out_n >= 1024 else f"{out_n}px"
             # Include resolution in world id so 1K/2K/4K of the same spot can coexist
-            world_id = f"planet_s{seed}_{safe_arch}_{coord_slug.lower()}_{res_tag.lower()}"
+            # Background tile stream may force a stable tile_* id (replaces ghost meta)
+            force_id = payload.get("forceWorldId")
+            world_id = str(force_id) if force_id else f"planet_s{seed}_{safe_arch}_{coord_slug.lower()}_{res_tag.lower()}"
+            tile_origin = payload.get("tileOrigin")
 
             VIEWER_WORLDS_DIR.mkdir(parents=True, exist_ok=True)
             # Curvature AO is a shading cue — compute at <=1024 then upsample for 2K/4K speed
@@ -695,6 +737,15 @@ class WarmStage2Engine:
                 },
                 "landmarks": landmarks,
             }
+            if tile_origin:
+                world_meta["tileOrigin"] = {
+                    "homeWorldId": tile_origin.get("homeWorldId"),
+                    "qi": tile_origin.get("qi"),
+                    "qj": tile_origin.get("qj"),
+                    "ring": tile_origin.get("ring"),
+                    "quality": res_tag.lower(),
+                }
+                world_meta["quality"] = res_tag.lower()
             (VIEWER_WORLDS_DIR / f"{world_id}.json").write_text(json.dumps(world_meta, indent=2))
 
             # Write dynamic Stage 2 regions into a gitignored catalog overlay so tracked catalog.json stays clean
@@ -1229,6 +1280,19 @@ def make_handler(engine: WarmStage2Engine):
                     )
                     TILE_STREAMS.mark_ghost_done(str(payload["homeWorldId"]), result["tileId"], result["world"])
                     print(f"[Stage2] Ghost tile {result['tileId']} (ring {payload.get('ring', 1)})", flush=True)
+                    self._send_json(200, result)
+                except Exception as exc:
+                    self._send_json(500, {"ok": False, "error": str(exc)})
+                return
+            if path == "/api/tiles/enqueue":
+                try:
+                    payload = self._read_json_body()
+                    result = engine.enqueue_tile_synth(payload)
+                    print(
+                        f"[Stage2] Queued tile synth {result.get('tileId')} "
+                        f"(qi={result.get('qi')}, qj={result.get('qj')})",
+                        flush=True,
+                    )
                     self._send_json(200, result)
                 except Exception as exc:
                     self._send_json(500, {"ok": False, "error": str(exc)})
