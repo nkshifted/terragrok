@@ -1436,6 +1436,7 @@ async function pollStage2Health() {
     if (!resp.ok) throw new Error('HTTP ' + resp.status);
     const data = await resp.json();
     stage2.serverReady = !!data.ready;
+    stage2.serverState = data.ready ? 'ready' : data.error ? 'error' : 'warming';
     stage2.serverDevice = (data.device || 'mps').toUpperCase();
     if (data.ready) {
       pill.textContent = `● ${stage2.serverDevice} Ready`;
@@ -1449,6 +1450,7 @@ async function pollStage2Health() {
     }
   } catch {
     stage2.serverReady = false;
+    stage2.serverState = 'offline';
     pill.textContent = '○ Server Offline';
     pill.className = 'status-pill offline';
   }
@@ -1466,6 +1468,23 @@ async function synthesizeStage2Target() {
   const progFill = document.getElementById('synth-progress-fill');
   const progText = document.getElementById('synth-status-text');
   const actionCard = document.getElementById('stage2-action-card');
+
+  // Don't fire a request the server cannot take yet: on a cold start it spends a while
+  // installing / importing before it listens, then more loading the model.
+  await pollStage2Health();
+  if (!stage2.serverReady) {
+    const why = {
+      warming: 'The Stage 2 server is still loading the model. Try again in a few seconds.',
+      error: 'The Stage 2 server failed to load the model. Check its terminal output.',
+      offline:
+        'The Stage 2 server is not reachable yet. If you just ran <code>just dev</code> it may still be starting ' +
+        '(the first run installs PyTorch); otherwise run <code>just stage2-server</code>.',
+    }[stage2.serverState || 'offline'];
+    progWrap.style.display = 'block';
+    progFill.style.width = '100%';
+    progText.innerHTML = `<span style="color:#fcd34d;">${why}</span>`;
+    return;
+  }
 
   stage2.synthesizing = true;
   if (btn) {

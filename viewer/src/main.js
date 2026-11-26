@@ -58,6 +58,8 @@ scene.add(sunLight);
 scene.add(sunLight.target);
 
 const skyDome = createSkyDome();
+skyDome.frustumCulled = false;
+skyDome.renderOrder = -10;
 scene.add(skyDome);
 
 // ---------- World State ----------
@@ -1784,6 +1786,10 @@ function animate() {
     grassObj.material.uniforms.uFocusPos.value.copy(focus);
     grassObj.material.uniforms.uPlayerPos.value.copy(player.pos);
   }
+
+  // The sky is a finite dome: keep it centred on the camera so walking (or flying the
+  // isometric view) several tiles from home never leaves it and shows black space instead.
+  skyDome.position.copy(camera.position);
 
   updateTelemetry();
   renderer.render(scene, camera);

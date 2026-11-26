@@ -69,8 +69,37 @@ else
 fi
 
 wait_http "http://127.0.0.1:$VIEWER_PORT/" "Vite viewer" 60 || true
-# Health may 200 before model is warm; still useful as connectivity check
-wait_http "http://127.0.0.1:$STAGE2_PORT/api/health" "Stage 2 /api/health" 120 || true
+
+# The Stage 2 server can take minutes to start listening on a first run (uv installs PyTorch
+# into this checkout's venv), so wait as long as its process is alive rather than a fixed time.
+stage2_listening() {
+  curl -sf --max-time 1 "http://127.0.0.1:$STAGE2_PORT/api/health" 2>/dev/null
+}
+echo "[dev] Waiting for the Stage 2 server (first run in a checkout installs PyTorch; this can take a few minutes)..."
+waited=0
+until stage2_listening >/dev/null; do
+  if [[ -n "${STAGE2_PID}" ]] && ! kill -0 "${STAGE2_PID}" 2>/dev/null; then
+    echo "[dev] Stage 2 server exited before it started listening." >&2
+    exit 1
+  fi
+  sleep 1
+  waited=$((waited + 1))
+  if ((waited % 30 == 0)); then
+    echo "[dev] ...still waiting for the Stage 2 server (${waited}s)"
+  fi
+done
+echo "[dev] Stage 2 server is listening; waiting for the model to load..."
+until stage2_listening | grep -q '"ready": true'; do
+  if stage2_listening | grep -q '"error": "'; then
+    echo "[dev] Stage 2 model failed to load (see the error above). The viewer still works on cached worlds." >&2
+    break
+  fi
+  if [[ -n "${STAGE2_PID}" ]] && ! kill -0 "${STAGE2_PID}" 2>/dev/null; then
+    echo "[dev] Stage 2 server exited while loading the model." >&2
+    exit 1
+  fi
+  sleep 1
+done
 
 echo ""
 echo "[dev] TerraGrok ready:"
