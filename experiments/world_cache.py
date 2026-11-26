@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 VIEWER_WORLDS_DIR = REPO_ROOT / "viewer" / "public" / "worlds"
 SYNTH_CATALOG_PATH = VIEWER_WORLDS_DIR / "synthesized_catalog.json"
+# Serializes read-modify-write of the catalog across the server's worker / HTTP / ghost threads
+CATALOG_LOCK = threading.RLock()
 WORLD_FILE_SUFFIXES = (
     ".json",
     ".height.f32",
@@ -15,6 +18,7 @@ WORLD_FILE_SUFFIXES = (
     ".climate.u8",
     ".rivers.json",
     ".lakes.json",
+    ".ghost.height.f32",
 )
 
 
@@ -63,11 +67,26 @@ def list_cached_worlds(
     catalog_path: Path | None = None,
     worlds_dir: Path | None = None,
 ) -> dict:
-    entries = [
-        enrich_world_entry(e, worlds_dir=worlds_dir)
-        for e in load_synth_catalog(catalog_path)
-        if e.get("id")
-    ]
+    catalog = [e for e in load_synth_catalog(catalog_path) if e.get("id")]
+    # Streamed chart tiles are part of their home world: fold their disk use into it
+    # instead of listing dozens of tiles and ghosts as worlds of their own.
+    tiles_by_home: dict[str, list[dict]] = {}
+    for e in catalog:
+        home = (e.get("tileOrigin") or {}).get("homeWorldId")
+        if home:
+            tiles_by_home.setdefault(home, []).append(e)
+    entries = []
+    for e in catalog:
+        if e.get("tileOrigin"):
+            continue
+        out = enrich_world_entry(e, worlds_dir=worlds_dir)
+        tiles = tiles_by_home.get(e["id"], [])
+        if tiles:
+            extra = sum(world_disk_bytes(str(t["id"]), worlds_dir=worlds_dir) for t in tiles)
+            out["tileCount"] = sum(1 for t in tiles if t.get("quality") != "ghost")
+            out["diskBytes"] += extra
+            out["diskMB"] = round(out["diskBytes"] / (1024 * 1024), 2)
+        entries.append(out)
     if seed is not None:
         entries = [
             e
@@ -98,7 +117,7 @@ def delete_cached_world(
     catalog_path: Path | None = None,
     worlds_dir: Path | None = None,
 ) -> dict:
-    """Delete a synthesized world and optionally all drill-down children."""
+    """Delete a synthesized world and optionally its drill-down children and streamed tiles."""
     root = worlds_dir or VIEWER_WORLDS_DIR
     cat_path = catalog_path or SYNTH_CATALOG_PATH
     catalog = load_synth_catalog(cat_path)
@@ -114,7 +133,8 @@ def delete_cached_world(
             for e in catalog:
                 wid = e.get("id")
                 parent = (e.get("drillOrigin") or {}).get("parentWorldId")
-                if wid and parent in to_delete and wid not in to_delete:
+                home = (e.get("tileOrigin") or {}).get("homeWorldId")
+                if wid and (parent in to_delete or home in to_delete) and wid not in to_delete:
                     to_delete.add(wid)
                     changed = True
 

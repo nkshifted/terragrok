@@ -101,3 +101,44 @@ def test_prune_keeps_bookmarked(tmp_path: Path):
     assert "keep_me" not in result["deletedIds"]
     assert (tmp_path / "keep_me.json").exists()
     assert not (tmp_path / "drop_me.json").exists()
+
+
+def test_delete_cascades_streamed_tiles_and_ghost_rasters(tmp_path: Path):
+    cat = tmp_path / "synthesized_catalog.json"
+    home = {"id": "planet_home_2k", "title": "Home"}
+    tile = {"id": "tile_planet_home_2k_e1_s0", "tileOrigin": {"homeWorldId": "planet_home_2k", "qi": 1, "qj": 0}}
+    ghost = {"id": "tile_planet_home_2k_e2_s0", "quality": "ghost", "tileOrigin": {"homeWorldId": "planet_home_2k"}}
+    other = {"id": "planet_other_2k", "title": "Other"}
+    for m in (home, tile, other):
+        _touch_world(tmp_path, m["id"], m)
+    (tmp_path / f"{ghost['id']}.json").write_text(json.dumps(ghost))
+    (tmp_path / f"{ghost['id']}.ghost.height.f32").write_bytes(b"\x00" * 16)
+    save_synth_catalog([home, tile, ghost, other], catalog_path=cat, worlds_dir=tmp_path)
+
+    result = delete_cached_world("planet_home_2k", catalog_path=cat, worlds_dir=tmp_path)
+
+    assert set(result["deletedIds"]) == {home["id"], tile["id"], ghost["id"]}
+    assert sorted(p.name for p in tmp_path.glob("tile_*")) == []
+    assert (tmp_path / "planet_other_2k.json").exists()
+
+
+def test_listing_folds_streamed_tiles_into_their_home(tmp_path: Path):
+    cat = tmp_path / "synthesized_catalog.json"
+    home = {"id": "planet_home_2k", "title": "Home", "planetOrigin": {"seed": 7}}
+    tile = {
+        "id": "tile_planet_home_2k_e1_s0",
+        "quality": "2k",
+        "planetOrigin": {"seed": 7},
+        "tileOrigin": {"homeWorldId": "planet_home_2k", "qi": 1, "qj": 0},
+    }
+    ghost = {**tile, "id": "tile_planet_home_2k_e2_s0", "quality": "ghost"}
+    for m in (home, tile):
+        _touch_world(tmp_path, m["id"], m)
+    save_synth_catalog([home, tile, ghost], catalog_path=cat, worlds_dir=tmp_path)
+
+    listed = list_cached_worlds(seed=7, catalog_path=cat, worlds_dir=tmp_path)
+
+    assert [w["id"] for w in listed["worlds"]] == ["planet_home_2k"]
+    assert listed["worlds"][0]["tileCount"] == 1
+    one_world = sum((tmp_path / f"planet_home_2k{s}").stat().st_size for s in (".json", ".height.f32", ".masks.u8"))
+    assert listed["worlds"][0]["diskBytes"] > one_world

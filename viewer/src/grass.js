@@ -59,6 +59,7 @@ export function createGrassField(heightFloatTex, maskTex, worldSpan, maxElev, bl
       uHeightTex: { value: heightFloatTex },
       uMasks: { value: maskTex },
       uWorldSpan: { value: worldSpan },
+      uTexOrigin: { value: new THREE.Vector2(0, 0) },
       uMaxElev: { value: maxElev },
       uVScale: { value: 1.0 },
       uRingSize: { value: ringSize },
@@ -77,6 +78,7 @@ export function createGrassField(heightFloatTex, maskTex, worldSpan, maxElev, bl
       uniform sampler2D uHeightTex;
       uniform sampler2D uMasks;
       uniform float uWorldSpan;
+      uniform vec2 uTexOrigin;
       uniform float uMaxElev;
       uniform float uVScale;
       uniform float uRingSize;
@@ -107,7 +109,7 @@ export function createGrassField(heightFloatTex, maskTex, worldSpan, maxElev, bl
       }
 
       float sampleH(vec2 xz) {
-        vec2 uv = xz / uWorldSpan + 0.5;
+        vec2 uv = (xz - uTexOrigin) / uWorldSpan + 0.5;
         uv.y = 1.0 - uv.y;
         return texture2D(uHeightTex, uv).r * uVScale;
       }
@@ -119,7 +121,7 @@ export function createGrassField(heightFloatTex, maskTex, worldSpan, maxElev, bl
         vec2 wxz = uFocusPos.xz + rel;
 
         // World UV check
-        vec2 uv = wxz / uWorldSpan + 0.5;
+        vec2 uv = (wxz - uTexOrigin) / uWorldSpan + 0.5;
         uv.y = 1.0 - uv.y;
         bool inBounds = uv.x > 0.01 && uv.x < 0.99 && uv.y > 0.01 && uv.y < 0.99;
 

@@ -5,6 +5,7 @@ import {
   faceUVToUnitDir as tecFaceUVToUnitDir,
   unitDirToFaceUV as tecUnitDirToFaceUV,
 } from './tectonics.js';
+import { coarseSizeForResolution, encodeChartTilePayload, extractChartTile } from './stage1Conditioning.js';
 
 const CUBE_FACES = TEC_FACES.map((f) => ({
   name: f.name,
@@ -1218,7 +1219,7 @@ async function loadCachedRegionsForPlanet({ focusFreshId = null, freshData = nul
       all = Array.isArray(data.worlds) ? data.worlds : [];
     } else {
       const resp = await fetch('/worlds/synthesized_catalog.json', { cache: 'no-store' });
-      if (resp.ok) all = await resp.json();
+      if (resp.ok) all = (await resp.json()).filter((w) => !w.tileOrigin);
     }
     const targetSeed = Number(genState.seed);
     const resolvedArch = currentPlanet.meta?.archetype || genState.archetype;
@@ -1354,113 +1355,19 @@ function setStage2Target(unitDir, { forceNew = false } = {}) {
   syncStage2ActionUI();
 }
 
-function float32ToBase64(f32) {
-  const bytes = new Uint8Array(f32.buffer, f32.byteOffset, f32.byteLength);
-  let binary = '';
-  const chunk = 0x8000;
-  for (let i = 0; i < bytes.length; i += chunk) {
-    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
-  }
-  return btoa(binary);
-}
-
-/** Sample Stage-1 elev (Earth-DEM meters) on a tangent square — used for ghost neighbor tiles. */
-function sampleStage1ElevGrid(latDeg, lonDeg, spanDeg, gridSize = 256) {
-  const center = dirFromLatLon(latDeg, lonDeg);
-  const { c, east, north } = tangentBasisForDir(center);
-  const totalSpanRad = THREE.MathUtils.degToRad(spanDeg);
-  const elev = new Float32Array(gridSize * gridSize);
-  const tmp = new THREE.Vector3();
-  const maxRef = Math.max(240.0 * genState.reliefScale, 120.0);
-  for (let r = 0; r < gridSize; r++) {
-    const ty = ((gridSize - 1) * 0.5 - r) * (totalSpanRad / gridSize);
-    for (let col = 0; col < gridSize; col++) {
-      const tx = (col - (gridSize - 1) * 0.5) * (totalSpanRad / gridSize);
-      projectTangentToUnitDir(c, east, north, tx, ty, tmp);
-      const s = sampleSphereSurface(tmp);
-      const idx = r * gridSize + col;
-      if (s.elev > 0) {
-        const norm = Math.min(1.25, s.elev / maxRef);
-        elev[idx] = 15.0 + Math.pow(norm, 1.15) * 3300.0;
-      } else {
-        const dNorm = Math.min(1.0, -s.elev / 260.0);
-        elev[idx] = -(60.0 + dNorm * 2800.0);
-      }
-    }
-  }
-  return elev;
-}
-
-async function kickoffTileStreamGhosts({ homeWorldId, seed, latDeg, lonDeg, spanDeg, worldSpan = 4800 }) {
+/**
+ * Start the server-side tile stream for a freshly synthesized home patch so its neighbours
+ * begin synthesizing while the user is still on the globe. The server samples Stage 1 itself
+ * (experiments/stage1_patch.mjs); the explorer page keeps the stream alive afterwards.
+ */
+async function kickoffTileStream(homeWorldId) {
   const resp = await fetch('/api/tiles/stream', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      homeWorldId,
-      seed,
-      latDeg,
-      lonDeg,
-      spanDeg,
-      maxRing: 1,
-    }),
+    body: JSON.stringify({ homeWorldId, x: 0, z: 0 }),
   });
-  const plan = await resp.json();
-  if (!resp.ok || !plan.ok) throw new Error(plan.error || 'tile stream failed');
-  const pending = new Set(plan.pendingGhost || []);
-  for (const n of plan.neighbors || []) {
-    // Always try ghost if missing; then enqueue 1K background synth
-    if (pending.has(n.tileId)) {
-      const elev = sampleStage1ElevGrid(n.latDeg, n.lonDeg, spanDeg, 256);
-      const gResp = await fetch('/api/tiles/ghost', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          homeWorldId,
-          seed,
-          latDeg: n.latDeg,
-          lonDeg: n.lonDeg,
-          spanDeg,
-          qi: n.qi,
-          qj: n.qj,
-          ring: n.ring,
-          size: 256,
-          worldSpan,
-          elev: float32ToBase64(elev),
-        }),
-      });
-      const gData = await gResp.json();
-      if (!gResp.ok || !gData.ok) {
-        console.warn('[tile-stream] ghost failed', n.tileId, gData.error);
-      }
-    }
-
-    // Phase 2: queue 1K AI synth (lower priority than interactive) using live Stage-1 conditioning
-    try {
-      const payload = extractStage2PayloadAt(n.latDeg, n.lonDeg, spanDeg, {
-        resolution: '1k',
-        coarseSize: 8,
-        quality: 'fast',
-      });
-      payload.forceWorldId = n.tileId;
-      payload.tileOrigin = {
-        homeWorldId,
-        qi: n.qi,
-        qj: n.qj,
-        ring: n.ring,
-      };
-      const qResp = await fetch('/api/tiles/enqueue', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      });
-      const qData = await qResp.json();
-      if (!qResp.ok || !qData.ok) {
-        console.warn('[tile-stream] enqueue failed', n.tileId, qData.error);
-      }
-    } catch (err) {
-      console.warn('[tile-stream] enqueue error', n.tileId, err);
-    }
-  }
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok || !data.ok) throw new Error(data.error || 'tile stream failed');
 }
 
 function getStage2ResolutionConfig() {
@@ -1482,75 +1389,34 @@ function syncStage2SynthButtonLabel() {
 
 function extractStage2PayloadAt(latDeg, lonDeg, spanDeg, opts = {}) {
   const resolution = opts.resolution || getStage2ResolutionConfig().resolution;
-  const coarseSize =
-    opts.coarseSize ||
-    (resolution === '4k' ? 32 : resolution === '1k' ? 8 : 16);
-  const padding = 64;
-  const fullCoarse = coarseSize + 2 * padding;
-  const refSize = coarseSize >= 32 ? 512 : 256;
-
-  const center = dirFromLatLon(latDeg, lonDeg);
-  const { c, east, north } = tangentBasisForDir(center);
-  const cellStepRad = THREE.MathUtils.degToRad(spanDeg) / coarseSize;
-  const tmp = new THREE.Vector3();
-
-  const sampleGrid = (gridSize, totalSpanRad, withStd) => {
-    const elev = new Float32Array(gridSize * gridSize);
-    const temp = new Float32Array(gridSize * gridSize);
-    const precip = new Float32Array(gridSize * gridSize);
-    const tempStd = withStd ? new Float32Array(gridSize * gridSize) : null;
-    const precipCv = withStd ? new Float32Array(gridSize * gridSize) : null;
-
-    for (let r = 0; r < gridSize; r++) {
-      const ty = ((gridSize - 1) * 0.5 - r) * (totalSpanRad / gridSize);
-      for (let col = 0; col < gridSize; col++) {
-        const tx = (col - (gridSize - 1) * 0.5) * (totalSpanRad / gridSize);
-        projectTangentToUnitDir(c, east, north, tx, ty, tmp);
-        const s = sampleSphereSurface(tmp);
-        const idx = r * gridSize + col;
-        const maxRef = Math.max(240.0 * genState.reliefScale, 120.0);
-        if (s.elev > 0) {
-          const norm = Math.min(1.25, s.elev / maxRef);
-          elev[idx] = 15.0 + Math.pow(norm, 1.15) * 3300.0;
-        } else {
-          const dNorm = Math.min(1.0, -s.elev / 260.0);
-          elev[idx] = -(60.0 + dNorm * 2800.0);
-        }
-        temp[idx] = Math.max(-18.0, Math.min(32.0, s.tempC));
-        precip[idx] = 35.0 + Math.pow(s.moisture, 1.35) * 2500.0;
-        if (withStd) {
-          tempStd[idx] = (2.5 + Math.abs(tmp.y) * 11.5) * 100.0;
-          precipCv[idx] = 22.0 + (1.0 - s.moisture) * 48.0;
-        }
-      }
-    }
-    return { elev, temp, precip, tempStd, precipCv };
-  };
-
-  const coarse = sampleGrid(fullCoarse, fullCoarse * cellStepRad, true);
-  const ref = sampleGrid(refSize, coarseSize * cellStepRad, false);
+  const coarseSize = opts.coarseSize || coarseSizeForResolution(resolution);
+  // Round first: the stored (rounded) lat/lon is the chart origin streamed neighbours reuse
+  const homeLatDeg = Number(latDeg.toFixed(2));
+  const homeLonDeg = Number(lonDeg.toFixed(2));
+  const tile = extractChartTile(currentPlanet, {
+    reliefScale: genState.reliefScale,
+    homeLatDeg,
+    homeLonDeg,
+    spanDeg,
+    qi: 0,
+    qj: 0,
+    coarseSize,
+    margin: true,
+  });
 
   return {
     seed: genState.seed,
     archetype: genState.archetype,
+    climateMode: genState.climateMode,
     seaLevelBias: genState.seaLevelBias,
+    reliefScale: genState.reliefScale,
     resolution,
     quality: opts.quality || document.getElementById('sel-stage2-quality')?.value || 'high',
     fidelity: opts.fidelity || document.getElementById('sel-stage2-fidelity')?.value || 'exact',
-    latDeg: Number(latDeg.toFixed(2)),
-    lonDeg: Number(lonDeg.toFixed(2)),
+    latDeg: homeLatDeg,
+    lonDeg: homeLonDeg,
     spanDeg,
-    coarseSize,
-    padding,
-    refSize,
-    condElev: float32ToBase64(coarse.elev),
-    condTemp: float32ToBase64(coarse.temp),
-    condTempStd: float32ToBase64(coarse.tempStd),
-    condPrecip: float32ToBase64(coarse.precip),
-    condPrecipCv: float32ToBase64(coarse.precipCv),
-    refElev: float32ToBase64(ref.elev),
-    refTemp: float32ToBase64(ref.temp),
-    refPrecip: float32ToBase64(ref.precip),
+    ...encodeChartTilePayload(tile),
   };
 }
 
@@ -1646,15 +1512,8 @@ async function synthesizeStage2Target() {
     progWrap.style.display = 'none';
     // Immediately refresh cached footprints and transition into ONE single "Explore Synthesized 3D World" card!
     await loadCachedRegionsForPlanet({ focusFreshId: data.worldId, freshData: data });
-    // Phase 1 tile stream: bake Stage-1 ghost neighbors in the background (does not block Enter)
-    kickoffTileStreamGhosts({
-      homeWorldId: data.worldId,
-      seed: payload.seed,
-      latDeg: payload.latDeg,
-      lonDeg: payload.lonDeg,
-      spanDeg: payload.spanDeg,
-      worldSpan: 4800,
-    }).catch((e) => console.warn('[tile-stream]', e));
+    // Neighbour tiles start synthesizing in the background (does not block Enter)
+    kickoffTileStream(data.worldId).catch((e) => console.warn('[tile-stream]', e));
   } catch (err) {
     progFill.style.width = '100%';
     progText.innerHTML =

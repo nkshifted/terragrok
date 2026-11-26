@@ -5,6 +5,7 @@
  * for direct conditioning of Terrain Diffusion 30m!
  */
 import fs from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { generateTectonicPlanet, unitDirToFaceUV } from '../viewer/src/tectonics.js';
 
 const args = process.argv.slice(2);
@@ -17,7 +18,7 @@ const seed = Number(getArg('seed', '101'));
 const archetype = getArg('archetype', 'earth');
 const coarseSize = Number(getArg('coarse', '8')); // 8x8 coarse cells -> 1024x1024 at pool=2 or 2048x2048 at pool=1
 const spanDeg = Number(getArg('span', '46')); // angular width of region on sphere (degrees)
-const outDir = '/Users/noam/Workspace/terragrok/out/tectonics_td30m';
+const outDir = fileURLToPath(new URL('../out/tectonics_td30m', import.meta.url));
 fs.mkdirSync(outDir, { recursive: true });
 
 console.log(`Generating Stage 1 tectonic planet (seed=${seed}, archetype=${archetype})...`);

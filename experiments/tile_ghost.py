@@ -8,7 +8,6 @@ from typing import Any
 
 import numpy as np
 
-from tile_grid import tile_id
 from world_cache import SYNTH_CATALOG_PATH, VIEWER_WORLDS_DIR, load_synth_catalog, save_synth_catalog
 
 GHOST_SUFFIX = ".ghost.height.f32"
@@ -23,6 +22,7 @@ def ghost_paths(tile: str, worlds_dir: Path | None = None) -> tuple[Path, Path]:
 def write_ghost_tile(
     elev: np.ndarray,
     *,
+    tile_id: str,
     seed: int,
     lat_deg: float,
     lon_deg: float,
@@ -41,7 +41,7 @@ def write_ghost_tile(
     if elev.ndim != 2 or elev.shape[0] != elev.shape[1]:
         raise ValueError("elev must be a square float32 array")
     size = int(elev.shape[0])
-    tid = tile_id(seed, lat_deg, lon_deg, span_deg)
+    tid = tile_id
     root = worlds_dir or VIEWER_WORLDS_DIR
     root.mkdir(parents=True, exist_ok=True)
     meta_path, height_path = ghost_paths(tid, worlds_dir=root)
@@ -71,14 +71,18 @@ def write_ghost_tile(
             "qj": int(qj),
             "ring": int(ring),
             "quality": "ghost",
+            "scheme": "chart",
         },
         "landmarks": {"plains": [0.5, 0.5]},
     }
+    cat_path = catalog_path or SYNTH_CATALOG_PATH
+    catalog = load_synth_catalog(cat_path)
+    if any(e.get("id") == tid and e.get("quality") != "ghost" for e in catalog):
+        # Real terrain already landed for this tile; never downgrade it to a ghost
+        return {"ok": True, "tileId": tid, "world": meta, "skipped": True}
     height_path.write_bytes(elev.tobytes())
     meta_path.write_text(json.dumps(meta, indent=2))
 
-    cat_path = catalog_path or SYNTH_CATALOG_PATH
-    catalog = load_synth_catalog(cat_path)
     catalog = [e for e in catalog if e.get("id") != tid]
     catalog.append(meta)
     save_synth_catalog(catalog, catalog_path=cat_path, worlds_dir=root)

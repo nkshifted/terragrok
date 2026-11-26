@@ -25,9 +25,10 @@ import torch
 
 # Add vendored terrain-diffusion repo to sys.path
 REPO_ROOT = Path(__file__).resolve().parent.parent
-VENDOR_TD = REPO_ROOT / ".vendor" / "terrain-diffusion"
-if VENDOR_TD.exists():
-    sys.path.insert(0, str(VENDOR_TD))
+sys.path.insert(0, str(REPO_ROOT / "experiments"))
+from paths import VENDOR_TD, add_vendor_to_syspath  # noqa: E402
+
+add_vendor_to_syspath()
 
 from terrain_diffusion.inference.world_pipeline import WorldPipeline  # noqa: E402
 

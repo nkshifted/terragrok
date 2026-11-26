@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import { generateTectonicPlanet, unitDirToFaceUV } from '../viewer/src/tectonics.js';
 
@@ -13,7 +14,7 @@ const CASES = [
 
 const W = 540;
 const H = 270;
-const outDir = '/Users/noam/Workspace/terragrok/out/planet';
+const outDir = fileURLToPath(new URL('../out/planet', import.meta.url));
 fs.mkdirSync(outDir, { recursive: true });
 
 function shadePixel(h, tempC, moist, river, lake, bound) {

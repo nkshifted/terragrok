@@ -1,219 +1,240 @@
-import {
-  buildGhostTileMesh,
-  createGhostTileGroup,
-  disposeGhostTileGroup,
-} from './tileAtlas.js';
+import { prepareTileSlot, tileAt, tileKey } from './seamAtlas.js';
+
+const HEARTBEAT_MS = 2000;
+const ATLAS_TILE_N = 1024;
+const ATLAS_CLIM_N = 512;
+/** Recentre the 3×3 window once the player is this far (in tiles) past the centre tile's middle. */
+const RECENTRE_AT = 0.62;
+/** Keep loaded tiles this many rings around the window centre; drop the rest. */
+const KEEP_RING = 2;
 
 /**
- * Poll tile-stream status: show ghosts, upgrade to 1K walkable neighbor heightfields.
+ * Tile stream client.
+ *
+ * Posts the player's position to the Stage 2 server every couple of seconds. The server keeps
+ * synthesizing the tiles nearest the player (experiments/tile_stream.py) and answers with what
+ * exists; this module loads those tiles and maintains the 3×3 window the explorer stitches.
+ *
+ * @param {{ onChange: () => void, getPlayerPos: () => {x: number, z: number} }} deps
  */
-export function createTileStreamController({ scene, getVScale, onWalkableChange }) {
-  let group = null;
-  let pollId = null;
+export function createTileStreamController({ onChange, getPlayerPos }) {
   let homeWorldId = null;
   let worldSpan = 4800;
-  /** @type {Map<string, { qi:number, qj:number, quality:string, heights:Float32Array, size:number, mesh?:THREE.Mesh }>} */
+  let timer = null;
+  let busy = false;
+  let generation = 0;
+  let live = false;
+  let centre = { qi: 0, qj: 0 };
+  let lastStatus = null;
+  let version = 0;
+  /** @type {Map<string, object>} */
   const tiles = new Map();
 
-  function tileKey(qi, qj) {
-    return `${qi},${qj}`;
-  }
-
-  async function fetchHeightF32(tileId, size, ghost) {
-    const url = ghost
-      ? `/worlds/${encodeURIComponent(tileId)}.ghost.height.f32`
-      : `/worlds/${encodeURIComponent(tileId)}.height.f32`;
+  async function fetchBytes(url, Type, expected) {
     const resp = await fetch(url, { cache: 'no-store' });
-    if (!resp.ok) throw new Error(`height HTTP ${resp.status}`);
-    const buf = await resp.arrayBuffer();
-    const heights = new Float32Array(buf);
-    if (heights.length !== size * size) {
-      throw new Error(`height size mismatch ${heights.length} vs ${size * size}`);
+    if (!resp.ok) throw new Error(`${url}: HTTP ${resp.status}`);
+    const arr = new Type(await resp.arrayBuffer());
+    if (expected != null && arr.length !== expected) {
+      throw new Error(`${url}: expected ${expected} values, got ${arr.length}`);
     }
-    return heights;
+    return arr;
   }
 
-  function removeMesh(entry) {
-    if (entry?.mesh && group) {
-      group.remove(entry.mesh);
-      entry.mesh.geometry?.dispose();
-      entry.mesh.material?.dispose();
-      entry.mesh = null;
+  async function loadTile(st) {
+    const base = `/worlds/${encodeURIComponent(st.tileId)}`;
+    const meta = await fetch(`${base}.json`, { cache: 'no-store' }).then((r) => {
+      if (!r.ok) throw new Error(`${base}.json: HTTP ${r.status}`);
+      return r.json();
+    });
+    const ghost = meta.quality === 'ghost';
+    const size = meta.size;
+    const entry = {
+      key: tileKey(st.qi, st.qj),
+      qi: st.qi,
+      qj: st.qj,
+      tileId: st.tileId,
+      rev: st.rev,
+      quality: ghost ? 'ghost' : st.quality,
+      ghost,
+      walkable: !ghost,
+      meta,
+      rivers: [],
+      lakes: [],
+      version: ++version,
+    };
+    if (ghost) {
+      const heights = await fetchBytes(`${base}.ghost.height.f32`, Float32Array, size * size);
+      entry.slot = prepareTileSlot({ heights, size }, ATLAS_TILE_N, ATLAS_CLIM_N);
+      return entry;
     }
+    const climateSize = meta.climateSize || size;
+    const [heights, masks, climate, rivers, lakes] = await Promise.all([
+      fetchBytes(`${base}.height.f32`, Float32Array, size * size),
+      fetchBytes(`${base}.masks.u8`, Uint8Array, size * size * 4),
+      meta.hasClimate ? fetchBytes(`${base}.climate.u8`, Uint8Array, climateSize * climateSize * 4) : null,
+      fetch(`${base}.rivers.json`, { cache: 'no-store' }).then((r) => (r.ok ? r.json() : [])),
+      fetch(`${base}.lakes.json`, { cache: 'no-store' }).then((r) => (r.ok ? r.json() : [])),
+    ]);
+    entry.slot = prepareTileSlot({ heights, size, masks, climate, climateSize }, ATLAS_TILE_N, ATLAS_CLIM_N);
+    entry.rivers = rivers;
+    entry.lakes = lakes;
+    return entry;
   }
 
-  async function upsertTile(tile) {
-    const tid = tile.tileId;
-    if (!tid || tile.qi == null || tile.qj == null) return;
-    if (tile.qi === 0 && tile.qj === 0) return;
+  function recentre(pos) {
+    const fx = pos.x / worldSpan - centre.qi;
+    const fz = pos.z / worldSpan - centre.qj;
+    const next = { ...centre };
+    if (Math.abs(fx) > RECENTRE_AT) next.qi = Math.round(pos.x / worldSpan);
+    if (Math.abs(fz) > RECENTRE_AT) next.qj = Math.round(pos.z / worldSpan);
+    if (next.qi === centre.qi && next.qj === centre.qj) return false;
+    centre = next;
+    return true;
+  }
 
-    const quality = String(tile.quality || 'ghost').toLowerCase();
-    const walkable = quality === '1k' || quality === '2k' || quality === '4k' || tile.walkable;
-    const key = tileKey(tile.qi, tile.qj);
-    const prev = tiles.get(key);
-    if (prev && prev.quality === quality && prev.tileId === tid) return;
-
-    const metaResp = await fetch(`/worlds/${encodeURIComponent(tid)}.json`, { cache: 'no-store' });
-    if (!metaResp.ok) return;
-    const meta = await metaResp.json();
-    const size = meta.size || (walkable ? 1024 : 256);
-    const span = meta.worldSpan || worldSpan;
-
-    let heights;
+  async function beat() {
+    if (!homeWorldId || busy) return;
+    busy = true;
+    const gen = generation;
+    let changed = false;
     try {
-      heights = await fetchHeightF32(tid, size, !walkable && (meta.quality === 'ghost' || quality === 'ghost'));
-    } catch {
-      if (walkable) {
-        // 1K may still be writing; keep ghost if present
+      const pos = getPlayerPos();
+      const resp = await fetch('/api/tiles/stream', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ homeWorldId, x: pos.x, z: pos.z }),
+      });
+      const st = await resp.json().catch(() => null);
+      if (gen !== generation) return;
+      if (!resp.ok || !st?.ok) {
+        // 400 / 404: this world cannot be tiled (not planet-synthesized, or deleted) - stop asking.
+        // Anything else (server restarting, dev proxy 5xx) is transient: keep the heartbeat going.
+        if (resp.status === 400 || resp.status === 404) stopTimer();
         return;
       }
-      throw new Error('ghost missing');
-    }
+      lastStatus = st;
+      if (!live) {
+        live = true;
+        changed = true;
+      }
+      if (recentre(pos)) changed = true;
 
-    if (!group) {
-      group = createGhostTileGroup();
-      scene.add(group);
-    }
-    removeMesh(prev);
-
-    const mesh = buildGhostTileMesh(heights, size, span, tile.qi, tile.qj, getVScale());
-    mesh.name = `${walkable ? 'walk' : 'ghost'}:${tid}`;
-    if (walkable) {
-      mesh.material.color.set('#7a9a6a');
-      mesh.material.opacity = 0.92;
-      mesh.material.flatShading = false;
-    }
-    group.add(mesh);
-
-    tiles.set(key, {
-      tileId: tid,
-      qi: tile.qi,
-      qj: tile.qj,
-      quality: walkable ? quality : 'ghost',
-      walkable: !!walkable,
-      heights,
-      size,
-      worldSpan: span,
-      mesh,
-    });
-    onWalkableChange?.(getWalkableTiles());
-  }
-
-  function getWalkableTiles() {
-    return [...tiles.values()].filter((t) => t.walkable);
-  }
-
-  /** Sample neighbor height in home-local XZ (viewer meters * before vScale). */
-  function sampleNeighborRaw(x, z) {
-    const span = worldSpan;
-    const qi = Math.floor((x + span * 0.5) / span);
-    const qj = Math.floor((z + span * 0.5) / span);
-    if (qi === 0 && qj === 0) return null;
-    const entry = tiles.get(tileKey(qi, qj));
-    if (!entry?.walkable || !entry.heights) return null;
-    const localX = x - qi * span;
-    const localZ = z - qj * span;
-    const size = entry.size;
-    const u = (localX / span + 0.5) * (size - 1);
-    const v = (localZ / span + 0.5) * (size - 1);
-    const x0 = Math.min(size - 1, Math.max(0, Math.floor(u)));
-    const z0 = Math.min(size - 1, Math.max(0, Math.floor(v)));
-    const x1 = Math.min(size - 1, x0 + 1);
-    const z1 = Math.min(size - 1, z0 + 1);
-    const tx = u - x0;
-    const tz = v - z0;
-    const h = entry.heights;
-    const a = h[z0 * size + x0] * (1 - tx) + h[z0 * size + x1] * tx;
-    const b = h[z1 * size + x0] * (1 - tx) + h[z1 * size + x1] * tx;
-    return a * (1 - tz) + b * tz;
-  }
-
-  function walkBounds() {
-    const span = worldSpan;
-    let minX = -span * 0.5;
-    let maxX = span * 0.5;
-    let minZ = -span * 0.5;
-    let maxZ = span * 0.5;
-    for (const t of getWalkableTiles()) {
-      minX = Math.min(minX, (t.qi - 0.5) * span);
-      maxX = Math.max(maxX, (t.qi + 0.5) * span);
-      minZ = Math.min(minZ, (t.qj - 0.5) * span);
-      maxZ = Math.max(maxZ, (t.qj + 0.5) * span);
-    }
-    const pad = 1;
-    return { minX: minX + pad, maxX: maxX - pad, minZ: minZ + pad, maxZ: maxZ - pad };
-  }
-
-  async function pollOnce() {
-    if (!homeWorldId) return;
-    try {
-      const resp = await fetch(`/api/tiles/status?homeWorldId=${encodeURIComponent(homeWorldId)}`, {
-        cache: 'no-store',
-      });
-      if (!resp.ok) return;
-      const st = await resp.json();
-      for (const tile of st.done || []) {
-        await upsertTile(tile);
+      for (const t of st.tiles || []) {
+        if (t.qi === 0 && t.qj === 0) continue;
+        if (Math.max(Math.abs(t.qi - centre.qi), Math.abs(t.qj - centre.qj)) > 1) continue;
+        const have = tiles.get(tileKey(t.qi, t.qj));
+        if (have && have.tileId === t.tileId && have.rev === t.rev) continue;
+        try {
+          const entry = await loadTile(t);
+          if (gen !== generation) return;
+          tiles.set(entry.key, entry);
+          changed = true;
+        } catch (err) {
+          // Usually a tile that is mid-write; the next heartbeat retries
+          console.warn('[tile-stream] load failed', t.tileId, err.message);
+        }
+      }
+      for (const [key, e] of tiles) {
+        if (key === tileKey(0, 0)) continue;
+        if (Math.max(Math.abs(e.qi - centre.qi), Math.abs(e.qj - centre.qj)) > KEEP_RING) {
+          tiles.delete(key);
+        }
       }
     } catch {
-      // Stage 2 offline
+      // Stage 2 server offline: the explorer keeps working on the home tile alone
+    } finally {
+      busy = false;
+      if (changed && gen === generation) onChange();
     }
   }
 
-  function start(meta) {
+  function stopTimer() {
+    if (timer) window.clearInterval(timer);
+    timer = null;
+  }
+
+  /**
+   * @param {object} homeMeta  the home world's meta JSON
+   * @param {{heights: Float32Array, masks: Uint8Array, climate: Uint8Array|null, rivers: object[], lakes: object[]}} home
+   */
+  function start(homeMeta, home) {
     stop();
-    if (!meta?.planetOrigin || !meta.id) return;
-    homeWorldId = meta.id;
-    worldSpan = meta.worldSpan || 4800;
-    const o = meta.planetOrigin;
-    fetch('/api/tiles/stream', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        homeWorldId,
-        seed: o.seed,
-        latDeg: o.latDeg,
-        lonDeg: o.lonDeg,
-        spanDeg: o.spanDeg || 46,
-        maxRing: 1,
-      }),
-    }).catch(() => {});
-    pollOnce();
-    pollId = window.setInterval(pollOnce, 2500);
+    if (!homeMeta?.planetOrigin || homeMeta.drillOrigin || homeMeta.tileOrigin) return;
+    homeWorldId = homeMeta.id;
+    worldSpan = homeMeta.worldSpan || 4800;
+    const size = homeMeta.size;
+    tiles.set(tileKey(0, 0), {
+      key: tileKey(0, 0),
+      qi: 0,
+      qj: 0,
+      tileId: homeMeta.id,
+      rev: 0,
+      quality: String(homeMeta.resolution || '2k').toLowerCase(),
+      ghost: false,
+      walkable: true,
+      meta: homeMeta,
+      rivers: home.rivers,
+      lakes: home.lakes,
+      version: ++version,
+      slot: prepareTileSlot(
+        { heights: home.heights, size, masks: home.masks, climate: home.climate, climateSize: homeMeta.climateSize || size },
+        ATLAS_TILE_N,
+        ATLAS_CLIM_N
+      ),
+    });
+    beat();
+    timer = window.setInterval(beat, HEARTBEAT_MS);
   }
 
   function stop() {
-    if (pollId) {
-      window.clearInterval(pollId);
-      pollId = null;
-    }
+    stopTimer();
+    generation++;
     homeWorldId = null;
+    live = false;
+    busy = false;
+    centre = { qi: 0, qj: 0 };
+    lastStatus = null;
     tiles.clear();
-    if (group) {
-      scene.remove(group);
-      disposeGhostTileGroup(group);
-      group = null;
-    }
-    onWalkableChange?.([]);
   }
 
-  function setVScale(_v) {
-    tiles.clear();
-    if (group) {
-      scene.remove(group);
-      disposeGhostTileGroup(group);
-      group = null;
-    }
-    pollOnce();
+  /** True once the server has confirmed a stream for this world. */
+  function isLive() {
+    return live;
   }
 
-  return {
-    start,
-    stop,
-    setVScale,
-    pollOnce,
-    sampleNeighborRaw,
-    walkBounds,
-    getWalkableTiles,
-  };
+  /** The 3×3 window to stitch: centre tile + every loaded tile within one ring of it. */
+  function getWindow() {
+    const win = new Map();
+    for (const [key, e] of tiles) {
+      if (Math.max(Math.abs(e.qi - centre.qi), Math.abs(e.qj - centre.qj)) <= 1) win.set(key, e);
+    }
+    return { centerQi: centre.qi, centerQj: centre.qj, tiles: win };
+  }
+
+  function isWalkable(x, z) {
+    const { qi, qj } = tileAt(worldSpan, x, z);
+    if (Math.max(Math.abs(qi - centre.qi), Math.abs(qj - centre.qj)) > 1) return false;
+    return Boolean(tiles.get(tileKey(qi, qj))?.walkable);
+  }
+
+  /** One-line progress for the HUD, or '' when there is nothing to say. */
+  function describe() {
+    if (!live || !lastStatus) return '';
+    const pos = getPlayerPos();
+    const p = tileAt(worldSpan, pos.x, pos.z);
+    let real = 0;
+    let total = 0;
+    for (let dj = -1; dj <= 1; dj++) {
+      for (let di = -1; di <= 1; di++) {
+        total++;
+        if (tiles.get(tileKey(p.qi + di, p.qj + dj))?.walkable) real++;
+      }
+    }
+    const a = lastStatus.active;
+    const where = p.qi === 0 && p.qj === 0 ? 'home tile' : `tile ${p.qi},${p.qj}`;
+    const work = a ? ` · synthesizing ${a.qi},${a.qj}` : real < total ? ' · queued' : '';
+    return `${where} · ${real}/${total} nearby tiles ready${work}`;
+  }
+
+  return { start, stop, isLive, getWindow, isWalkable, describe, tileN: ATLAS_TILE_N, climN: ATLAS_CLIM_N };
 }

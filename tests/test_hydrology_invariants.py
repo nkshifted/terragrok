@@ -103,3 +103,43 @@ def test_plains_landmark_prefers_map_center():
     # Should be near center, not near the corner peak
     assert 0.35 < px < 0.65
     assert 0.35 < pz < 0.65
+
+
+def _valley_plain(n: int = 128) -> np.ndarray:
+    """Landlocked plain tilting east with a shallow valley along the middle row."""
+    yy, xx = np.mgrid[0:n, 0:n].astype(np.float32)
+    return (120.0 - 0.6 * xx + 0.05 * np.abs(yy - n / 2) ** 1.5).astype(np.float32)
+
+
+def test_inflow_from_a_neighbour_tile_continues_as_a_river_to_the_far_edge():
+    n = 128
+    elev = _valley_plain(n)
+    runoff = np.full((n, n), 0.4, dtype=np.float32)
+    _, riv, _, lakes, rivers = solve_physical_hydrology(
+        elev=elev,
+        world_span_m=4800.0,
+        max_spring_rivers=0,  # arid tile: nothing of its own
+        max_lakes=0,
+        runoff_map=runoff,
+        inflows=[(n // 2, 1, 5.0e6)],
+    )
+    assert lakes == []
+    assert [r["source"] for r in rivers] == ["inflow"]
+    river = rivers[0]
+    assert river["dest"] == "edge"
+    assert river["points"][0][0] < -2300.0, "starts where the neighbour's river enters (west edge)"
+    assert river["points"][-1][0] > 2300.0, "runs out through the east edge"
+    assert river["q"] >= 5.0e6
+    assert riv.max() > 0
+
+
+def test_without_inflow_the_same_arid_tile_stays_dry():
+    n = 128
+    _, _, _, lakes, rivers = solve_physical_hydrology(
+        elev=_valley_plain(n),
+        world_span_m=4800.0,
+        max_spring_rivers=0,
+        max_lakes=0,
+        runoff_map=np.full((n, n), 0.4, dtype=np.float32),
+    )
+    assert lakes == [] and rivers == []

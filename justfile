@@ -4,11 +4,17 @@ set shell := ["mise", "exec", "--", "bash", "-euo", "pipefail", "-c"]
 default:
     @just --list
 
-# Install mise tools & Python dependencies
+# Install mise tools, Python + viewer dependencies, and the Terrain Diffusion model code
 setup:
     mise trust
     mise install
     uv sync
+    cd viewer && npm ci
+    just vendor
+
+# Clone the pinned Terrain Diffusion code into .vendor/ (git worktrees reuse the main checkout's copy)
+vendor rev="e8dcb4b1a834ab2f6b1a6f5256ed7c9f2f3e8230":
+    python experiments/paths.py --check || (git clone https://github.com/xandergos/terrain-diffusion.git .vendor/terrain-diffusion && git -C .vendor/terrain-diffusion checkout --quiet {{rev}})
 
 # Run all 4 terraforming experiments
 all: geogenesis terrain-gen fastscape whitebox
@@ -60,6 +66,7 @@ dev:
 # Fast invariant / regression tests (no MPS / no diffusion model required)
 test:
     uv run --with pytest pytest tests/ -q
+    cd viewer && node --test "tests/*.test.mjs"
 
 # Remove generated outputs
 clean:

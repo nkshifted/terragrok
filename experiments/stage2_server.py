@@ -13,7 +13,6 @@ Run via:
 from __future__ import annotations
 
 import argparse
-import base64
 import gc
 import itertools
 import json
@@ -32,8 +31,11 @@ import torch
 from scipy.ndimage import gaussian_filter, zoom
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO_ROOT / ".vendor" / "terrain-diffusion"))
 sys.path.insert(0, str(REPO_ROOT / "experiments"))
+
+from paths import VENDOR_TD, add_vendor_to_syspath  # noqa: E402
+
+add_vendor_to_syspath()
 
 from terrain_diffusion.inference.world_pipeline import WorldPipeline  # noqa: E402
 from export_viewer_worlds import (  # noqa: E402
@@ -50,16 +52,28 @@ from world_cache import (  # noqa: E402
     patch_cached_world,
     prune_unbookmarked_worlds,
 )
-from tile_ghost import write_ghost_tile  # noqa: E402
+from chart import (  # noqa: E402
+    GHOST_SIZE,
+    chart_from_home_meta,
+    chart_seed,
+    coarse_size_for,
+    collect_edge_inflows,
+    decode_f32,
+    dem_to_viewer,
+    estimate_home_v_scale,
+    relief_v_scale,
+    run_stage1_patch,
+)
+from tile_ghost import list_tiles_for_home, write_ghost_tile  # noqa: E402
+from tile_grid import chart_tile_id  # noqa: E402
 from tile_stream import TILE_STREAMS  # noqa: E402
+from world_cache import CATALOG_LOCK, load_synth_catalog, save_synth_catalog  # noqa: E402
 
 # Back-compat alias used throughout this module
 _compute_biome_hydrology_profile = compute_biome_hydrology_profile
 
 
-def _decode_f32(b64_str: str, shape: tuple[int, int]) -> np.ndarray:
-    raw = base64.b64decode(b64_str)
-    return np.frombuffer(raw, dtype=np.float32).copy().reshape(shape)
+_decode_f32 = decode_f32
 
 
 def _format_coord_slug(lat_deg: float, lon_deg: float) -> str:
@@ -84,9 +98,11 @@ def _apply_biome_surface_refinement(
     precip_mm: np.ndarray,
     world_span_m: float,
     seed: int,
+    origin_px: tuple[float, float] = (0.0, 0.0),
 ) -> np.ndarray:
     """
-    Biome-aware micro-terrain refinement:
+    Biome-aware micro-terrain refinement (`origin_px` keeps procedural detail continuous
+    across the tiles of one chart):
       - Hot arid deserts: smooth wind-sculpted sand dune ripples instead of rocky alpine chatter
       - Polar glaciers: sweeping smooth glacial snowfields & crevasse swells
       - Temperate / alpine / coastal rock: crag & gully micro-detail at 1K (at 2K/4K Terrain Diffusion
@@ -94,7 +110,9 @@ def _apply_biome_surface_refinement(
     """
     ny, nx = elev_viewer.shape
     if nx <= 1024:
-        craggy = apply_micro_detail_refinement(elev_viewer, world_span_m=world_span_m, seed=seed)
+        craggy = apply_micro_detail_refinement(
+            elev_viewer, world_span_m=world_span_m, seed=seed, origin_px=origin_px
+        )
     else:
         craggy = elev_viewer.copy()
 
@@ -105,6 +123,8 @@ def _apply_biome_surface_refinement(
     out = craggy
     if float(desert_w.max()) > 0.05:
         yy, xx = np.mgrid[0:ny, 0:nx].astype(np.float32)
+        xx += np.float32(origin_px[0])
+        yy += np.float32(origin_px[1])
         # Wind-sculpted barchan/transverse dune waves at 2 natural scales
         ang = (seed % 360) * np.pi / 180.0
         cell_m = world_span_m / max(nx, 1)
@@ -137,8 +157,12 @@ def solve_hydrology_multires(
     world_span_m: float,
     hydro_prof: dict,
     min_lake_depth_m: float = 0.55,
+    inflows: list[dict] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, list, list, int]:
     """
+    `inflows`: rivers entering from neighbouring tiles, as {edge: W|E|N|S, t: 0..1 along that
+    edge (north->south or west->east), q: discharge or None}; see chart.collect_edge_inflows.
+
     Fast multi-resolution physical hydrology:
       - For <= 1024x1024: solves Landlab LakeMapperBarnes + Fastscapelib directly on native grid.
       - For 2048x2048 / 4096x4096: solves exact lake/river topology on a 1024x1024 grid (~5s instead
@@ -147,6 +171,12 @@ def solve_hydrology_multires(
     Returns: (carved, riv_u8, lak_u8, lakes_data, rivers_data, lake_grid_size)
     """
     out_n = elev.shape[0]
+    hn = min(out_n, 1024)
+    cells = []
+    for f in inflows or []:
+        k = int(np.clip(round(float(f["t"]) * (hn - 1)), 1, hn - 2))
+        rc = {"W": (k, 1), "E": (k, hn - 2), "N": (1, k), "S": (hn - 2, k)}[f["edge"]]
+        cells.append((rc[0], rc[1], f.get("q")))
     if out_n <= 1024:
         carved, riv_u8, lak_u8, lakes_data, rivers_data = solve_physical_hydrology(
             elev=elev,
@@ -157,6 +187,7 @@ def solve_hydrology_multires(
             runoff_map=hydro_prof["runoff_map"],
             max_lakes=hydro_prof["max_lakes"],
             min_lake_runoff=hydro_prof["min_lake_runoff"],
+            inflows=cells,
         )
         return carved, riv_u8, lak_u8, lakes_data, rivers_data, out_n
 
@@ -176,6 +207,7 @@ def solve_hydrology_multires(
         runoff_map=runoff_1k,
         max_lakes=hydro_prof["max_lakes"],
         min_lake_runoff=hydro_prof["min_lake_runoff"],
+        inflows=cells,
     )
 
     if len(lakes_data) == 0 and len(rivers_data) == 0:
@@ -322,7 +354,8 @@ class WarmStage2Engine:
         self.ready = False
         self.load_error: str | None = None
         self.lock = threading.Lock()
-        # PriorityQueue: 0 = interactive synthesize/drilldown, 10 = background tile synth
+        # Interactive synthesize / drilldown jobs. Background chart tiles are not queued:
+        # the worker asks the tile-stream planner for the nearest missing tile when idle.
         self._job_queue: queue.PriorityQueue = queue.PriorityQueue()
         self._job_seq = itertools.count()
         self.status = {
@@ -343,36 +376,136 @@ class WarmStage2Engine:
     def _worker_loop(self):
         self.load_model()
         while True:
-            _prio, _seq, kind, payload, done_evt, holder = self._job_queue.get()
+            try:
+                _prio, _seq, kind, payload, done_evt, holder = self._job_queue.get(timeout=0.5)
+            except queue.Empty:
+                if self.ready:
+                    job = TILE_STREAMS.next_synth_job()
+                    if job:
+                        self._run_tile_job(job)
+                continue
             try:
                 if kind == "drilldown":
                     holder["result"] = self._drilldown_on_worker(payload)
                 else:
                     holder["result"] = self._synthesize_on_worker(payload)
-                    if kind == "tile_synth" and holder.get("result", {}).get("ok"):
-                        to = payload.get("tileOrigin") or {}
-                        home = to.get("homeWorldId")
-                        if home:
-                            TILE_STREAMS.mark_synth_done(
-                                home,
-                                holder["result"]["worldId"],
-                                {
-                                    "qi": to.get("qi"),
-                                    "qj": to.get("qj"),
-                                    "ring": to.get("ring"),
-                                    "quality": holder["result"].get("resolution", "1K").lower(),
-                                    "latDeg": payload.get("latDeg"),
-                                    "lonDeg": payload.get("lonDeg"),
-                                },
-                            )
             except Exception as exc:
                 holder["error"] = exc
-                if kind == "tile_synth":
-                    print(f"[Stage2] Background tile synth failed: {exc}", flush=True)
             finally:
                 if done_evt is not None:
                     done_evt.set()
                 self._job_queue.task_done()
+
+    # ---------- Chart tile stream ----------
+    def _run_tile_job(self, job: dict) -> None:
+        """Synthesize one streamed chart tile as a shifted window of the home's diffusion world."""
+        home, qi, qj, tile_id = job["homeWorldId"], job["qi"], job["qj"], job["tileId"]
+        chart = job["chart"]
+        try:
+            patch = run_stage1_patch(
+                chart, [{"qi": qi, "qj": qj, "coarseSize": coarse_size_for(job["resolution"]), "margin": True}]
+            )[0]
+            payload = {
+                **{k: v for k, v in patch.items() if k not in ("qi", "qj")},
+                "seed": chart["seed"],
+                "archetype": chart["archetype"],
+                "climateMode": chart["climateMode"],
+                "seaLevelBias": chart["seaLevelBias"],
+                "reliefScale": chart["reliefScale"],
+                "spanDeg": chart["spanDeg"],
+                "resolution": job["resolution"],
+                "quality": chart["quality"],
+                "fidelity": chart["fidelity"],
+                "forceWorldId": tile_id,
+                # Rivers that reach a shared edge in tiles already on disk continue into this one
+                "inflows": collect_edge_inflows(home, qi, qj, load_synth_catalog(), VIEWER_WORLDS_DIR, chart["worldSpan"]),
+                "chart": {
+                    "homeWorldId": home,
+                    "homeLatDeg": chart["homeLatDeg"],
+                    "homeLonDeg": chart["homeLonDeg"],
+                    "qi": qi,
+                    "qj": qj,
+                    "vScale": chart["vScale"],
+                },
+            }
+            result = self._synthesize_on_worker(payload)
+            TILE_STREAMS.mark_tile(home, qi, qj, result["worldId"], result["resolution"])
+            print(f"[TileStream] {tile_id} ready ({result['resolution']}, {result['totalSec']}s)", flush=True)
+        except Exception as exc:
+            TILE_STREAMS.mark_failed(home, qi, qj)
+            self.status.update({"busy": False, "phase": "idle", "message": f"Tile {qi},{qj} failed: {exc}"})
+            print(f"[TileStream] {tile_id} FAILED: {exc}", flush=True)
+
+    def open_tile_stream(self, home_world_id: str) -> None:
+        """Create the planner session for a home world (idempotent)."""
+        if TILE_STREAMS.has_session(home_world_id):
+            return
+        meta_path = VIEWER_WORLDS_DIR / f"{home_world_id}.json"
+        if not meta_path.exists():
+            raise FileNotFoundError(f"World not found: {home_world_id}")
+        meta = json.loads(meta_path.read_text())
+        chart = chart_from_home_meta(meta)
+        if chart["vScale"] is None:
+            # Home predates recorded vertical scale: recover it once and persist it
+            ref = run_stage1_patch(chart, [{"qi": 0, "qj": 0, "coarseSize": 8}])[0]
+            n = int(meta["size"])
+            heights = np.fromfile(VIEWER_WORLDS_DIR / f"{home_world_id}.height.f32", dtype=np.float32).reshape(n, n)
+            chart["vScale"] = estimate_home_v_scale(heights, decode_f32(ref["refElev"], (ref["refSize"],) * 2))
+            meta["vScale"] = round(chart["vScale"], 5)
+            meta["vScaleEstimated"] = True
+            with CATALOG_LOCK:
+                meta_path.write_text(json.dumps(meta, indent=2))
+                catalog = load_synth_catalog()
+                for e in catalog:
+                    if e.get("id") == home_world_id:
+                        e["vScale"] = meta["vScale"]
+                        e["vScaleEstimated"] = True
+                save_synth_catalog(catalog)
+            print(f"[TileStream] {home_world_id}: estimated vScale={chart['vScale']:.4f}", flush=True)
+        TILE_STREAMS.open_session(home_world_id, chart, list_tiles_for_home(home_world_id))
+        print(
+            f"[TileStream] Stream open for {home_world_id} "
+            f"(tiles at {chart['tileResolution']}, vScale={chart['vScale']:.4f})",
+            flush=True,
+        )
+
+    def bake_ghosts_async(self, home_world_id: str) -> None:
+        """Bake Stage-1 ghost tiles around the player off the MPS thread (cheap, no model)."""
+        batch = TILE_STREAMS.claim_ghost_batch(home_world_id)
+        if not batch:
+            return
+
+        def work():
+            try:
+                chart = TILE_STREAMS.chart(home_world_id)
+                patches = run_stage1_patch(chart, [{"qi": qi, "qj": qj, "ghostSize": GHOST_SIZE} for qi, qj in batch])
+                for pt in patches:
+                    qi, qj = int(pt["qi"]), int(pt["qj"])
+                    elev = dem_to_viewer(decode_f32(pt["ghostElev"], (GHOST_SIZE, GHOST_SIZE)), chart["vScale"])
+                    tid = chart_tile_id(home_world_id, qi, qj)
+                    with CATALOG_LOCK:
+                        res = write_ghost_tile(
+                            elev,
+                            tile_id=tid,
+                            seed=chart["seed"],
+                            lat_deg=pt["latDeg"],
+                            lon_deg=pt["lonDeg"],
+                            span_deg=chart["spanDeg"],
+                            home_world_id=home_world_id,
+                            qi=qi,
+                            qj=qj,
+                            ring=max(abs(qi), abs(qj)),
+                            world_span_m=chart["worldSpan"],
+                        )
+                    if not res.get("skipped"):
+                        TILE_STREAMS.mark_tile(home_world_id, qi, qj, tid, "ghost")
+                print(f"[TileStream] {len(patches)} ghost tiles baked for {home_world_id}", flush=True)
+            except Exception as exc:
+                print(f"[TileStream] ghost bake failed: {exc}", flush=True)
+            finally:
+                TILE_STREAMS.release_ghost_batch(home_world_id)
+
+        threading.Thread(target=work, daemon=True, name="tile-ghosts").start()
 
     def synthesize(self, payload: dict) -> dict:
         if not self.ready or self.world is None:
@@ -395,21 +528,6 @@ class WarmStage2Engine:
         if "error" in holder:
             raise holder["error"]
         return holder["result"]
-
-    def enqueue_tile_synth(self, payload: dict) -> dict:
-        """Fire-and-forget 1K/2K neighbor synth (lower priority than interactive)."""
-        if not self.ready or self.world is None:
-            raise RuntimeError(self.load_error or "Terrain Diffusion 30m model is still warming up.")
-        self._put_job(10, "tile_synth", payload, None, {})
-        to = payload.get("tileOrigin") or {}
-        return {
-            "ok": True,
-            "queued": True,
-            "tileId": payload.get("forceWorldId"),
-            "homeWorldId": to.get("homeWorldId"),
-            "qi": to.get("qi"),
-            "qj": to.get("qj"),
-        }
 
     def load_model(self):
         t0 = time.perf_counter()
@@ -436,7 +554,7 @@ class WarmStage2Engine:
             world.set_cond_snr(self.cond_snr)
 
             prev_cwd = os.getcwd()
-            os.chdir(REPO_ROOT / ".vendor" / "terrain-diffusion")
+            os.chdir(VENDOR_TD)
             try:
                 world.bind(hdf5_file=None)
             finally:
@@ -494,23 +612,36 @@ class WarmStage2Engine:
             cond_temp_std = _decode_f32(payload["condTempStd"], (full_coarse, full_coarse))
             cond_precip = _decode_f32(payload["condPrecip"], (full_coarse, full_coarse))
             cond_precip_cv = _decode_f32(payload["condPrecipCv"], (full_coarse, full_coarse))
-            ref_elev = _decode_f32(payload["refElev"], (ref_size, ref_size))
-            ref_temp = _decode_f32(payload["refTemp"], (ref_size, ref_size))
-            ref_precip = _decode_f32(payload["refPrecip"], (ref_size, ref_size))
+            # Optional margin: synthesize a little beyond the tile and crop after the local
+            # filters, so their edge effects fall outside the tile and neighbours stay matched.
+            ref_pad = int(payload.get("refPad", 0))
+            ref_full = ref_size + 2 * ref_pad
+            ref_elev = _decode_f32(payload["refElev"], (ref_full, ref_full))
+            ref_temp = _decode_f32(payload["refTemp"], (ref_full, ref_full))
+            ref_precip = _decode_f32(payload["refPrecip"], (ref_full, ref_full))
 
-            # Deterministic unique diffusion seed per (planet seed, lat, lon)
-            td_seed = (
-                (seed * 73856093)
-                ^ (int(round((lat_deg + 90.0) * 10)) * 19349663)
-                ^ (int(round((lon_deg + 180.0) * 10)) * 83492791)
-            ) & 0x7FFFFFFF
+            # One diffusion world per chart: the seed comes from the HOME patch, and a streamed
+            # tile (qi east, qj south) is the same world's window shifted by whole tiles. The
+            # model seeds its noise by world coordinate, so neighbouring windows agree at edges.
+            chart = payload.get("chart") or {}
+            chart_qi = int(chart.get("qi", 0))
+            chart_qj = int(chart.get("qj", 0))
+            td_seed = chart_seed(
+                seed,
+                float(chart.get("homeLatDeg", lat_deg)),
+                float(chart.get("homeLonDeg", lon_deg)),
+            )
+            cond_oi = chart_qj * coarse_size
+            cond_oj = chart_qi * coarse_size
 
             px_per_raw_cell = 256 // self.coarse_pooling
-            pi1 = padding * px_per_raw_cell
-            pi2 = (padding + coarse_size) * px_per_raw_cell
-            pj1 = padding * px_per_raw_cell
-            pj2 = (padding + coarse_size) * px_per_raw_cell
+            pi1 = (padding + cond_oi) * px_per_raw_cell
+            pi2 = (padding + cond_oi + coarse_size) * px_per_raw_cell
+            pj1 = (padding + cond_oj) * px_per_raw_cell
+            pj2 = (padding + cond_oj + coarse_size) * px_per_raw_cell
             out_n = pi2 - pi1
+            margin = (ref_pad * out_n) // ref_size
+            pad_n = out_n + 2 * margin
 
             self.status.update(
                 {
@@ -529,20 +660,20 @@ class WarmStage2Engine:
             self.world.onestep_latent = quality == "fast"
 
             prev_cwd = os.getcwd()
-            os.chdir(REPO_ROOT / ".vendor" / "terrain-diffusion")
+            os.chdir(VENDOR_TD)
             try:
                 # Batch-update all 5 tectonic conditioning channels & reset tile cache cleanly!
-                self.world.set_custom_conditioning_import(0, cond_elev, 0, 0, default_value=-1500.0, rebuild=False)
-                self.world.set_custom_conditioning_import(1, cond_temp, 0, 0, default_value=12.0, rebuild=False)
-                self.world.set_custom_conditioning_import(2, cond_temp_std, 0, 0, default_value=600.0, rebuild=False)
-                self.world.set_custom_conditioning_import(3, cond_precip, 0, 0, default_value=900.0, rebuild=False)
-                self.world.set_custom_conditioning_import(4, cond_precip_cv, 0, 0, default_value=35.0, rebuild=False)
+                self.world.set_custom_conditioning_import(0, cond_elev, cond_oi, cond_oj, default_value=-1500.0, rebuild=False)
+                self.world.set_custom_conditioning_import(1, cond_temp, cond_oi, cond_oj, default_value=12.0, rebuild=False)
+                self.world.set_custom_conditioning_import(2, cond_temp_std, cond_oi, cond_oj, default_value=600.0, rebuild=False)
+                self.world.set_custom_conditioning_import(3, cond_precip, cond_oi, cond_oj, default_value=900.0, rebuild=False)
+                self.world.set_custom_conditioning_import(4, cond_precip_cv, cond_oi, cond_oj, default_value=35.0, rebuild=False)
                 self.world.seed = td_seed
                 self.world.rebuild()
 
                 t_gen0 = time.perf_counter()
                 with torch.no_grad():
-                    res = self.world.get(pi1, pj1, pi2, pj2, with_climate=True)
+                    res = self.world.get(pi1 - margin, pj1 - margin, pi2 + margin, pj2 + margin, with_climate=True)
                 if self.device == "mps":
                     torch.mps.synchronize()
                 t_gen = time.perf_counter() - t_gen0
@@ -558,7 +689,7 @@ class WarmStage2Engine:
 
             # Fidelity metrics & optional Laplacian Coastline Lock vs Stage 1 tectonic reference
             fidelity = str(payload.get("fidelity", "exact")).lower()
-            ref_up = zoom(ref_elev, out_n / ref_size, order=3).astype(np.float32)
+            ref_up = zoom(ref_elev, pad_n / ref_full, order=3).astype(np.float32)
             elev_fused = fuse_laplacian_coastline(elev_raw, ref_up, fidelity=fidelity)
 
             ref_land = ref_up > 0.0
@@ -583,18 +714,12 @@ class WarmStage2Engine:
             )
 
             world_span_m = 4800.0
-            land_mask = elev_fused > 0.0
-            max_land_m = float(np.percentile(elev_fused[land_mask], 99.6)) if land_mask.any() else 1000.0
             # True physical relief scaling: flat deserts & tundra plains stay gentle open plains,
             # while towering alpine ranges & volcanic arcs still rise dramatically to 340-430m!
-            v_scale = min(420.0 / max(max_land_m, 1550.0), 0.28)
-            elev_viewer = np.where(land_mask, elev_fused * v_scale, np.maximum(elev_fused * 0.05, -55.0)).astype(np.float32)
-            # Soft-knee extreme outlier peaks above 330m so tiny islets don't tower as vertical spires
-            elev_viewer = np.where(
-                elev_viewer > 330.0,
-                330.0 + 115.0 * np.tanh((elev_viewer - 330.0) / 150.0),
-                elev_viewer,
-            ).astype(np.float32)
+            # A chart has ONE vertical scale (set by its home patch): per-tile scales would turn
+            # every shared edge into a cliff. Peaks above 330 m are soft-kneed inside dem_to_viewer.
+            v_scale = float(chart["vScale"]) if chart.get("vScale") else relief_v_scale(elev_fused)
+            elev_viewer = dem_to_viewer(elev_fused, v_scale)
             # Talus / angle-of-repose relaxation (~52° max macro cliff) before micro-crag refinement
             repose_iters = 14 if out_n <= 1024 else (8 if out_n <= 2048 else 5)
             elev_viewer = _relax_angle_of_repose(
@@ -606,8 +731,8 @@ class WarmStage2Engine:
 
             # Preserve Stage 1 planetary climate mean EXACTLY, adding ONLY TD30m's zero-mean local spatial
             # anomaly so Sahara deserts stay bone-dry (<220mm) and polar glaciers stay genuinely frozen (<-5°C)!
-            ref_temp_up = zoom(ref_temp, out_n / ref_size, order=1).astype(np.float32)
-            ref_precip_up = zoom(ref_precip, out_n / ref_size, order=1).astype(np.float32)
+            ref_temp_up = zoom(ref_temp, pad_n / ref_full, order=1).astype(np.float32)
+            ref_precip_up = zoom(ref_precip, pad_n / ref_full, order=1).astype(np.float32)
             valid_t = np.isfinite(climate_raw[0])
             td_t_mean = float(np.mean(climate_raw[0][valid_t])) if valid_t.any() else 10.0
             td_t_anom = np.where(valid_t, (climate_raw[0] - td_t_mean) * 0.28, 0.0)
@@ -620,8 +745,19 @@ class WarmStage2Engine:
             t_season = np.where(np.isfinite(climate_raw[1]), np.abs(climate_raw[1]), 450.0).astype(np.float32)
 
             elev_refined = _apply_biome_surface_refinement(
-                elev_viewer, temp_c, precip_mm, world_span_m=world_span_m, seed=td_seed
+                elev_viewer,
+                temp_c,
+                precip_mm,
+                world_span_m=world_span_m * pad_n / out_n,
+                seed=td_seed,
+                origin_px=(float(pj1 - margin), float(pi1 - margin)),
             )
+            if margin > 0:
+                crop = slice(margin, margin + out_n)
+                elev_refined = np.ascontiguousarray(elev_refined[crop, crop])
+                temp_c = np.ascontiguousarray(temp_c[crop, crop])
+                precip_mm = np.ascontiguousarray(precip_mm[crop, crop])
+                t_season = np.ascontiguousarray(t_season[crop, crop])
 
             res_scale = (out_n / 512.0) ** 2
             hydro_prof = _compute_biome_hydrology_profile(elev_refined, temp_c, precip_mm, res_scale)
@@ -641,6 +777,7 @@ class WarmStage2Engine:
                 world_span_m=world_span_m,
                 hydro_prof=hydro_prof,
                 min_lake_depth_m=0.55,
+                inflows=payload.get("inflows"),
             )
             t_hydro = time.perf_counter() - t_h0
 
@@ -660,7 +797,7 @@ class WarmStage2Engine:
             # Background tile stream may force a stable tile_* id (replaces ghost meta)
             force_id = payload.get("forceWorldId")
             world_id = str(force_id) if force_id else f"planet_s{seed}_{safe_arch}_{coord_slug.lower()}_{res_tag.lower()}"
-            tile_origin = payload.get("tileOrigin")
+            is_chart_tile = bool(chart.get("homeWorldId"))
 
             VIEWER_WORLDS_DIR.mkdir(parents=True, exist_ok=True)
             # Curvature AO is a shading cue — compute at <=1024 then upsample for 2K/4K speed
@@ -728,32 +865,42 @@ class WarmStage2Engine:
                 "precipRange": precip_range,
                 "riverCount": len(rivers_data),
                 "lakeCount": len(lakes_data),
+                # Chart-wide vertical scale (DEM m -> viewer m); streamed tiles reuse the home's
+                "vScale": round(v_scale, 5),
                 "planetOrigin": {
                     "seed": seed,
                     "archetype": archetype,
                     "latDeg": round(lat_deg, 2),
                     "lonDeg": round(lon_deg, 2),
                     "spanDeg": round(span_deg, 1),
+                    # Everything needed to regenerate Stage 1 and re-enter this chart later
+                    "climateMode": str(payload.get("climateMode") or "earth"),
+                    "seaLevelBias": float(payload.get("seaLevelBias") or 0.0),
+                    "reliefScale": float(payload.get("reliefScale") or 1.0),
+                    "quality": quality,
+                    "fidelity": fidelity,
                 },
                 "landmarks": landmarks,
             }
-            if tile_origin:
+            if is_chart_tile:
                 world_meta["tileOrigin"] = {
-                    "homeWorldId": tile_origin.get("homeWorldId"),
-                    "qi": tile_origin.get("qi"),
-                    "qj": tile_origin.get("qj"),
-                    "ring": tile_origin.get("ring"),
+                    "homeWorldId": chart["homeWorldId"],
+                    "qi": chart_qi,
+                    "qj": chart_qj,
+                    "ring": max(abs(chart_qi), abs(chart_qj)),
                     "quality": res_tag.lower(),
+                    "scheme": "chart",
                 }
                 world_meta["quality"] = res_tag.lower()
-            (VIEWER_WORLDS_DIR / f"{world_id}.json").write_text(json.dumps(world_meta, indent=2))
 
             # Write dynamic Stage 2 regions into a gitignored catalog overlay so tracked catalog.json stays clean
-            synth_catalog_path = VIEWER_WORLDS_DIR / "synthesized_catalog.json"
-            synth_catalog = json.loads(synth_catalog_path.read_text()) if synth_catalog_path.exists() else []
-            synth_catalog = [w for w in synth_catalog if w["id"] != world_id]
-            synth_catalog.append(world_meta)
-            synth_catalog_path.write_text(json.dumps(synth_catalog, indent=2))
+            with CATALOG_LOCK:
+                (VIEWER_WORLDS_DIR / f"{world_id}.json").write_text(json.dumps(world_meta, indent=2))
+                synth_catalog = [w for w in load_synth_catalog() if w.get("id") != world_id]
+                synth_catalog.append(world_meta)
+                save_synth_catalog(synth_catalog)
+            # A real tile supersedes its Stage-1 ghost raster
+            (VIEWER_WORLDS_DIR / f"{world_id}.ghost.height.f32").unlink(missing_ok=True)
 
             total_s = time.perf_counter() - t0
             self.status.update(
@@ -931,7 +1078,7 @@ class WarmStage2Engine:
             )
 
             prev_cwd = os.getcwd()
-            os.chdir(REPO_ROOT / ".vendor" / "terrain-diffusion")
+            os.chdir(VENDOR_TD)
             try:
                 self.world.set_custom_conditioning_import(0, cond_elev, 0, 0, default_value=-360.0, rebuild=False)
                 self.world.set_custom_conditioning_import(1, cond_temp, 0, 0, default_value=10.0, rebuild=False)
@@ -1213,7 +1360,8 @@ def make_handler(engine: WarmStage2Engine):
                 if not home:
                     self._send_json(400, {"ok": False, "error": "homeWorldId required"})
                 else:
-                    self._send_json(200, TILE_STREAMS.status(home))
+                    st = TILE_STREAMS.status(home)
+                    self._send_json(200 if st.get("ok") else 404, st)
             else:
                 self._send_json(404, {"error": f"Unknown endpoint {path}"})
 
@@ -1225,75 +1373,31 @@ def make_handler(engine: WarmStage2Engine):
                     payload = self._read_json_body()
                     seed = payload.get("seed")
                     seed_i = int(seed) if seed not in (None, "") else None
-                    result = prune_unbookmarked_worlds(
-                        seed=seed_i,
-                        archetype=payload.get("archetype"),
-                    )
+                    with CATALOG_LOCK:
+                        result = prune_unbookmarked_worlds(
+                            seed=seed_i,
+                            archetype=payload.get("archetype"),
+                        )
                     self._send_json(200, result)
                 except Exception as exc:
                     self._send_json(500, {"ok": False, "error": str(exc)})
                 return
             if path == "/api/tiles/stream":
+                # Heartbeat from the explorer: player position (metres from the home centre).
+                # Keeps the stream alive, re-centres the wanted window and returns tile status.
                 try:
                     payload = self._read_json_body()
-                    result = TILE_STREAMS.start_stream(
-                        home_world_id=str(payload["homeWorldId"]),
-                        seed=int(payload["seed"]),
-                        lat_deg=float(payload["latDeg"]),
-                        lon_deg=float(payload["lonDeg"]),
-                        span_deg=float(payload.get("spanDeg", 46.0)),
-                        max_ring=int(payload.get("maxRing", 1)),
-                    )
-                    print(
-                        f"[Stage2] Tile stream {result['homeWorldId']}: "
-                        f"{len(result['neighbors'])} neighbors, {len(result['pendingGhost'])} ghosts pending",
-                        flush=True,
-                    )
-                    self._send_json(200, result)
-                except Exception as exc:
-                    self._send_json(500, {"ok": False, "error": str(exc)})
-                return
-            if path == "/api/tiles/ghost":
-                try:
-                    payload = self._read_json_body()
-                    size = int(payload.get("size", 256))
-                    elev = _decode_f32(payload["elev"], (size, size))
-                    # Scale Stage-1 DEM-ish meters into viewer relief (~same as synth v_scale ballpark)
-                    land = elev > 0
-                    if land.any():
-                        peak = float(np.percentile(elev[land], 99.0))
-                        v_scale = min(420.0 / max(peak, 1550.0), 0.28)
-                    else:
-                        v_scale = 0.2
-                    elev_viewer = np.where(land, elev * v_scale, np.maximum(elev * 0.05, -55.0)).astype(np.float32)
-                    result = write_ghost_tile(
-                        elev_viewer,
-                        seed=int(payload["seed"]),
-                        lat_deg=float(payload["latDeg"]),
-                        lon_deg=float(payload["lonDeg"]),
-                        span_deg=float(payload.get("spanDeg", 46.0)),
-                        home_world_id=str(payload["homeWorldId"]),
-                        qi=int(payload.get("qi", 0)),
-                        qj=int(payload.get("qj", 0)),
-                        ring=int(payload.get("ring", 1)),
-                        world_span_m=float(payload.get("worldSpan", 4800.0)),
-                    )
-                    TILE_STREAMS.mark_ghost_done(str(payload["homeWorldId"]), result["tileId"], result["world"])
-                    print(f"[Stage2] Ghost tile {result['tileId']} (ring {payload.get('ring', 1)})", flush=True)
-                    self._send_json(200, result)
-                except Exception as exc:
-                    self._send_json(500, {"ok": False, "error": str(exc)})
-                return
-            if path == "/api/tiles/enqueue":
-                try:
-                    payload = self._read_json_body()
-                    result = engine.enqueue_tile_synth(payload)
-                    print(
-                        f"[Stage2] Queued tile synth {result.get('tileId')} "
-                        f"(qi={result.get('qi')}, qj={result.get('qj')})",
-                        flush=True,
-                    )
-                    self._send_json(200, result)
+                    home = str(payload["homeWorldId"])
+                    engine.open_tile_stream(home)
+                    span = float((TILE_STREAMS.chart(home) or {}).get("worldSpan") or 4800.0)
+                    TILE_STREAMS.touch(home, float(payload.get("x", 0.0)) / span, float(payload.get("z", 0.0)) / span)
+                    engine.bake_ghosts_async(home)
+                    self._send_json(200, TILE_STREAMS.status(home))
+                except FileNotFoundError as exc:
+                    self._send_json(404, {"ok": False, "error": str(exc)})
+                except ValueError as exc:
+                    # Not a planet-synthesized home world: there is no chart to stream
+                    self._send_json(400, {"ok": False, "error": str(exc)})
                 except Exception as exc:
                     self._send_json(500, {"ok": False, "error": str(exc)})
                 return
@@ -1323,7 +1427,10 @@ def make_handler(engine: WarmStage2Engine):
             qs = parse_qs(parsed.query)
             cascade = (qs.get("cascade", ["1"])[0] or "1") not in ("0", "false", "False")
             try:
-                result = delete_cached_world(world_id, cascade=cascade)
+                with CATALOG_LOCK:
+                    result = delete_cached_world(world_id, cascade=cascade)
+                for wid in result["deletedIds"]:
+                    TILE_STREAMS.forget(wid)
                 print(f"[Stage2] Deleted world {world_id} (cascade={cascade}) → {result['deletedIds']}", flush=True)
                 self._send_json(200, result)
             except FileNotFoundError as exc:
@@ -1341,7 +1448,8 @@ def make_handler(engine: WarmStage2Engine):
             world_id = unquote(m.group(1))
             try:
                 payload = self._read_json_body()
-                result = patch_cached_world(world_id, payload)
+                with CATALOG_LOCK:
+                    result = patch_cached_world(world_id, payload)
                 self._send_json(200, result)
             except FileNotFoundError as exc:
                 self._send_json(404, {"ok": False, "error": str(exc)})

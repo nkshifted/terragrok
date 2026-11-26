@@ -429,7 +429,9 @@ export function buildLakeSystem(lakesData, gridSize, worldSpan, heightFloatTex, 
     uniforms: {
       uHeightTex: { value: heightFloatTex },
       uMasks: { value: maskTex },
+      // Span and world-XZ centre of the height / mask textures (the seam atlas is larger than a tile)
       uWorldSpan: { value: worldSpan },
+      uTexOrigin: { value: new THREE.Vector2(0, 0) },
       uVScale: { value: 1.0 },
       uTime: { value: 0.0 },
       uSunDir: { value: new THREE.Vector3(0.65, 0.45, 0.45).normalize() },
@@ -456,6 +458,7 @@ export function buildLakeSystem(lakesData, gridSize, worldSpan, heightFloatTex, 
       uniform sampler2D uHeightTex;
       uniform sampler2D uMasks;
       uniform float uWorldSpan;
+      uniform vec2 uTexOrigin;
       uniform float uVScale;
       uniform float uTime;
       uniform vec3 uSunDir;
@@ -483,7 +486,7 @@ export function buildLakeSystem(lakesData, gridSize, worldSpan, heightFloatTex, 
 
       void main() {
         // Compute exact continuous water depth from Float32 heightmap
-        vec2 uv = vWorldPos.xz / uWorldSpan + 0.5;
+        vec2 uv = (vWorldPos.xz - uTexOrigin) / uWorldSpan + 0.5;
         uv.y = 1.0 - uv.y;
         float bedY = texture2D(uHeightTex, uv).r * uVScale;
         float waterY = vLevel * uVScale;

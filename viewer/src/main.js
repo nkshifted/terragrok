@@ -6,6 +6,14 @@ import { createGrassField } from './grass.js';
 import { buildWorldProps, updatePropsTransform } from './props.js';
 import { buildTerrainClipmapGeometry } from './clipmap.js';
 import { createTileStreamController } from './tileStream.js';
+import {
+  buildSeamAtlas,
+  sampleAtlasClimate,
+  sampleAtlasHeight,
+  sampleAtlasMasks,
+  seamOffsetAt,
+  tileAt,
+} from './seamAtlas.js';
 
 // ---------- Renderer & Scene ----------
 const canvas = document.getElementById('scene');
@@ -20,8 +28,18 @@ renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(56, window.innerWidth / window.innerHeight, 0.4, 20000);
 
-// Phase 1: ghost neighbor tiles beyond the home rim (not walkable yet)
+// ---------- Streamed chart tiles ----------
+// A world synthesized from the planet can grow: the Stage 2 server streams the tiles around the
+// player and the explorer stitches the 3×3 window under them into one seam atlas. While `atlas`
+// is set, terrain / water / grass / sampling all read it instead of the home tile's own rasters.
 let tileStream = null;
+/** @type {null | ReturnType<typeof buildSeamAtlas>} */
+let atlas = null;
+let atlasDirty = false;
+/** Per-tile rivers, lakes and props in atlas mode: key -> { sig, river, lake, props }. */
+const tileDecor = new Map();
+let homeMeanClimate = [128, 128, 128];
+let subtitleBase = '';
 
 // Lights (driving multi-tier trees, boulders & explorer character)
 const hemiLight = new THREE.HemisphereLight('#b9dcff', '#4b5a40', 0.92);
@@ -429,7 +447,8 @@ async function refreshCatalogData() {
     // ignore
   }
   const seenIds = new Set(baseCatalog.map((w) => w.id));
-  catalog = [...baseCatalog, ...synthCatalog.filter((w) => !seenIds.has(w.id))];
+  // Streamed tiles and ghosts belong to their home world; they are not worlds to open on their own
+  catalog = [...baseCatalog, ...synthCatalog.filter((w) => !seenIds.has(w.id) && !w.tileOrigin)];
   const select = document.getElementById('world-select');
   if (select) {
     const curVal = world?.meta?.id || select.value;
@@ -529,8 +548,8 @@ function pickTerrainAtNdc(ndcX, ndcY) {
   const d = pickRaycaster.ray.direction;
   if (d.y >= -1e-4) return null;
 
-  const halfSpan = walkHalfSpan();
-  const maxY = Math.max(world.meta.maxElev * state.vScale + 30, 60);
+  const bounds = worldBounds();
+  const maxY = Math.max(Math.max(world.meta.maxElev, atlas ? 460 : 0) * state.vScale + 30, 60);
   const tStart = Math.max(1.0, (maxY - o.y) / d.y);
   const tEnd = Math.min(20000, (-60 - o.y) / d.y);
   if (tEnd <= tStart) return null;
@@ -558,7 +577,7 @@ function pickTerrainAtNdc(ndcX, ndcY) {
       }
       const fx = o.x + d.x * hi;
       const fz = o.z + d.z * hi;
-      if (Math.abs(fx) > halfSpan || Math.abs(fz) > halfSpan) return null;
+      if (fx < bounds.minX || fx > bounds.maxX || fz < bounds.minZ || fz > bounds.maxZ) return null;
       const fy = Math.max(sampleHeight(fx, fz), 0);
       return new THREE.Vector3(fx, fy, fz);
     }
@@ -569,6 +588,8 @@ function pickTerrainAtNdc(ndcX, ndcY) {
 
 function relocateExplorerTo(x, z) {
   if (!world) return false;
+  // A pin dropped on a ghost / unsynthesized tile is ignored rather than snapped elsewhere
+  if (atlas && !canWalk(x, z)) return false;
   const { x: cx, z: cz } = clampToWalkable(x, z);
   const cy = Math.max(sampleHeight(cx, cz), 0.2);
   player.pos.set(cx, cy, cz);
@@ -660,26 +681,52 @@ canvas.addEventListener(
 );
 
 // ---------- Terrain Sampling / Walk Bounds ----------
-/** Playable bounds: home tile, expanded when Phase-2 1K neighbors commit. */
-function walkBounds() {
+/** Extent of everything drawn: the home tile, or the 3×3 seam atlas around the player. */
+function worldBounds() {
   if (!world) return { minX: 0, maxX: 0, minZ: 0, maxZ: 0 };
-  if (tileStream) return tileStream.walkBounds();
-  const lim = Math.max(0, world.meta.worldSpan * 0.5 - 1);
+  if (atlas) {
+    const h = atlas.meta.atlasSpan * 0.5;
+    const { centerX: cx, centerZ: cz } = atlas.meta;
+    return { minX: cx - h, maxX: cx + h, minZ: cz - h, maxZ: cz + h };
+  }
+  const lim = world.meta.worldSpan * 0.5;
   return { minX: -lim, maxX: lim, minZ: -lim, maxZ: lim };
 }
 
-function walkHalfSpan() {
-  if (!world) return 0;
-  const b = walkBounds();
-  return Math.max(b.maxX, -b.minX, b.maxZ, -b.minZ);
+function canWalk(x, z) {
+  if (!world) return false;
+  if (atlas) return tileStream.isWalkable(x, z);
+  const lim = world.meta.worldSpan * 0.5 - 1;
+  return Math.abs(x) <= lim && Math.abs(z) <= lim;
 }
 
+/** Nearest walkable spot: (x, z) itself, else clamped into the tile the player stands on. */
 function clampToWalkable(x, z) {
-  const b = walkBounds();
-  return {
-    x: THREE.MathUtils.clamp(x, b.minX, b.maxX),
-    z: THREE.MathUtils.clamp(z, b.minZ, b.maxZ),
-  };
+  if (!world) return { x, z };
+  const span = world.meta.worldSpan;
+  if (atlas) {
+    if (canWalk(x, z)) return { x, z };
+    const here = canWalk(player.pos.x, player.pos.z) ? tileAt(span, player.pos.x, player.pos.z) : { qi: 0, qj: 0 };
+    const lim = span * 0.5 - 1;
+    return {
+      x: THREE.MathUtils.clamp(x, here.qi * span - lim, here.qi * span + lim),
+      z: THREE.MathUtils.clamp(z, here.qj * span - lim, here.qj * span + lim),
+    };
+  }
+  const lim = Math.max(0, span * 0.5 - 1);
+  return { x: THREE.MathUtils.clamp(x, -lim, lim), z: THREE.MathUtils.clamp(z, -lim, lim) };
+}
+
+/** One walking step with wall-sliding against tiles that are not synthesized yet. */
+function resolveWalk(x, z, nextX, nextZ) {
+  if (!atlas) {
+    const c = clampToWalkable(nextX, nextZ);
+    return { x: c.x, z: c.z, blocked: c.x !== nextX || c.z !== nextZ };
+  }
+  if (canWalk(nextX, nextZ)) return { x: nextX, z: nextZ, blocked: false };
+  if (canWalk(nextX, z)) return { x: nextX, z, blocked: true };
+  if (canWalk(x, nextZ)) return { x, z: nextZ, blocked: true };
+  return { x, z, blocked: true };
 }
 
 function worldToGrid(x, z) {
@@ -694,12 +741,9 @@ function worldToGrid(x, z) {
 
 function sampleHeight(x, z) {
   if (!world) return 0;
-  const span = world.meta.worldSpan;
-  const half = span * 0.5;
-  // Phase 2: outside the home tile, sample walkable neighbor heightfields
-  if (tileStream && (Math.abs(x) > half - 1e-3 || Math.abs(z) > half - 1e-3)) {
-    const raw = tileStream.sampleNeighborRaw(x, z);
-    if (raw != null) return raw * state.vScale;
+  if (atlas) {
+    const raw = sampleAtlasHeight(atlas, x, z);
+    return (raw == null ? -30 : raw) * state.vScale;
   }
   const { size } = world.meta;
   const { u, v } = worldToGrid(x, z);
@@ -716,6 +760,237 @@ function sampleHeight(x, z) {
   return (a * (1 - ty) + b * ty) * state.vScale;
 }
 
+// ---------- Seam atlas (streamed tiles) ----------
+function makeAtlasTexture(data, size, format, type, linear) {
+  const tex = new THREE.DataTexture(data, size, size, format, type);
+  tex.flipY = true;
+  tex.minFilter = linear ? THREE.LinearFilter : THREE.NearestFilter;
+  tex.magFilter = linear ? THREE.LinearFilter : THREE.NearestFilter;
+  tex.needsUpdate = true;
+  return tex;
+}
+
+function replaceTextureData(tex, data) {
+  tex.image.data = data;
+  tex.needsUpdate = true;
+}
+
+/** Re-stitch the 3×3 window around the player and rebuild whatever decor it invalidated. */
+function rebuildChart() {
+  atlasDirty = false;
+  if (!world || !tileStream?.isLive() || !terrainMat) return;
+  const t0 = performance.now();
+  const win = tileStream.getWindow();
+  const span = world.meta.worldSpan;
+  const entering = !atlas;
+  atlas = buildSeamAtlas({
+    centerQi: win.centerQi,
+    centerQj: win.centerQj,
+    tiles: win.tiles,
+    tileN: tileStream.tileN,
+    climN: tileStream.climN,
+    worldSpan: span,
+    fallbackClimate: homeMeanClimate,
+  });
+  const { size: W, climateSize: CW, atlasSpan, centerX, centerZ } = atlas.meta;
+
+  if (entering) {
+    // Home-only rasters and decor give way to the atlas and per-tile decor
+    disposeHomeDecor();
+    heightFloatTex.dispose();
+    maskTex.dispose();
+    climateTex.dispose();
+    const hasFloatLinear = renderer.extensions.has('OES_texture_float_linear');
+    heightFloatTex = makeAtlasTexture(atlas.heights, W, THREE.RedFormat, THREE.FloatType, hasFloatLinear);
+    maskTex = makeAtlasTexture(atlas.masks, W, THREE.RGBAFormat, THREE.UnsignedByteType, true);
+    climateTex = makeAtlasTexture(atlas.climate, CW, THREE.RGBAFormat, THREE.UnsignedByteType, true);
+    terrainMesh.geometry.dispose();
+    terrainMesh.geometry = buildTerrainClipmapGeometry(atlasSpan, W, 128);
+  } else {
+    replaceTextureData(heightFloatTex, atlas.heights);
+    replaceTextureData(maskTex, atlas.masks);
+    replaceTextureData(climateTex, atlas.climate);
+  }
+
+  const tu = terrainMat.uniforms;
+  tu.uHeightTex.value = heightFloatTex;
+  tu.uMasks.value = maskTex;
+  tu.uClimate.value = climateTex;
+  tu.uHasClimate.value = 1;
+  tu.uWorldSpan.value = atlasSpan;
+  tu.uGridSize.value = W;
+  tu.uCellReg.value = 1;
+  tu.uTileOrigin.value.set(centerX, centerZ);
+
+  const wu = waterMat.uniforms;
+  wu.uHeightTex.value = heightFloatTex;
+  wu.uMasks.value = maskTex;
+  wu.uWorldSpan.value = atlasSpan;
+  wu.uGridSize.value = W;
+  wu.uCellReg.value = 1;
+  wu.uTexOrigin.value.set(centerX, centerZ);
+  waterMesh.position.set(centerX, 0, centerZ);
+  waterMesh.scale.setScalar((atlasSpan * 1.25) / (span * 1.6));
+  waterMesh.scale.y = 1;
+
+  if (grassObj) {
+    const gu = grassObj.material.uniforms;
+    gu.uHeightTex.value = heightFloatTex;
+    gu.uMasks.value = maskTex;
+    gu.uWorldSpan.value = atlasSpan;
+    gu.uTexOrigin.value.set(centerX, centerZ);
+  }
+
+  const built = rebuildTileDecor(win);
+  for (const d of tileDecor.values()) {
+    if (!d.lake) continue;
+    const lu = d.lake.material.uniforms;
+    lu.uHeightTex.value = heightFloatTex;
+    lu.uMasks.value = maskTex;
+    lu.uWorldSpan.value = atlasSpan;
+    lu.uTexOrigin.value.set(centerX, centerZ);
+  }
+  updateSun();
+  setStyleMode(state.styleMode);
+  syncFogDensity();
+  updatePropsTransformAll();
+  if (player.grounded) player.pos.y = Math.max(sampleHeight(player.pos.x, player.pos.z), 0.2);
+  console.info(
+    `[seam-atlas] centre ${win.centerQi},${win.centerQj} · ${win.tiles.size} tiles · ` +
+      `${built} decor rebuilt · ${(performance.now() - t0).toFixed(0)} ms`
+  );
+}
+
+function disposeDecor(d) {
+  if (d.river) {
+    scene.remove(d.river.mesh);
+    d.river.mesh.geometry.dispose();
+    d.river.material.dispose();
+  }
+  if (d.lake) {
+    scene.remove(d.lake.mesh);
+    d.lake.mesh.geometry.dispose();
+    d.lake.material.dispose();
+  }
+  if (d.props) {
+    scene.remove(d.props);
+    d.props.traverse((o) => {
+      if (o.geometry) o.geometry.dispose();
+      if (o.material) o.material.dispose();
+    });
+  }
+}
+
+function disposeHomeDecor() {
+  disposeDecor({ river: riverObj, lake: lakeObj, props: propsGroup });
+  riverObj = null;
+  lakeObj = null;
+  propsGroup = null;
+}
+
+function clearTileDecor() {
+  for (const d of tileDecor.values()) disposeDecor(d);
+  tileDecor.clear();
+}
+
+/**
+ * Rivers, lakes and props for every real tile in the window, positioned on the stitched
+ * surface. A tile is rebuilt only when it or a neighbour changed (neighbours move its seams).
+ */
+function rebuildTileDecor(win) {
+  const span = world.meta.worldSpan;
+  const surface = (x, z) => {
+    const h = sampleAtlasHeight(atlas, x, z);
+    return h == null ? 0 : h;
+  };
+  let built = 0;
+  for (const [key, d] of tileDecor) {
+    if (!win.tiles.has(key) || win.tiles.get(key).ghost) {
+      disposeDecor(d);
+      tileDecor.delete(key);
+    }
+  }
+  for (const [key, e] of win.tiles) {
+    if (e.ghost) continue;
+    let sig = `${e.version}`;
+    for (let dj = -1; dj <= 1; dj++) {
+      for (let di = -1; di <= 1; di++) {
+        if (di === 0 && dj === 0) continue;
+        sig += `|${win.tiles.get(`${e.qi + di},${e.qj + dj}`)?.version ?? '-'}`;
+      }
+    }
+    const prev = tileDecor.get(key);
+    if (prev?.sig === sig) continue;
+    if (prev) disposeDecor(prev);
+
+    const ox = e.qi * span;
+    const oz = e.qj * span;
+    const d = { sig, river: null, lake: null, props: null };
+
+    // River points are tile-local; move them into the world and onto the stitched surface
+    const rivers = (e.rivers || []).map((r) => {
+      const pts = (Array.isArray(r) ? r : r.points).map((p) => {
+        const x = p[0] + ox;
+        const z = p[1] + oz;
+        return [x, z, p[2] + seamOffsetAt(atlas, x, z), ...p.slice(3)];
+      });
+      return Array.isArray(r) ? pts : { ...r, points: pts };
+    });
+    if (rivers.length) {
+      d.river = buildRiverSystem(rivers, surface);
+      d.river.mesh.scale.y = state.vScale;
+      scene.add(d.river.mesh);
+    }
+
+    const lakes = (e.lakes || []).map((l) => ({ ...l, level: l.level + seamOffsetAt(atlas, l.cx + ox, l.cz + oz) }));
+    if (lakes.length) {
+      d.lake = buildLakeSystem(lakes, e.meta.lakeGridSize || e.meta.size, span, heightFloatTex, maskTex);
+      d.lake.mesh.position.set(ox, 0, oz);
+      d.lake.mesh.scale.y = state.vScale;
+      d.lake.material.uniforms.uVScale.value = state.vScale;
+      scene.add(d.lake.mesh);
+    }
+
+    d.props = buildWorldProps(
+      {
+        meta: { ...e.meta, size: tileStream.tileN, climateSize: tileStream.climN, hasClimate: Boolean(e.slot.climate) },
+        heights: e.slot.grid,
+        masks: e.slot.masks,
+        climate: e.slot.climate,
+      },
+      state.vScale,
+      { originX: ox, originZ: oz, surfaceAt: surface, seed: (4242 + e.qi * 7919 + e.qj * 104729) >>> 0 }
+    );
+    scene.add(d.props);
+
+    tileDecor.set(key, d);
+    built++;
+  }
+  return built;
+}
+
+function allRivers() {
+  const out = riverObj ? [riverObj] : [];
+  for (const d of tileDecor.values()) if (d.river) out.push(d.river);
+  return out;
+}
+
+function allLakes() {
+  const out = lakeObj ? [lakeObj] : [];
+  for (const d of tileDecor.values()) if (d.lake) out.push(d.lake);
+  return out;
+}
+
+function allProps() {
+  const out = propsGroup ? [propsGroup] : [];
+  for (const d of tileDecor.values()) if (d.props) out.push(d.props);
+  return out;
+}
+
+function updatePropsTransformAll() {
+  for (const g of allProps()) updatePropsTransform(g, state.vScale, state.camMode === 'diorama');
+}
+
 function sampleSlopeDeg(x, z) {
   const eps = 3.5;
   const hx = (sampleHeight(x + eps, z) - sampleHeight(x - eps, z)) / (2 * eps);
@@ -725,6 +1000,10 @@ function sampleSlopeDeg(x, z) {
 
 function sampleMasks(x, z) {
   if (!world) return { river: 0, lake: 0, curv: 0.5, moisture: 0.5 };
+  if (atlas) {
+    const m = sampleAtlasMasks(atlas, x, z) || [0, 0, 128, 128];
+    return { river: m[0] / 255, lake: m[1] / 255, curv: m[2] / 255, moisture: m[3] / 255 };
+  }
   const { size } = world.meta;
   const { u, v } = worldToGrid(x, z);
   const idx = (Math.round(v) * size + Math.round(u)) * 4;
@@ -739,20 +1018,33 @@ function sampleMasks(x, z) {
 function sampleClimate(x, z) {
   if (!world || !world.meta.hasClimate || !world.climate) return null;
   const { size, tempRange, precipRange } = world.meta;
-  const climateSize = world.meta.climateSize || size;
-  const { u, v } = worldToGrid(x, z);
-  // Climate may be packed at a coarser grid (e.g. 512 on 2K/4K worlds)
-  const cu = THREE.MathUtils.clamp((u / Math.max(size - 1, 1)) * (climateSize - 1), 0, climateSize - 1.001);
-  const cv = THREE.MathUtils.clamp((v / Math.max(size - 1, 1)) * (climateSize - 1), 0, climateSize - 1.001);
-  const idx = (Math.round(cv) * climateSize + Math.round(cu)) * 4;
-  const tempC = tempRange[0] + (world.climate[idx] / 255) * (tempRange[1] - tempRange[0]);
-  const precipMm = precipRange[0] + (world.climate[idx + 1] / 255) * (precipRange[1] - precipRange[0]);
+  let t;
+  let p;
+  if (atlas) {
+    const c = sampleAtlasClimate(atlas, x, z);
+    if (!c) return null;
+    [t, p] = c;
+  } else {
+    const climateSize = world.meta.climateSize || size;
+    const { u, v } = worldToGrid(x, z);
+    // Climate may be packed at a coarser grid (e.g. 512 on 2K/4K worlds)
+    const cu = THREE.MathUtils.clamp((u / Math.max(size - 1, 1)) * (climateSize - 1), 0, climateSize - 1.001);
+    const cv = THREE.MathUtils.clamp((v / Math.max(size - 1, 1)) * (climateSize - 1), 0, climateSize - 1.001);
+    const idx = (Math.round(cv) * climateSize + Math.round(cu)) * 4;
+    t = world.climate[idx];
+    p = world.climate[idx + 1];
+  }
+  const tempC = tempRange[0] + (t / 255) * (tempRange[1] - tempRange[0]);
+  const precipMm = precipRange[0] + (p / 255) * (precipRange[1] - precipRange[0]);
   return { tempC, precipMm };
 }
 
 // ---------- Dispose Helper ----------
 function disposeWorldScene() {
   if (tileStream) tileStream.stop();
+  atlas = null;
+  atlasDirty = false;
+  clearTileDecor();
   if (terrainMesh) {
     scene.remove(terrainMesh);
     terrainMesh.geometry.dispose();
@@ -829,7 +1121,8 @@ async function loadWorld(worldId) {
   const climate = climateBuf ? new Uint8Array(climateBuf) : null;
   world = { meta, heights, masks, climate, splines, lakes };
 
-  document.getElementById('world-subtitle').textContent = `${meta.subtitle} · ${lakes.length} lakes, ${splines.length} rivers`;
+  subtitleBase = `${meta.subtitle} · ${lakes.length} lakes, ${splines.length} rivers`;
+  document.getElementById('world-subtitle').textContent = subtitleBase;
   const sel = document.getElementById('world-select');
   if (sel) sel.value = worldId;
   syncWorldCacheActions();
@@ -967,17 +1260,29 @@ async function loadWorld(worldId) {
   rebuildDrillChildrenOverlay();
   rebuildDrillBoxOverlay();
 
+  // Planet-synthesized worlds grow: stream the tiles around the player from the Stage 2 server.
+  // (Demo worlds and drill-down children are not part of a planet chart; start() ignores them.)
   if (!tileStream) {
     tileStream = createTileStreamController({
-      scene,
-      getVScale: () => state.vScale,
-      onWalkableChange: () => {
-        // Bounds refresh on next movement frame via walkBounds()
+      onChange: () => {
+        atlasDirty = true;
       },
+      getPlayerPos: () => ({ x: player.pos.x, z: player.pos.z }),
     });
   }
-  if (meta.planetOrigin) tileStream.start(meta);
-  else tileStream.stop();
+  if (climate) {
+    const sum = [0, 0, 0];
+    const n = climate.length / 4;
+    for (let i = 0; i < climate.length; i += 4) {
+      sum[0] += climate[i];
+      sum[1] += climate[i + 1];
+      sum[2] += climate[i + 2];
+    }
+    homeMeanClimate = sum.map((v) => Math.round(v / n));
+  } else {
+    homeMeanClimate = [128, 128, 128];
+  }
+  tileStream.start(meta, { heights, masks, climate, rivers: splines, lakes });
 
   loader.classList.add('hidden');
 }
@@ -1017,8 +1322,8 @@ function syncFogDensity() {
   const fogVal = state.camMode === 'diorama' ? baseFog * 0.24 : baseFog;
   if (terrainMat) terrainMat.uniforms.uFogDensity.value = fogVal;
   if (waterMat) waterMat.uniforms.uFogDensity.value = fogVal;
-  if (riverObj) riverObj.material.uniforms.uFogDensity.value = fogVal;
-  if (lakeObj) lakeObj.material.uniforms.uFogDensity.value = fogVal;
+  for (const r of allRivers()) r.material.uniforms.uFogDensity.value = fogVal;
+  for (const l of allLakes()) l.material.uniforms.uFogDensity.value = fogVal;
 }
 
 function setCameraMode(mode) {
@@ -1058,23 +1363,23 @@ function setCameraMode(mode) {
   if (grassObj) grassObj.mesh.visible = state.styleMode === 0 && mode !== 'diorama';
   if (drillChildrenGroup) drillChildrenGroup.visible = mode === 'diorama';
   rebuildDrillBoxOverlay();
-  updatePropsTransform(propsGroup, state.vScale, mode === 'diorama');
+  updatePropsTransformAll();
 }
 
 function setStyleMode(styleIdx) {
   state.styleMode = styleIdx;
   if (terrainMat) terrainMat.uniforms.uStyleMode.value = styleIdx;
   if (waterMat) waterMat.uniforms.uStyleMode.value = styleIdx;
-  if (riverObj) {
-    riverObj.material.uniforms.uStyleMode.value = styleIdx;
-    riverObj.mesh.visible = styleIdx !== 2;
+  for (const r of allRivers()) {
+    r.material.uniforms.uStyleMode.value = styleIdx;
+    r.mesh.visible = styleIdx !== 2;
   }
-  if (lakeObj) {
-    lakeObj.material.uniforms.uStyleMode.value = styleIdx;
-    lakeObj.mesh.visible = styleIdx !== 2;
+  for (const l of allLakes()) {
+    l.material.uniforms.uStyleMode.value = styleIdx;
+    l.mesh.visible = styleIdx !== 2;
   }
   if (grassObj) grassObj.mesh.visible = styleIdx === 0 && state.camMode !== 'diorama';
-  if (propsGroup) propsGroup.visible = styleIdx !== 2;
+  for (const g of allProps()) g.visible = styleIdx !== 2;
   document.querySelectorAll('[data-style]').forEach((b) => b.classList.toggle('active', Number(b.dataset.style) === styleIdx));
 }
 
@@ -1112,13 +1417,9 @@ function updateSun() {
     waterMat.uniforms.uSunDir.value.copy(dir);
     waterMat.uniforms.uFogColor.value.copy(fogCol);
   }
-  if (riverObj) {
-    riverObj.material.uniforms.uSunDir.value.copy(dir);
-    riverObj.material.uniforms.uFogColor.value.copy(fogCol);
-  }
-  if (lakeObj) {
-    lakeObj.material.uniforms.uSunDir.value.copy(dir);
-    lakeObj.material.uniforms.uFogColor.value.copy(fogCol);
+  for (const o of [...allRivers(), ...allLakes()]) {
+    o.material.uniforms.uSunDir.value.copy(dir);
+    o.material.uniforms.uFogColor.value.copy(fogCol);
   }
   if (grassObj) {
     grassObj.material.uniforms.uSunDir.value.copy(dir);
@@ -1144,18 +1445,17 @@ document.getElementById('sun-slider').addEventListener('input', (e) => {
 document.getElementById('vscale-slider').addEventListener('input', (e) => {
   state.vScale = Number(e.target.value);
   document.getElementById('vscale-val').textContent = `${state.vScale.toFixed(2)}×`;
-  if (tileStream) tileStream.setVScale(state.vScale);
   // Clipmap height is displaced in-shader; mesh Y scale stays 1
   if (terrainMat) terrainMat.uniforms.uVScale.value = state.vScale;
   if (waterMat) waterMat.uniforms.uVScale.value = state.vScale;
-  if (riverObj) riverObj.mesh.scale.y = state.vScale;
-  if (lakeObj) {
-    lakeObj.mesh.scale.y = state.vScale;
-    lakeObj.material.uniforms.uVScale.value = state.vScale;
+  for (const r of allRivers()) r.mesh.scale.y = state.vScale;
+  for (const l of allLakes()) {
+    l.mesh.scale.y = state.vScale;
+    l.material.uniforms.uVScale.value = state.vScale;
   }
   if (grassObj) grassObj.material.uniforms.uVScale.value = state.vScale;
   if (world) player.pos.y = Math.max(sampleHeight(player.pos.x, player.pos.z), 0.2);
-  updatePropsTransform(propsGroup, state.vScale, state.camMode === 'diorama');
+  updatePropsTransformAll();
   rebuildDrillBoxOverlay();
   rebuildDrillChildrenOverlay();
 });
@@ -1251,7 +1551,7 @@ const elZone = document.getElementById('stat-zone');
 
 function updateMovement(dt) {
   if (!world) return;
-  const halfSpan = walkHalfSpan();
+  const bounds = worldBounds();
 
   const forwardInput = (keys.has('w') || keys.has('arrowup') ? 1 : 0) - (keys.has('s') || keys.has('arrowdown') ? 1 : 0);
   const rightInput = (keys.has('d') || keys.has('arrowright') ? 1 : 0) - (keys.has('a') || keys.has('arrowleft') ? 1 : 0);
@@ -1263,8 +1563,8 @@ function updateMovement(dt) {
     const right = new THREE.Vector3(Math.cos(camRig.dioramaYaw), 0, -Math.sin(camRig.dioramaYaw));
     camRig.dioramaCenter.addScaledVector(fwd, forwardInput * panSpeed * dt);
     camRig.dioramaCenter.addScaledVector(right, rightInput * panSpeed * dt);
-    camRig.dioramaCenter.x = THREE.MathUtils.clamp(camRig.dioramaCenter.x, -halfSpan, halfSpan);
-    camRig.dioramaCenter.z = THREE.MathUtils.clamp(camRig.dioramaCenter.z, -halfSpan, halfSpan);
+    camRig.dioramaCenter.x = THREE.MathUtils.clamp(camRig.dioramaCenter.x, bounds.minX, bounds.maxX);
+    camRig.dioramaCenter.z = THREE.MathUtils.clamp(camRig.dioramaCenter.z, bounds.minZ, bounds.maxZ);
     // Keep camera glide strictly on a level aerial plane (zero jumping up/down over ridges!)
     camRig.dioramaCenter.y = getDioramaPlaneY();
 
@@ -1340,10 +1640,10 @@ function updateMovement(dt) {
     move.addScaledVector(camFwd, forwardInput).addScaledVector(camRight, rightInput).normalize();
     const nextX = player.pos.x + move.x * speed * dt;
     const nextZ = player.pos.z + move.z * speed * dt;
-    const clamped = clampToWalkable(nextX, nextZ);
-    hitMapEdge = clamped.x !== nextX || clamped.z !== nextZ;
-    player.pos.x = clamped.x;
-    player.pos.z = clamped.z;
+    const step = resolveWalk(player.pos.x, player.pos.z, nextX, nextZ);
+    hitMapEdge = step.blocked;
+    player.pos.x = step.x;
+    player.pos.z = step.z;
     player.yaw = Math.atan2(move.x, move.z);
   }
 
@@ -1372,7 +1672,7 @@ function updateMovement(dt) {
   if (cape) cape.rotation.x = 0.2 + (moving ? 0.35 : 0.05) + Math.sin(t * 6) * 0.08;
 
   if (!player.grounded) player.activity = 'JUMPING';
-  else if (hitMapEdge && moving) player.activity = 'MAP EDGE';
+  else if (hitMapEdge && moving) player.activity = atlas ? 'TERRAIN LOADING' : 'MAP EDGE';
   else if (inWater) player.activity = m.river > 0.42 ? 'CROSSING RIVER' : 'WADING';
   else if (climbing) player.activity = 'CLIMBING';
   else if (moving) player.activity = sprint ? 'SPRINTING' : 'WALKING';
@@ -1448,6 +1748,12 @@ function updateTelemetry() {
     else if (m.moisture > 0.64) zone = 'Woodland Valley';
   }
   elZone.textContent = zone;
+
+  // Tile-stream progress rides along on the subtitle line
+  const stream = tileStream?.describe() || '';
+  const sub = stream ? `${subtitleBase} · ${stream}` : subtitleBase;
+  const elSub = document.getElementById('world-subtitle');
+  if (elSub && elSub.textContent !== sub) elSub.textContent = sub;
 }
 
 function animate() {
@@ -1455,6 +1761,8 @@ function animate() {
   const dt = Math.min(clock.getDelta(), 0.05);
   const t = clock.elapsedTime;
 
+  // Tiles landed or the player crossed into a new tile: re-stitch before this frame draws
+  if (atlasDirty) rebuildChart();
   updateMovement(dt);
 
   // Follow player with directional shadow frustum & 48K GPU grass ring
@@ -1469,8 +1777,8 @@ function animate() {
     terrainMat.uniforms.uFocusPos.value.copy(focus);
   }
   if (waterMat) waterMat.uniforms.uTime.value = t;
-  if (riverObj) riverObj.material.uniforms.uTime.value = t;
-  if (lakeObj) lakeObj.material.uniforms.uTime.value = t;
+  for (const r of allRivers()) r.material.uniforms.uTime.value = t;
+  for (const l of allLakes()) l.material.uniforms.uTime.value = t;
   if (grassObj) {
     grassObj.material.uniforms.uTime.value = t;
     grassObj.material.uniforms.uFocusPos.value.copy(focus);
@@ -1492,7 +1800,8 @@ async function init() {
     // No locally synthesized worlds yet
   }
   const seenIds = new Set(baseCatalog.map((w) => w.id));
-  catalog = [...baseCatalog, ...synthCatalog.filter((w) => !seenIds.has(w.id))];
+  // Streamed tiles and ghosts belong to their home world; they are not worlds to open on their own
+  catalog = [...baseCatalog, ...synthCatalog.filter((w) => !seenIds.has(w.id) && !w.tileOrigin)];
 
   const select = document.getElementById('world-select');
   select.innerHTML = catalog.map((w) => `<option value="${w.id}">${w.title}</option>`).join('');

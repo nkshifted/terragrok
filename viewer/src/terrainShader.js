@@ -35,6 +35,9 @@ export function createTerrainMaterial(
       uPrecipRange: { value: new THREE.Vector2(precipRange[0], precipRange[1]) },
       uWorldSpan: { value: worldSpan },
       uGridSize: { value: gridSize },
+      // 0: node-registered single world (first/last texel on the world edge)
+      // 1: cell-registered seam atlas (see seamAtlas.js)
+      uCellReg: { value: 0 },
       uSunDir: { value: new THREE.Vector3(0.65, 0.45, 0.45).normalize() },
       uFogColor: { value: new THREE.Color('#a8d0ea') },
       uMistColor: { value: new THREE.Color('#d2e4f0') },
@@ -44,6 +47,8 @@ export function createTerrainMaterial(
       uStyleMode: { value: 0 },
       uTime: { value: 0.0 },
       uFocusPos: { value: new THREE.Vector3(0, 0, 0) },
+      // World XZ of the height / mask / climate textures' centre (the seam atlas follows the player)
+      uTileOrigin: { value: new THREE.Vector2(0, 0) },
     },
     vertexShader: /* glsl */ `
       attribute vec4 aRingData; // (stepSize, snapPeriod, edgeSnapX, edgeSnapZ)
@@ -51,58 +56,75 @@ export function createTerrainMaterial(
       uniform sampler2D uHeightTex;
       uniform float uWorldSpan;
       uniform float uGridSize;
+      uniform float uCellReg;
       uniform float uVScale;
       uniform vec3 uFocusPos;
+      uniform vec2 uTileOrigin;
 
       varying vec2 vUv;
       varying vec3 vWorldPos;
       varying vec3 vNormalW;
       varying float vElevRaw;
 
-      vec2 xzToHeightUv(vec2 xz) {
-        vec2 uv = clamp(xz / uWorldSpan + 0.5, 0.0, 1.0);
-        uv.y = 1.0 - uv.y;
-        return (uv * (uGridSize - 1.0) + 0.5) / uGridSize;
+      vec2 atlasSpan() {
+        return vec2(uWorldSpan);
+      }
+      vec2 atlasGrid() {
+        return vec2(uGridSize);
       }
 
-      float sampleRawH(vec2 xz) {
-        return texture2D(uHeightTex, xzToHeightUv(xz)).r;
+      // xz is LOCAL to the tile/atlas (relative to uTileOrigin)
+      vec2 localToHeightUv(vec2 localXZ) {
+        vec2 span = atlasSpan();
+        vec2 grid = atlasGrid();
+        vec2 uv = clamp(localXZ / span + 0.5, 0.0, 1.0);
+        uv.y = 1.0 - uv.y;
+        return mix((uv * (grid - 1.0) + 0.5) / grid, uv, uCellReg);
+      }
+
+      float sampleRawH(vec2 localXZ) {
+        return texture2D(uHeightTex, localToHeightUv(localXZ)).r;
       }
 
       void main() {
         float stepSize = aRingData.x;
         float snapPeriod = max(aRingData.y, 1.0);
         vec2 edgeSnap = aRingData.zw;
+        // Clipmap covers a square of uWorldSpan; atlas may be rectangular inside it
         float halfSpan = uWorldSpan * 0.5;
+        vec2 span = atlasSpan();
+        vec2 halfAtlas = span * 0.5;
 
-        // Uniform-snap clipmap center: zero vertex swimming & 100% aligned ring borders!
-        vec2 ringCenter = floor(uFocusPos.xz / snapPeriod + 0.5) * snapPeriod;
-        vec2 rawXZ = ringCenter + position.xz;
-        vec2 wxz = clamp(rawXZ, -halfSpan, halfSpan);
+        // Uniform-snap clipmap center in LOCAL tile space
+        vec2 focusLocal = uFocusPos.xz - uTileOrigin;
+        vec2 ringCenter = floor(focusLocal / snapPeriod + 0.5) * snapPeriod;
+        vec2 rawLocal = ringCenter + position.xz;
+        vec2 localXZ = clamp(rawLocal, -halfSpan, halfSpan);
+        // Height samples clamp to atlas bounds
+        vec2 sampleXZ = clamp(localXZ, -halfAtlas, halfAtlas);
 
-        // Zero T-junction cracks: odd outer-edge vertices average their two adjacent even neighbors
         float hRaw;
         if (edgeSnap.x > 0.0 || edgeSnap.y > 0.0) {
-          vec2 xzA = clamp(rawXZ - edgeSnap, -halfSpan, halfSpan);
-          vec2 xzB = clamp(rawXZ + edgeSnap, -halfSpan, halfSpan);
+          vec2 xzA = clamp(rawLocal - edgeSnap, -halfAtlas, halfAtlas);
+          vec2 xzB = clamp(rawLocal + edgeSnap, -halfAtlas, halfAtlas);
           hRaw = 0.5 * (sampleRawH(xzA) + sampleRawH(xzB));
         } else {
-          hRaw = sampleRawH(wxz);
+          hRaw = sampleRawH(sampleXZ);
         }
 
-        vec2 planeUv = clamp(wxz / uWorldSpan + 0.5, 0.0, 1.0);
+        vec2 planeUv = clamp(sampleXZ / span + 0.5, 0.0, 1.0);
         planeUv.y = 1.0 - planeUv.y;
         vUv = planeUv;
         vElevRaw = hRaw;
 
-        vec3 worldP = vec3(wxz.x, hRaw * uVScale, wxz.y);
+        vec3 worldP = vec3(localXZ.x + uTileOrigin.x, hRaw * uVScale, localXZ.y + uTileOrigin.y);
         vWorldPos = worldP;
 
-        float eps = max(stepSize, uWorldSpan / max(uGridSize - 1.0, 1.0));
-        float hL = sampleRawH(clamp(wxz - vec2(eps, 0.0), -halfSpan, halfSpan)) * uVScale;
-        float hR = sampleRawH(clamp(wxz + vec2(eps, 0.0), -halfSpan, halfSpan)) * uVScale;
-        float hD = sampleRawH(clamp(wxz - vec2(0.0, eps), -halfSpan, halfSpan)) * uVScale;
-        float hU = sampleRawH(clamp(wxz + vec2(0.0, eps), -halfSpan, halfSpan)) * uVScale;
+        float eps = max(stepSize, span.x / max(atlasGrid().x - 1.0, 1.0));
+        float hL = sampleRawH(clamp(sampleXZ - vec2(eps, 0.0), -halfAtlas, halfAtlas)) * uVScale;
+        float hR = sampleRawH(clamp(sampleXZ + vec2(eps, 0.0), -halfAtlas, halfAtlas)) * uVScale;
+        float hD = sampleRawH(clamp(sampleXZ - vec2(0.0, eps), -halfAtlas, halfAtlas)) * uVScale;
+        float hU = sampleRawH(clamp(sampleXZ + vec2(0.0, eps), -halfAtlas, halfAtlas)) * uVScale;
         vNormalW = normalize(vec3(hL - hR, 2.0 * eps, hD - hU));
 
         gl_Position = projectionMatrix * viewMatrix * vec4(worldP, 1.0);
@@ -117,6 +139,8 @@ export function createTerrainMaterial(
       uniform vec2 uPrecipRange;
       uniform float uWorldSpan;
       uniform float uGridSize;
+      uniform float uCellReg;
+      uniform vec2 uTileOrigin;
       uniform vec3 uSunDir;
       uniform vec3 uFogColor;
       uniform vec3 uMistColor;
@@ -130,6 +154,13 @@ export function createTerrainMaterial(
       varying vec3 vWorldPos;
       varying vec3 vNormalW;
       varying float vElevRaw;
+
+      vec2 fragAtlasSpan() {
+        return vec2(uWorldSpan);
+      }
+      vec2 fragAtlasGrid() {
+        return vec2(uGridSize);
+      }
 
       // ---------- Fast Procedural Noise ----------
       float hash21(vec2 p) {
@@ -210,23 +241,33 @@ export function createTerrainMaterial(
         return normalize(baseN - grad);
       }
 
-      // Sample exact terrain height (meters * vScale) from float height texture
+      // Sample exact terrain height (meters * vScale); xz is WORLD, converted via uTileOrigin
       float sampleHeightAtWorld(vec2 xz) {
-        vec2 uv = xz / uWorldSpan + 0.5;
-        uv.y = 1.0 - uv.y; // match PlaneGeometry flipY
+        vec2 span = fragAtlasSpan();
+        vec2 grid = fragAtlasGrid();
+        vec2 localXZ = xz - uTileOrigin;
+        vec2 uv = localXZ / span + 0.5;
+        uv.y = 1.0 - uv.y;
         if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) return -50.0;
-        vec2 texUv = (uv * (uGridSize - 1.0) + 0.5) / uGridSize;
+        vec2 texUv = mix((uv * (grid - 1.0) + 0.5) / grid, uv, uCellReg);
         return texture2D(uHeightTex, texUv).r * uVScale;
       }
 
-      // Full-resolution (1K / 2K / 4K) analytical heightfield normal so distant peaks stay razor-sharp!
+      // Full-resolution analytical heightfield normal (local to this tile/atlas)
       vec3 computeHeightTexNormal(vec2 xz) {
-        float eps = uWorldSpan / max(uGridSize - 1.0, 1.0);
-        float halfSpan = uWorldSpan * 0.5;
-        float hL = sampleHeightAtWorld(clamp(xz - vec2(eps, 0.0), -halfSpan, halfSpan));
-        float hR = sampleHeightAtWorld(clamp(xz + vec2(eps, 0.0), -halfSpan, halfSpan));
-        float hD = sampleHeightAtWorld(clamp(xz - vec2(0.0, eps), -halfSpan, halfSpan));
-        float hU = sampleHeightAtWorld(clamp(xz + vec2(0.0, eps), -halfSpan, halfSpan));
+        vec2 span = fragAtlasSpan();
+        vec2 grid = fragAtlasGrid();
+        float eps = span.x / max(grid.x - 1.0, 1.0);
+        vec2 halfAtlas = span * 0.5;
+        vec2 localXZ = xz - uTileOrigin;
+        vec2 cL = clamp(localXZ - vec2(eps, 0.0), -halfAtlas, halfAtlas) + uTileOrigin;
+        vec2 cR = clamp(localXZ + vec2(eps, 0.0), -halfAtlas, halfAtlas) + uTileOrigin;
+        vec2 cD = clamp(localXZ - vec2(0.0, eps), -halfAtlas, halfAtlas) + uTileOrigin;
+        vec2 cU = clamp(localXZ + vec2(0.0, eps), -halfAtlas, halfAtlas) + uTileOrigin;
+        float hL = sampleHeightAtWorld(cL);
+        float hR = sampleHeightAtWorld(cR);
+        float hD = sampleHeightAtWorld(cD);
+        float hU = sampleHeightAtWorld(cU);
         return normalize(vec3(hL - hR, 2.0 * eps, hD - hU));
       }
 
@@ -464,6 +505,12 @@ export function createTerrainMaterial(
           color = mix(color, uFogColor, clamp(fogFactor, 0.0, 0.88));
         }
 
+        // Not-yet-synthesized "ghost" tiles (climate alpha 0) read as hazy, washed-out terrain
+        float ghostAmt = 1.0 - texture2D(uClimate, vUv).a;
+        if (ghostAmt > 0.01) {
+          vec3 washed = mix(vec3(dot(color, vec3(0.30, 0.59, 0.11))), uMistColor, 0.42);
+          color = mix(color, washed, ghostAmt * 0.72);
+        }
         gl_FragColor = vec4(color, 1.0);
       }
     `,
@@ -484,8 +531,11 @@ export function createWaterMaterial(heightFloatTex, maskTex, worldSpan, gridSize
     uniforms: {
       uHeightTex: { value: heightFloatTex },
       uMasks: { value: maskTex },
+      // Span, texel count and world-XZ centre of the height / mask textures
       uWorldSpan: { value: worldSpan },
       uGridSize: { value: gridSize },
+      uCellReg: { value: 0 },
+      uTexOrigin: { value: new THREE.Vector2(0, 0) },
       uSunDir: { value: new THREE.Vector3(0.65, 0.45, 0.45).normalize() },
       uFogColor: { value: new THREE.Color('#a8d0ea') },
       uFogDensity: { value: 0.00044 },
@@ -510,6 +560,8 @@ export function createWaterMaterial(heightFloatTex, maskTex, worldSpan, gridSize
       uniform sampler2D uMasks;
       uniform float uWorldSpan;
       uniform float uGridSize;
+      uniform float uCellReg;
+      uniform vec2 uTexOrigin;
       uniform vec3 uSunDir;
       uniform vec3 uFogColor;
       uniform float uFogDensity;
@@ -534,10 +586,10 @@ export function createWaterMaterial(heightFloatTex, maskTex, worldSpan, gridSize
       }
 
       void main() {
-        vec2 uv = vWorldPos.xz / uWorldSpan + 0.5;
+        vec2 uv = (vWorldPos.xz - uTexOrigin) / uWorldSpan + 0.5;
         uv.y = 1.0 - uv.y;
         bool inMap = (uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0);
-        vec2 texUv = (uv * (uGridSize - 1.0) + 0.5) / uGridSize;
+        vec2 texUv = mix((uv * (uGridSize - 1.0) + 0.5) / uGridSize, uv, uCellReg);
         // Never draw the y=0 ocean sheet underneath an inland crater lake whose floor dips below sea level!
         if (inMap && texture2D(uMasks, texUv).g > 0.05) discard;
         float terrainH = inMap

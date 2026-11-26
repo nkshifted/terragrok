@@ -8,7 +8,14 @@ import * as THREE from 'three';
  *   3. Craggy Cliff Boulders & Riverbank Rocks (displaced faceted rocks on steep
  *      slopes, ridges, and river channels to break up heightmap silhouettes)
  */
-export function buildWorldProps(worldData, vScale = 1.0) {
+/**
+ * `opts` places a streamed tile's props in the stitched world:
+ *   originX / originZ  world offset of the tile centre
+ *   surfaceAt(x, z)    raw height of the rendered (seam-stitched) surface, so nothing floats
+ *   seed               per-tile scatter seed, so neighbouring tiles do not repeat one pattern
+ */
+export function buildWorldProps(worldData, vScale = 1.0, opts = {}) {
+  const { originX = 0, originZ = 0, surfaceAt = null, seed = 4242 } = opts;
   const group = new THREE.Group();
   const { size, worldSpan, maxElev, hasClimate, tempRange, precipRange } = worldData.meta;
   const climateSize = worldData.meta.climateSize || size;
@@ -28,7 +35,7 @@ export function buildWorldProps(worldData, vScale = 1.0) {
     return { tempC, pMm };
   };
 
-  let s = 4242;
+  let s = seed >>> 0;
   const rand = () => {
     s = (s * 1664525 + 1013904223) >>> 0;
     return s / 4294967296;
@@ -83,7 +90,7 @@ export function buildWorldProps(worldData, vScale = 1.0) {
     if (Math.hypot(wx - spx, wz - spz) < 20) continue;
 
     const scale = (0.72 + rand() * 0.78) * (1.0 - hNorm * 0.38);
-    const item = { wx, wz, baseElev: elev, scale, moisture, hNorm, rotY: rand() * Math.PI * 2 };
+    const item = { wx: wx + originX, wz: wz + originZ, baseElev: surfaceAt ? surfaceAt(wx + originX, wz + originZ) : elev, scale, moisture, hNorm, rotY: rand() * Math.PI * 2 };
 
     // Warm moist zones get lush broadleafs; cool/boreal slopes get multi-tier conifers
     if (clim) {
@@ -130,9 +137,9 @@ export function buildWorldProps(worldData, vScale = 1.0) {
 
     const baseScale = nearRiver ? 0.6 + rand() * 1.4 : 1.1 + rand() * 3.0;
     rocks.push({
-      wx,
-      wz,
-      baseElev: elev,
+      wx: wx + originX,
+      wz: wz + originZ,
+      baseElev: surfaceAt ? surfaceAt(wx + originX, wz + originZ) : elev,
       sx: baseScale * (0.8 + rand() * 0.6),
       sy: baseScale * (0.55 + rand() * 0.55),
       sz: baseScale * (0.8 + rand() * 0.6),

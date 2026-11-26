@@ -26,8 +26,11 @@ from matplotlib.patches import Rectangle
 from scipy.ndimage import gaussian_filter, zoom
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO_ROOT / ".vendor" / "terrain-diffusion"))
 sys.path.insert(0, str(REPO_ROOT / "experiments"))
+
+from paths import VENDOR_TD, add_vendor_to_syspath  # noqa: E402
+
+add_vendor_to_syspath()
 
 from terrain_diffusion.inference.world_pipeline import WorldPipeline  # noqa: E402
 from export_viewer_worlds import (  # noqa: E402
@@ -95,7 +98,7 @@ def run_conditioned_td30m(
     print(f"Synthesizing {out_n}x{out_n} Terrain Diffusion 30m conditioned on Stage 1 tectonics...")
 
     prev_cwd = os.getcwd()
-    os.chdir(REPO_ROOT / ".vendor" / "terrain-diffusion")
+    os.chdir(VENDOR_TD)
     try:
         world.bind(hdf5_file=None)
         # Import all 5 Stage 1 tectonic conditioning channels directly in memory!

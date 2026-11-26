@@ -26,8 +26,11 @@ from scipy.ndimage import gaussian_filter, zoom
 import torch
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO_ROOT / ".vendor" / "terrain-diffusion"))
 sys.path.insert(0, str(REPO_ROOT / "experiments"))
+
+from paths import VENDOR_TD, add_vendor_to_syspath  # noqa: E402
+
+add_vendor_to_syspath()
 
 from terrain_diffusion.inference.world_pipeline import WorldPipeline
 from export_viewer_worlds import apply_micro_detail_refinement, solve_physical_hydrology
@@ -84,7 +87,7 @@ def run_mps_synth(
 
     world.onestep_latent = onestep
     prev_cwd = os.getcwd()
-    os.chdir(REPO_ROOT / ".vendor" / "terrain-diffusion")
+    os.chdir(VENDOR_TD)
     try:
         world.set_custom_conditioning_import(0, cond_elev, 0, 0, default_value=-1500.0, rebuild=False)
         world.set_custom_conditioning_import(1, cond_temp, 0, 0, default_value=12.0, rebuild=False)
@@ -189,7 +192,7 @@ def main() -> None:
     world.to(device)
     world.set_cond_snr([0.03, 0.03, 0.03, 0.03, 0.03])
     prev_cwd = os.getcwd()
-    os.chdir(REPO_ROOT / ".vendor" / "terrain-diffusion")
+    os.chdir(VENDOR_TD)
     try:
         world.bind(hdf5_file=None)
     finally:

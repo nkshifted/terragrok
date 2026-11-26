@@ -60,8 +60,12 @@ def apply_micro_detail_refinement(
     elev: np.ndarray,
     world_span_m: float,
     seed: int = 42,
+    origin_px: tuple[float, float] = (0.0, 0.0),
 ) -> np.ndarray:
     """
+    `origin_px` (x, y) offsets the crag noise so adjacent tiles of one chart sample one
+    continuous noise field instead of each restarting the same pattern at its own corner.
+
     Walking-scale micro-detail refinement for 30m/px macro Terrain Diffusion DEMs:
       1. Slope-gated multi-octave ridged crags & cliff ledges on mountain slopes (>10 deg),
          leaving lowland valleys, plains, and sandy beaches smoothly untouched.
@@ -81,8 +85,8 @@ def apply_micro_detail_refinement(
     elev_gate = np.clip((out - 6.0) / 30.0, 0.0, 1.0)
     mask = slope_gate * elev_gate
 
-    xs = np.linspace(0.0, float(nx), nx, dtype=np.float32)
-    ys = np.linspace(0.0, float(ny), ny, dtype=np.float32)
+    xs = np.arange(nx, dtype=np.float32) + np.float32(origin_px[0])
+    ys = np.arange(ny, dtype=np.float32) + np.float32(origin_px[1])
     xx, yy = np.meshgrid(xs, ys)
     coords = np.vstack([xx.ravel(), yy.ravel()])
 
@@ -137,9 +141,16 @@ def solve_physical_hydrology(
     runoff_map: np.ndarray | None = None,
     max_lakes: int | None = None,
     min_lake_runoff: float = 0.0,
+    inflows: list[tuple[int, int, float | None]] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[dict], list[dict]]:
     """
     Solve exact Barnes Priority-Flood lake hierarchy & pit-free D8 drainage tree.
+
+    `inflows` are (row, col, discharge) cells where a river from an adjacent, already
+    synthesized tile enters this one. Their discharge joins the routing and each becomes a
+    river source ("inflow"), so a river that reaches a tile edge carries on across it.
+    A discharge of None means "a substantial river" (the neighbour predates recorded discharge).
+    Requires `runoff_map`.
 
     Returns:
       carved_elev   : float32 (ny, nx) with smooth carved river channels & banks
@@ -152,7 +163,8 @@ def solve_physical_hydrology(
     cell_m = world_span_m / (nx - 1)
 
     # Dry desert / frozen glacier fast-path: legitimately 0 liquid lakes and 0 liquid rivers!
-    if max_spring_rivers <= 0 and (max_lakes is not None and max_lakes <= 0):
+    # (A river arriving from a neighbouring tile still crosses a desert, so inflows skip this.)
+    if max_spring_rivers <= 0 and (max_lakes is not None and max_lakes <= 0) and not inflows:
         print("  Hydrology OK: 0 lakes | 0 rivers (arid/frozen biome)", flush=True)
         zeros = np.zeros((ny, nx), dtype=np.uint8)
         return elev.astype(np.float32), zeros, zeros, [], []
@@ -177,8 +189,21 @@ def solve_physical_hydrology(
     z_in = np.where(is_ocean, 0.0, elev.astype(np.float64))
     z_shift = max(0.0, -float(z_in.min())) + 1.0
     mg.add_field("topographic__elevation", (z_in + z_shift).ravel(), at="node")
+    inflow_cells: list[tuple[int, int]] = []
     if runoff_map is not None:
-        mg.add_field("water__unit_flux_in", np.clip(runoff_map.astype(np.float64), 0.001, 4.0).ravel(), at="node")
+        flux = np.clip(runoff_map.astype(np.float64), 0.001, 4.0)
+        if inflows:
+            cell_area = cell_m * cell_m
+            # Unknown discharge: roughly the runoff of a catchment covering 12% of a tile
+            default_q = float(flux.mean()) * cell_area * 0.12 * ny * nx
+            for ir, ic, q in inflows:
+                ir = int(np.clip(ir, 1, ny - 2))
+                ic = int(np.clip(ic, 1, nx - 2))
+                if is_ocean[ir, ic]:
+                    continue
+                flux[ir, ic] += (default_q if q is None else float(q)) / cell_area
+                inflow_cells.append((ir, ic))
+        mg.add_field("water__unit_flux_in", flux.ravel(), at="node")
     mg.status_at_node[is_ocean.ravel()] = mg.BC_NODE_IS_FIXED_VALUE
 
     pf = PriorityFloodFlowRouter(
@@ -390,6 +415,15 @@ def solve_physical_hydrology(
                     wz = (r / (ny - 1) - 0.5) * world_span_m
                     claimed_trunk[node_id] = (wx, wz, float(filled[r, c]))
         candidate_traces.append((path, source_type, start_lake, dest_type, dest_lake))
+
+    #    Priority 0: rivers arriving from neighbouring tiles continue from where they enter
+    for ir, ic in inflow_cells:
+        if lake_id_grid[ir, ic] > 0:
+            continue  # flows straight into a lake at the edge; the lake's own outlet carries it on
+        res = trace_downstream(ir, ic, "inflow")
+        if res is not None:
+            path, dest_type, dest_lake = res
+            register_trace(path, "inflow", 0, dest_type, dest_lake)
 
     for lid, sr, sc, _ in lake_spillways:
         res = trace_downstream(sr, sc, "lake", start_lake_id=lid)
@@ -726,6 +760,8 @@ def solve_physical_hydrology(
             "dest": dest_type,
             "startLake": start_lake,
             "destLake": dest_lake,
+            # Discharge where the river ends; a neighbouring tile injects it when dest == "edge"
+            "q": round(float(pts_da[-1]), 1),
             "points": spline_pts,
         })
 

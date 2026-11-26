@@ -37,9 +37,10 @@ from pyfastnoiselite.pyfastnoiselite import FastNoiseLite, FractalType, NoiseTyp
 from scipy.ndimage import gaussian_filter
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-VENDOR_TD = REPO_ROOT / ".vendor" / "terrain-diffusion"
-if VENDOR_TD.exists():
-    sys.path.insert(0, str(VENDOR_TD))
+sys.path.insert(0, str(REPO_ROOT / "experiments"))
+from paths import VENDOR_TD, add_vendor_to_syspath  # noqa: E402
+
+add_vendor_to_syspath()
 
 # Reuse our verified micro-detail + Landlab Barnes lake-to-sea solver!
 sys.path.insert(0, str(REPO_ROOT / "experiments"))

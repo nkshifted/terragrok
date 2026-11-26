@@ -13,20 +13,22 @@ VIEWER_PID=""
 cleanup() {
   trap - EXIT INT TERM
   echo ""
-  echo "[dev] Shutting down…"
-  if [[ -n "${VIEWER_PID}" ]] && kill -0 "$VIEWER_PID" 2>/dev/null; then
-    kill "$VIEWER_PID" 2>/dev/null || true
-    wait "$VIEWER_PID" 2>/dev/null || true
+  echo "[dev] Shutting down..."
+  if [[ -n "${VIEWER_PID}" ]] && kill -0 "${VIEWER_PID}" 2>/dev/null; then
+    kill "${VIEWER_PID}" 2>/dev/null || true
+    wait "${VIEWER_PID}" 2>/dev/null || true
   fi
-  if [[ -n "${STAGE2_PID}" ]] && kill -0 "$STAGE2_PID" 2>/dev/null; then
-    kill "$STAGE2_PID" 2>/dev/null || true
-    wait "$STAGE2_PID" 2>/dev/null || true
+  if [[ -n "${STAGE2_PID}" ]] && kill -0 "${STAGE2_PID}" 2>/dev/null; then
+    kill "${STAGE2_PID}" 2>/dev/null || true
+    wait "${STAGE2_PID}" 2>/dev/null || true
   fi
   # Clear stale listeners if children ignored SIGTERM
-  for port in "$STAGE2_PORT" "$VIEWER_PORT"; do
+  for port in "${STAGE2_PORT}" "${VIEWER_PORT}"; do
     if command -v lsof >/dev/null 2>&1; then
       pids="$(lsof -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null || true)"
       if [[ -n "$pids" ]]; then
+        # intentional unquoted: lsof may return multiple PIDs
+        # shellcheck disable=SC2086
         kill $pids 2>/dev/null || true
       fi
     fi
@@ -53,7 +55,7 @@ wait_http() {
 if lsof -tiTCP:"$STAGE2_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
   echo "[dev] Port $STAGE2_PORT already in use — reusing existing Stage 2 server."
 else
-  echo "[dev] Starting Stage 2 server on :$STAGE2_PORT…"
+  echo "[dev] Starting Stage 2 server on :${STAGE2_PORT}..."
   uv run --extra diffusion python experiments/stage2_server.py --port "$STAGE2_PORT" &
   STAGE2_PID=$!
 fi
@@ -61,7 +63,7 @@ fi
 if lsof -tiTCP:"$VIEWER_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
   echo "[dev] Port $VIEWER_PORT already in use — reusing existing Vite viewer."
 else
-  echo "[dev] Starting Vite viewer on :$VIEWER_PORT…"
+  echo "[dev] Starting Vite viewer on :${VIEWER_PORT}..."
   (cd viewer && npm run dev -- --host 127.0.0.1 --port "$VIEWER_PORT") &
   VIEWER_PID=$!
 fi

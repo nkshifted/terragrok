@@ -1,5 +1,9 @@
 # Planet Tile Streaming Implementation Plan
 
+> **Status (2026-11-26):** superseded. Streaming now synthesizes every tile as a window of one
+> shared diffusion world and stitches a player-centred 3×3; see "How it works" in the README.
+> Kept as a record of the earlier design.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Click “Land here” on the planet, explore a home patch immediately, and grow a continuous walkable world as neighbors fill in (ghost → 1K → 2K) until the planet is traversable.
@@ -98,9 +102,9 @@
 
 ### Task 7: Quality ladder
 
-- [ ] Queue policy per tile: ghost → 1k → 2k (skip if user chose 1K-only planet)
-- [ ] Re-stitch atlas on 2K replace (same qi,qj slot)
-- [ ] Priority = `ring * 100 + distToPlayerTiles` (update every ~2 s from client `POST /api/tiles/priority`)
+- [x] Queue policy per tile: ghost → 1k → 2k (skip if user chose 1K-only planet)
+- [x] Re-stitch atlas on 2K replace (same qi,qj slot)
+- [x] Priority = `ring * 100 + distToPlayerTiles` (update every ~2 s from client `POST /api/tiles/priority`)
 
 ---
 
