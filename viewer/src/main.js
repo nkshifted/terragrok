@@ -38,6 +38,12 @@ let atlas = null;
 let atlasDirty = false;
 /** Per-tile rivers, lakes and props in atlas mode: key -> { sig, river, lake, props }. */
 const tileDecor = new Map();
+/**
+ * Tiles outside the stitched 3×3, drawn from low-detail copies so explored terrain and the
+ * ghosts ahead stay on screen: key -> { sig, mesh, mat, textures, lake, props }.
+ */
+const farDecor = new Map();
+let farGeo = null;
 let homeMeanClimate = [128, 128, 128];
 let subtitleBase = '';
 
@@ -600,6 +606,8 @@ function relocateExplorerTo(x, z) {
   explorer.position.copy(player.pos);
   pinDropFlash = 1.0;
   rebuildDrillBoxOverlay();
+  // Landed on a far tile: recentre the stitched window on it now, not at the next heartbeat
+  if (atlas) tileStream.poke();
   return true;
 }
 
@@ -687,7 +695,7 @@ canvas.addEventListener(
 function worldBounds() {
   if (!world) return { minX: 0, maxX: 0, minZ: 0, maxZ: 0 };
   if (atlas) {
-    const h = atlas.meta.atlasSpan * 0.5;
+    const h = (tileStream.farRing + 0.5) * atlas.meta.worldSpan;
     const { centerX: cx, centerZ: cz } = atlas.meta;
     return { minX: cx - h, maxX: cx + h, minZ: cz - h, maxZ: cz + h };
   }
@@ -744,7 +752,10 @@ function worldToGrid(x, z) {
 function sampleHeight(x, z) {
   if (!world) return 0;
   if (atlas) {
-    const raw = sampleAtlasHeight(atlas, x, z);
+    // Stitched surface near the player; low-detail far copies beyond it; open sea elsewhere
+    const t = tileAt(atlas.meta.worldSpan, x, z);
+    let raw = atlas.slots.has(`${t.qi},${t.qj}`) ? sampleAtlasHeight(atlas, x, z) : null;
+    if (raw == null) raw = tileStream.sampleFarHeight(x, z);
     return (raw == null ? -30 : raw) * state.vScale;
   }
   const { size } = world.meta;
@@ -832,7 +843,8 @@ function rebuildChart() {
   wu.uCellReg.value = 1;
   wu.uTexOrigin.value.set(centerX, centerZ);
   waterMesh.position.set(centerX, 0, centerZ);
-  waterMesh.scale.setScalar((atlasSpan * 1.25) / (span * 1.6));
+  // One sea for everything on screen, far tiles included
+  waterMesh.scale.setScalar(((2 * tileStream.farRing + 1.5) * span) / (span * 1.6));
   waterMesh.scale.y = 1;
 
   if (grassObj) {
@@ -844,6 +856,7 @@ function rebuildChart() {
   }
 
   const built = rebuildTileDecor(win);
+  const farBuilt = rebuildFarTiles();
   for (const d of tileDecor.values()) {
     if (!d.lake) continue;
     const lu = d.lake.material.uniforms;
@@ -859,7 +872,7 @@ function rebuildChart() {
   if (player.grounded) player.pos.y = Math.max(sampleHeight(player.pos.x, player.pos.z), 0.2);
   console.info(
     `[seam-atlas] centre ${win.centerQi},${win.centerQj} · ${win.tiles.size} tiles · ` +
-      `${built} decor rebuilt · ${(performance.now() - t0).toFixed(0)} ms`
+      `${built} decor rebuilt · ${farDecor.size} far tiles (${farBuilt} new) · ${(performance.now() - t0).toFixed(0)} ms`
   );
 }
 
@@ -893,6 +906,118 @@ function disposeHomeDecor() {
 function clearTileDecor() {
   for (const d of tileDecor.values()) disposeDecor(d);
   tileDecor.clear();
+  for (const d of farDecor.values()) disposeFar(d);
+  farDecor.clear();
+}
+
+function disposeFar(d) {
+  scene.remove(d.mesh);
+  d.mat.dispose();
+  for (const t of d.textures) t.dispose();
+  disposeDecor({ river: null, lake: d.lake, props: d.props });
+}
+
+/**
+ * Low-detail stand-ins for every known tile outside the stitched window: the real terrain
+ * shader over a 256² copy of the tile, its lakes, and a thinned-out scatter of trees and
+ * rocks. No rivers (ribbons need the full-resolution bed) and no walking: stepping or
+ * teleporting onto one recentres the window, which swaps in the full tile.
+ */
+function rebuildFarTiles() {
+  const span = world.meta.worldSpan;
+  const hasFloatLinear = renderer.extensions.has('OES_texture_float_linear');
+  const want = new Map(tileStream.getFarTiles().map((e) => [e.key, e]));
+  for (const [key, d] of farDecor) {
+    if (want.get(key)?.version !== d.sig) {
+      disposeFar(d);
+      farDecor.delete(key);
+    }
+  }
+  if (!farGeo) farGeo = buildTerrainClipmapGeometry(span, 256, 64);
+  let built = 0;
+  for (const [key, e] of want) {
+    if (farDecor.has(key)) continue;
+    const ox = e.qi * span;
+    const oz = e.qj * span;
+    const n = e.size;
+    const cn = e.climateSize;
+
+    const hTex = makeAtlasTexture(e.heights, n, THREE.RedFormat, THREE.FloatType, hasFloatLinear);
+    let masks = e.masks;
+    if (!masks) {
+      masks = new Uint8Array(n * n * 4);
+      for (let i = 0; i < n * n; i++) {
+        masks[i * 4 + 2] = 128;
+        masks[i * 4 + 3] = 110;
+      }
+    }
+    const mTex = makeAtlasTexture(masks, n, THREE.RGBAFormat, THREE.UnsignedByteType, true);
+    let climate = e.climate;
+    if (!climate || e.ghost) {
+      // Ghosts carry no climate: borrow the home's average and flag them (alpha 0) for the haze
+      climate = new Uint8Array(cn * cn * 4);
+      for (let i = 0; i < cn * cn; i++) {
+        climate[i * 4] = homeMeanClimate[0];
+        climate[i * 4 + 1] = homeMeanClimate[1];
+        climate[i * 4 + 2] = homeMeanClimate[2];
+        climate[i * 4 + 3] = e.ghost ? 0 : 255;
+      }
+    }
+    const cTex = makeAtlasTexture(climate, cn, THREE.RGBAFormat, THREE.UnsignedByteType, true);
+
+    const mat = createTerrainMaterial(
+      mTex,
+      hTex,
+      span,
+      world.meta.maxElev,
+      n,
+      cTex,
+      true,
+      world.meta.tempRange || [-16.0, 32.0],
+      world.meta.precipRange || [0.0, 1800.0]
+    );
+    mat.uniforms.uCellReg.value = 1;
+    mat.uniforms.uTileOrigin.value.set(ox, oz);
+    // The clipmap stays centred on its own tile: uniform (coarse) detail across it
+    mat.uniforms.uFocusPos.value.set(ox, 0, oz);
+    mat.uniforms.uVScale.value = state.vScale;
+    const mesh = new THREE.Mesh(farGeo, mat);
+    mesh.frustumCulled = false;
+    scene.add(mesh);
+
+    const d = { sig: e.version, mesh, mat, textures: [hTex, mTex, cTex], lake: null, props: null };
+    if (!e.ghost) {
+      if (e.lakes?.length) {
+        d.lake = buildLakeSystem(e.lakes, e.meta.lakeGridSize || e.meta.size, span, hTex, mTex);
+        d.lake.mesh.position.set(ox, 0, oz);
+        d.lake.mesh.scale.y = state.vScale;
+        d.lake.material.uniforms.uVScale.value = state.vScale;
+        d.lake.material.uniforms.uTexOrigin.value.set(ox, oz);
+        scene.add(d.lake.mesh);
+      }
+      d.props = buildWorldProps(
+        {
+          meta: { ...e.meta, size: n, climateSize: cn, hasClimate: Boolean(e.climate) },
+          heights: e.heights,
+          masks,
+          climate: e.climate,
+        },
+        state.vScale,
+        { originX: ox, originZ: oz, seed: (4242 + e.qi * 7919 + e.qj * 104729) >>> 0, density: 0.3 }
+      );
+      scene.add(d.props);
+    }
+    farDecor.set(key, d);
+    built++;
+  }
+  return built;
+}
+
+/** Terrain materials of the far tiles (the stitched terrain's own is `terrainMat`). */
+function farMats() {
+  const out = [];
+  for (const d of farDecor.values()) out.push(d.mat);
+  return out;
 }
 
 /**
@@ -980,12 +1105,14 @@ function allRivers() {
 function allLakes() {
   const out = lakeObj ? [lakeObj] : [];
   for (const d of tileDecor.values()) if (d.lake) out.push(d.lake);
+  for (const d of farDecor.values()) if (d.lake) out.push(d.lake);
   return out;
 }
 
 function allProps() {
   const out = propsGroup ? [propsGroup] : [];
   for (const d of tileDecor.values()) if (d.props) out.push(d.props);
+  for (const d of farDecor.values()) if (d.props) out.push(d.props);
   return out;
 }
 
@@ -1323,6 +1450,7 @@ function syncFogDensity() {
   const baseFog = 0.00044 * (0.62 + 0.38 * spanFactor);
   const fogVal = state.camMode === 'diorama' ? baseFog * 0.24 : baseFog;
   if (terrainMat) terrainMat.uniforms.uFogDensity.value = fogVal;
+  for (const m of farMats()) m.uniforms.uFogDensity.value = fogVal;
   if (waterMat) waterMat.uniforms.uFogDensity.value = fogVal;
   for (const r of allRivers()) r.material.uniforms.uFogDensity.value = fogVal;
   for (const l of allLakes()) l.material.uniforms.uFogDensity.value = fogVal;
@@ -1371,6 +1499,7 @@ function setCameraMode(mode) {
 function setStyleMode(styleIdx) {
   state.styleMode = styleIdx;
   if (terrainMat) terrainMat.uniforms.uStyleMode.value = styleIdx;
+  for (const m of farMats()) m.uniforms.uStyleMode.value = styleIdx;
   if (waterMat) waterMat.uniforms.uStyleMode.value = styleIdx;
   for (const r of allRivers()) {
     r.material.uniforms.uStyleMode.value = styleIdx;
@@ -1410,10 +1539,10 @@ function updateSun() {
   skyDome.material.uniforms.uZenith.value.copy(zenith);
   skyDome.material.uniforms.uHorizon.value.copy(horizon);
 
-  if (terrainMat) {
-    terrainMat.uniforms.uSunDir.value.copy(dir);
-    terrainMat.uniforms.uFogColor.value.copy(fogCol);
-    terrainMat.uniforms.uMistColor.value.copy(mistCol);
+  for (const m of terrainMat ? [terrainMat, ...farMats()] : []) {
+    m.uniforms.uSunDir.value.copy(dir);
+    m.uniforms.uFogColor.value.copy(fogCol);
+    m.uniforms.uMistColor.value.copy(mistCol);
   }
   if (waterMat) {
     waterMat.uniforms.uSunDir.value.copy(dir);
@@ -1449,6 +1578,7 @@ document.getElementById('vscale-slider').addEventListener('input', (e) => {
   document.getElementById('vscale-val').textContent = `${state.vScale.toFixed(2)}×`;
   // Clipmap height is displaced in-shader; mesh Y scale stays 1
   if (terrainMat) terrainMat.uniforms.uVScale.value = state.vScale;
+  for (const m of farMats()) m.uniforms.uVScale.value = state.vScale;
   if (waterMat) waterMat.uniforms.uVScale.value = state.vScale;
   for (const r of allRivers()) r.mesh.scale.y = state.vScale;
   for (const l of allLakes()) {
@@ -1550,6 +1680,8 @@ const elElev = document.getElementById('stat-elev');
 const elSlope = document.getElementById('stat-slope');
 const elTemp = document.getElementById('stat-temp');
 const elZone = document.getElementById('stat-zone');
+const elCompassRose = document.getElementById('compass-rose');
+const elCompassHeading = document.getElementById('compass-heading');
 
 function updateMovement(dt) {
   if (!world) return;
@@ -1751,6 +1883,16 @@ function updateTelemetry() {
   }
   elZone.textContent = zone;
 
+  // Compass: the rose turns so its N points at chart north (-Z) as seen from the camera
+  const yaw = state.camMode === 'diorama' ? camRig.dioramaYaw : camRig.yaw;
+  const heading = (((-THREE.MathUtils.radToDeg(yaw)) % 360) + 360) % 360;
+  if (elCompassRose) elCompassRose.style.transform = `rotate(${(-heading).toFixed(1)}deg)`;
+  if (elCompassHeading) {
+    const names = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'];
+    const label = `${names[Math.round(heading / 45) % 8]} ${String(Math.round(heading) % 360).padStart(3, '0')}°`;
+    if (elCompassHeading.textContent !== label) elCompassHeading.textContent = label;
+  }
+
   // Tile-stream progress rides along on the subtitle line
   const stream = tileStream?.describe() || '';
   const sub = stream ? `${subtitleBase} · ${stream}` : subtitleBase;
@@ -1778,6 +1920,7 @@ function animate() {
     terrainMat.uniforms.uTime.value = t;
     terrainMat.uniforms.uFocusPos.value.copy(focus);
   }
+  for (const m of farMats()) m.uniforms.uTime.value = t;
   if (waterMat) waterMat.uniforms.uTime.value = t;
   for (const r of allRivers()) r.material.uniforms.uTime.value = t;
   for (const l of allLakes()) l.material.uniforms.uTime.value = t;

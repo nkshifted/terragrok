@@ -60,6 +60,10 @@ through an edge are injected as inflow into the tile beyond when it is synthesiz
   into one height / mask / climate atlas and removes what mismatch remains: the smooth part is
   spread over a ~1.3 km band, fine detail over ~50 m. Rivers, lakes, trees and rocks are built per
   tile on that stitched surface.
+- Tiles outside that 3×3 are not dropped from view. Each one seen stays on screen as a 256²
+  "far" copy (terrain, lakes and a thinned scatter of trees) out to three rings from the player,
+  so the isometric view shows where you have been. Stepping or teleporting onto a far tile
+  recentres the 3×3 and swaps in its full data.
 
 **The explorer.** [`viewer/src/main.js`](viewer/src/main.js) renders with a geometry clipmap, a
 custom terrain shader, river ribbons, lake surfaces, instanced grass and props.
@@ -101,6 +105,10 @@ per-checkout: a worktree starts with only the demo worlds.
 - **Stitched terrain is 4.7 m per sample.** The atlas holds each tile at 1024², so a 2K home
   loses its extra sharpness once streaming starts.
 - **A stutter when a tile lands.** Re-stitching takes 0.2–0.3 s.
+- **Far tiles are coarse.** Outside the 3×3 around the player, terrain is 19 m per sample with
+  no river ribbons, and it is not seam-corrected, so hairline gaps can show between far tiles.
+- **Compass north is the map's north.** It matches the planet at home and drifts from true
+  planet north the further you walk, because the chart is flat.
 - **Rivers only continue downstream into newer tiles.** A river flowing into a tile that was
   synthesized earlier stops at that edge. Each tile also treats its edge as a place water can
   leave, so two tiles sometimes both drain to the same low point on their seam.

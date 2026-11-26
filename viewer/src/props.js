@@ -13,17 +13,18 @@ import * as THREE from 'three';
  *   originX / originZ  world offset of the tile centre
  *   surfaceAt(x, z)    raw height of the rendered (seam-stitched) surface, so nothing floats
  *   seed               per-tile scatter seed, so neighbouring tiles do not repeat one pattern
+ *   density            fraction of the usual tree / rock count (distant tiles use fewer)
  */
 export function buildWorldProps(worldData, vScale = 1.0, opts = {}) {
-  const { originX = 0, originZ = 0, surfaceAt = null, seed = 4242 } = opts;
+  const { originX = 0, originZ = 0, surfaceAt = null, seed = 4242, density = 1.0 } = opts;
   const group = new THREE.Group();
   const { size, worldSpan, maxElev, hasClimate, tempRange, precipRange } = worldData.meta;
   const climateSize = worldData.meta.climateSize || size;
   const { heights, masks, climate } = worldData;
   const cellSize = worldSpan / (size - 1);
   const spanFactor = Math.min(Math.max(worldSpan / 2400, 1.0), 2.1);
-  const maxTrees = Math.round(5200 * spanFactor);
-  const maxRocks = Math.round(3400 * spanFactor);
+  const maxTrees = Math.round(5200 * spanFactor * density);
+  const maxRocks = Math.round(3400 * spanFactor * density);
 
   const sampleClimateAt = (gx, gy) => {
     if (!hasClimate || !climate) return null;
