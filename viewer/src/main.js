@@ -1962,6 +1962,7 @@ function leaveVehicle() {
   player.yaw = out.heading;
   player.velY = out.vy;
   player.grounded = !out.airborne;
+  explorer.visible = state.camMode !== 'first';
 }
 
 function toggleMount() {
@@ -1981,6 +1982,7 @@ function updateRiding(dt, forwardInput, rightInput, sprint) {
   player.yaw = v.heading;
   player.activity = v.blocked && forwardInput !== 0 ? (cfg.medium === 'water' ? 'SHALLOWS' : 'TOO STEEP') : cfg.activity;
   vehicles.placeRider(explorer);
+  explorer.visible = state.camMode !== 'first' && !vehicles.hideRider;
   character.holder.position.y = 0;
   // A glider pilot hangs level: the swim pose, held still
   character.setMotion(cfg.rider, cfg.rider === 'swim' ? 0.02 : 1);

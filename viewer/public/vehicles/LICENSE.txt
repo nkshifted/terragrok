@@ -1,0 +1,3 @@
+car/ and watercraft/: models from Kenney's Car Kit and Watercraft Kit (https://kenney.nl).
+horse/: the horse from Quaternius's Ultimate Animated Animal Pack (https://quaternius.com).
+All CC0 1.0 Universal (public domain): https://creativecommons.org/publicdomain/zero/1.0/

@@ -83,8 +83,11 @@ it; `E` gets off, or back on when standing next to it. W/S is speed and A/D stee
 stays on water, a jeep refuses steep slopes that a horse will climb, and a glider launches with
 a kick, sinks slowly, dives with W and flares with S.
 [`viewer/src/vehiclePhysics.js`](viewer/src/vehiclePhysics.js) holds those rules (pure, unit
-tested); [`viewer/src/vehicles.js`](viewer/src/vehicles.js) holds the meshes, which are
-built from primitives for now.
+tested); [`viewer/src/vehicles.js`](viewer/src/vehicles.js) holds the meshes. The horse
+(Quaternius, with walk and gallop clips), the SUV that stands in for a jeep and the motorboat
+(both Kenney) are CC0 models packed into `viewer/public/vehicles/` by
+`experiments/pack_vehicles.py`; the glider is built in code, as are the stand-ins shown while
+a model loads.
 
 ## Layout
 

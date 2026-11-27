@@ -5,12 +5,14 @@
  * One vehicle exists at a time. Summoning puts the player on it; dismounting leaves it parked
  * (a glider is packed away) until it is mounted again or another is summoned.
  *
- * The meshes here are built from primitives, front towards -Z like the explorer group, in
- * explorer scale (the character stands 3.3 units tall). Each builder returns
- * { group, seat, animate(state, dt, t) }; `seat` is where the rider's origin goes, in the
- * vehicle's frame. To use a downloaded model, replace a builder.
+ * Each builder returns { group, seat, animate(state, dt, t) }, front towards -Z like the
+ * explorer group and in explorer scale (the character stands 3.3 units tall); `seat` is where
+ * the rider's origin goes, in the vehicle's frame. The builders make a stand-in from primitives
+ * that is on screen at once. MODELS then swaps in a downloaded glTF (packed by
+ * experiments/pack_vehicles.py) when it has loaded; the glider has none and keeps its stand-in.
  */
 import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { VEHICLES, createVehicleState, findNearby, stepVehicle, summonSpot } from './vehiclePhysics.js';
 
 const mat = (color, extra = {}) => new THREE.MeshStandardMaterial({ color, roughness: 0.82, flatShading: true, ...extra });
@@ -212,6 +214,92 @@ function buildGlider() {
 }
 
 const BUILDERS = { boat: buildBoat, horse: buildHorse, jeep: buildJeep, glider: buildGlider };
+
+/**
+ * Downloaded models. `fit` scales the model so that its length (along Z) or height matches, in
+ * explorer units; `yaw` turns its front to -Z; `seat` replaces the stand-in's.
+ */
+const MODELS = {
+  boat: { url: '/vehicles/watercraft/boat-speed-e.glb', fit: { length: 7.4 }, yaw: Math.PI, y: -0.42, seat: [0, 0.72, 1.2] },
+  // A closed cab: the driver is inside and not drawn
+  jeep: { url: '/vehicles/car/suv.glb', fit: { length: 8.0 }, yaw: Math.PI, y: 0, seat: [0, 1.0, 0], hideRider: true, wheels: /^wheel-(front|back)-(left|right)$/ },
+  horse: { url: '/vehicles/horse/horse.glb', fit: { height: 4.5 }, yaw: Math.PI, y: 0, seat: [0, 2.05, 0.25], clips: { idle: 'Idle', walk: 'Walk', gallop: 'Gallop' } },
+};
+const loader = new GLTFLoader();
+
+/** Replace a stand-in's meshes with its downloaded model. Resolves false if there is none. */
+async function upgradeModel(model, kind, stillWanted) {
+  const spec = MODELS[kind];
+  if (!spec) return false;
+  const gltf = await loader.loadAsync(spec.url);
+  const root = gltf.scene;
+  if (!stillWanted()) {
+    disposeTree(root);
+    return false;
+  }
+  root.rotation.y = spec.yaw;
+  root.updateMatrixWorld(true);
+  const size = new THREE.Box3().setFromObject(root).getSize(new THREE.Vector3());
+  root.scale.setScalar(spec.fit.length ? spec.fit.length / size.z : spec.fit.height / size.y);
+  root.position.y = spec.y;
+  root.traverse((o) => {
+    if (!o.isMesh) return;
+    o.castShadow = true;
+    if (o.isSkinnedMesh) o.frustumCulled = false; // bounds are the bind pose's
+  });
+  for (const part of model.group.children) part.visible = false;
+  model.group.add(root);
+  model.seat.set(...spec.seat);
+  model.hideRider = Boolean(spec.hideRider);
+  model.riderBob = null;
+
+  const standInAnimate = model.animate;
+  if (spec.wheels) {
+    const wheels = [];
+    root.traverse((o) => spec.wheels.test(o.name) && wheels.push(o));
+    const radius = 0.3 * root.scale.x; // the kit's wheels
+    model.animate = (state, dt) => {
+      // The model is turned half a circle, so rolling forward is +X here
+      for (const w of wheels) w.rotation.x += (state.speed / radius) * dt;
+    };
+  } else if (spec.clips) {
+    const mixer = new THREE.AnimationMixer(root);
+    const actions = {};
+    for (const [name, clip] of Object.entries(spec.clips)) {
+      const found = THREE.AnimationClip.findByName(gltf.animations, clip);
+      if (found) actions[name] = mixer.clipAction(found);
+    }
+    let current = null;
+    const top = VEHICLES[kind].maxSpeed;
+    model.animate = (state, dt) => {
+      const v = Math.abs(state.speed);
+      const name = v < 1.5 ? 'idle' : v < top * 0.55 ? 'walk' : 'gallop';
+      const next = actions[name];
+      if (next && next !== current) {
+        next.reset().fadeIn(0.25).play();
+        if (current) current.fadeOut(0.25);
+        current = next;
+      }
+      if (current) current.timeScale = name === 'walk' ? 0.7 + (v / (top * 0.55)) * 1.1 : name === 'gallop' ? 0.75 + (v / top) * 0.35 : 1;
+      mixer.update(dt);
+    };
+    model.riderBob = () => (current === actions.gallop ? Math.abs(Math.sin(mixer.time * 10.8)) * 0.14 : 0);
+  } else {
+    model.animate = standInAnimate;
+  }
+  return true;
+}
+
+function disposeTree(root) {
+  root.traverse((o) => {
+    if (!o.isMesh) return;
+    o.geometry.dispose();
+    for (const m of [].concat(o.material)) {
+      m.map?.dispose();
+      m.dispose();
+    }
+  });
+}
 const MOUNT_RANGE = 14;
 
 /**
@@ -236,11 +324,7 @@ export function createVehicles({ scene, terrain }) {
   function release() {
     if (model) {
       scene.remove(model.group);
-      model.group.traverse((o) => {
-        if (!o.isMesh) return;
-        o.geometry.dispose();
-        o.material.dispose();
-      });
+      disposeTree(model.group);
     }
     model = null;
     state = null;
@@ -257,6 +341,10 @@ export function createVehicles({ scene, terrain }) {
     get state() {
       return state;
     },
+    /** True while the rider is inside a closed vehicle and should not be drawn. */
+    get hideRider() {
+      return riding && Boolean(model?.hideRider);
+    },
     release,
 
     /** Bring a vehicle to the player and put them on it. */
@@ -266,10 +354,12 @@ export function createVehicles({ scene, terrain }) {
       release();
       state = createVehicleState(kind, spot.x, spot.z, heading, terrain);
       state.steer = 0;
-      model = BUILDERS[kind]();
+      const built = BUILDERS[kind]();
+      model = built;
       scene.add(model.group);
       riding = true;
       pose();
+      upgradeModel(built, kind, () => model === built).catch((err) => console.warn(`[vehicles] ${kind} model failed to load, keeping the stand-in:`, err.message));
       return { ok: true };
     },
 
