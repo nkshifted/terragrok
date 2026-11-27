@@ -347,8 +347,10 @@ export function createTileStreamController({ onChange, getPlayerPos }) {
   function isWalkable(x, z) {
     const { qi, qj } = tileAt(worldSpan, x, z);
     const key = tileKey(qi, qj);
-    if (ringFromCentre(qi, qj) <= 1) return Boolean(tiles.get(key)?.walkable);
-    return Boolean(far.get(key)?.walkable);
+    // Right after the window shifts, a tile inside it may still be only a far copy for a few
+    // seconds. It is real terrain either way, so it must not act as a wall (a boat at full
+    // speed reaches the seam well before the full tile has loaded).
+    return Boolean(tiles.get(key)?.walkable || far.get(key)?.walkable);
   }
 
   /** Low-detail height (raw metres) from a far copy; null where nothing is known. */

@@ -98,6 +98,11 @@ export function createTerrainMaterial(
         // Uniform-snap clipmap center in LOCAL tile space
         vec2 focusLocal = uFocusPos.xz - uTileOrigin;
         vec2 ringCenter = floor(focusLocal / snapPeriod + 0.5) * snapPeriod;
+        // A cell-registered raster has its samples at cell centres, half a cell from where the
+        // grid would put vertices. Put the vertices ON the samples: otherwise each vertex shows
+        // the average of four samples, which shaves metres off sharp ridges and cliff tops and
+        // leaves everything standing on the true height (the player, grass) floating above.
+        ringCenter += uCellReg * 0.5 * span / atlasGrid();
         vec2 rawLocal = ringCenter + position.xz;
         vec2 localXZ = clamp(rawLocal, -halfSpan, halfSpan);
         // Height samples clamp to atlas bounds

@@ -37,6 +37,8 @@ curl -s -X POST localhost:8765/api/tiles/stream -H 'Content-Type: application/js
 - **Raster registration.** A tile's own rasters are node-registered (first and last samples sit
   on the tile edges). The seam atlas is cell-registered. `seamAtlas.js` documents both; the
   shaders switch with `uCellReg`. Mixing them up shifts rivers a few metres off their channels.
+  The terrain mesh puts its vertices on the samples (a half-cell shift when `uCellReg` is set):
+  without it the drawn ground is a blurred copy and the player floats above sharp ridges.
 - **Vertical units.** Heights on disk are "viewer metres" (DEM metres × the chart's `vScale`,
   soft-kneed above 330 m). Shaders and meshes multiply by the UI's vertical-scale slider.
 - **One MPS thread.** All model work runs on the server's single worker thread; Metal crashes

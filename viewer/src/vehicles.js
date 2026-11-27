@@ -47,7 +47,7 @@ function hullSlab(outline, depth, top, material) {
   return m;
 }
 
-function buildBoat() {
+function buildBoat(k = 1) {
   const group = new THREE.Group();
   const outline = (s) => [
     [-1.7 * s, 4.3 * s],
@@ -66,9 +66,13 @@ function buildBoat() {
   box(group, 2.6, 0.18, 0.7, wood, 0, 1.25, -1.6);
   box(group, 0.7, 1.3, 0.8, mat('#30363d'), 0, 1.5, 4.5); // outboard motor
   box(group, 0.16, 0.16, 1.5, mat('#30363d'), 0.5, 1.9, 3.6);
+  for (const part of group.children) {
+    part.scale.multiplyScalar(k);
+    part.position.multiplyScalar(k);
+  }
   return {
     group,
-    seat: new THREE.Vector3(0, 0.35, 1.2),
+    seat: new THREE.Vector3(0, 0.35 * k, 1.2 * k),
     animate(state, dt, t) {
       const run = Math.min(1, Math.abs(state.speed) / VEHICLES.boat.maxSpeed);
       group.position.y += Math.sin(t * 1.7) * 0.12;
@@ -213,23 +217,32 @@ function buildGlider() {
   return { group, seat: new THREE.Vector3(0, 0, 0.4), animate() {} };
 }
 
-const BUILDERS = { boat: buildBoat, horse: buildHorse, jeep: buildJeep, glider: buildGlider };
+const BUILDERS = { boat: () => buildBoat(1), canoe: () => buildBoat(0.6), horse: buildHorse, jeep: buildJeep, glider: buildGlider };
 
 /**
  * Downloaded models. `fit` scales the model so that its length (along Z) or height matches, in
  * explorer units; `yaw` turns its front to -Z; `seat` replaces the stand-in's.
  */
 const MODELS = {
-  boat: { url: '/vehicles/watercraft/boat-speed-e.glb', fit: { length: 7.4 }, yaw: Math.PI, y: -0.42, seat: [0, 0.72, 1.2] },
+  // Several skins: summoning a boat while aboard one switches to the next
+  boat: [
+    { label: 'Speedboat', url: '/vehicles/watercraft/boat-speed-e.glb', fit: { length: 7.4 }, yaw: Math.PI, y: -0.42, seat: [0, 0.72, 1.2] },
+    // The helm is inside the cabin, so the sailor is not drawn
+    { label: 'Sailboat', url: '/vehicles/watercraft/boat-sail-a.glb', fit: { length: 9.6 }, yaw: Math.PI, y: -0.5, seat: [0, 0.75, 2.6], hideRider: true },
+  ],
+  // The kit has no canoe or kayak; its small rowing boat is the closest
+  canoe: [{ label: 'Rowing boat', url: '/vehicles/watercraft/boat-row-small.glb', fit: { length: 5.8 }, yaw: Math.PI, y: -0.3, seat: [0, -0.1, 0.5] }],
   // A closed cab: the driver is inside and not drawn
-  jeep: { url: '/vehicles/car/suv.glb', fit: { length: 8.0 }, yaw: Math.PI, y: 0, seat: [0, 1.0, 0], hideRider: true, wheels: /^wheel-(front|back)-(left|right)$/ },
-  horse: { url: '/vehicles/horse/horse.glb', fit: { height: 4.5 }, yaw: Math.PI, y: 0, seat: [0, 2.05, 0.25], clips: { idle: 'Idle', walk: 'Walk', gallop: 'Gallop' } },
+  jeep: [{ url: '/vehicles/car/suv.glb', fit: { length: 8.0 }, yaw: Math.PI, y: 0, seat: [0, 1.0, 0], hideRider: true, wheels: /^wheel-(front|back)-(left|right)$/ }],
+  horse: [{ url: '/vehicles/horse/horse.glb', fit: { height: 4.5 }, yaw: Math.PI, y: 0, seat: [0, 2.05, -0.55], clips: { idle: 'Idle', walk: 'Walk', gallop: 'Gallop' } }],
 };
+const skinIndex = {};
+const skinOf = (kind) => MODELS[kind]?.[(skinIndex[kind] || 0) % MODELS[kind].length];
 const loader = new GLTFLoader();
 
 /** Replace a stand-in's meshes with its downloaded model. Resolves false if there is none. */
 async function upgradeModel(model, kind, stillWanted) {
-  const spec = MODELS[kind];
+  const spec = skinOf(kind);
   if (!spec) return false;
   const gltf = await loader.loadAsync(spec.url);
   const root = gltf.scene;
@@ -349,18 +362,27 @@ export function createVehicles({ scene, terrain }) {
 
     /** Bring a vehicle to the player and put them on it. */
     summon(kind, x, z, heading) {
-      const spot = summonSpot(kind, terrain, x, z);
-      if (!spot.ok) return spot;
-      release();
-      state = createVehicleState(kind, spot.x, spot.z, heading, terrain);
-      state.steer = 0;
+      const skins = MODELS[kind] || [];
+      const swap = riding && state.kind === kind && skins.length > 1;
+      if (swap) {
+        // Already aboard one: same vehicle, next look
+        skinIndex[kind] = ((skinIndex[kind] || 0) + 1) % skins.length;
+        scene.remove(model.group);
+        disposeTree(model.group);
+      } else {
+        const spot = summonSpot(kind, terrain, x, z);
+        if (!spot.ok) return spot;
+        release();
+        state = createVehicleState(kind, spot.x, spot.z, heading, terrain);
+        state.steer = 0;
+      }
       const built = BUILDERS[kind]();
       model = built;
       scene.add(model.group);
       riding = true;
       pose();
       upgradeModel(built, kind, () => model === built).catch((err) => console.warn(`[vehicles] ${kind} model failed to load, keeping the stand-in:`, err.message));
-      return { ok: true };
+      return { ok: true, label: skinOf(kind)?.label || VEHICLES[kind].label, swapped: swap, skins: skins.length };
     },
 
     /** Mount the parked vehicle if the player is next to it. */

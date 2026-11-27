@@ -162,6 +162,7 @@ const vehicles = createVehicles({
   terrain: {
     height: (x, z) => sampleHeight(x, z),
     lake: (x, z) => sampleMasks(x, z).lake,
+    river: (x, z) => sampleMasks(x, z).river,
     move: (x, z, nx, nz) => resolveWalk(x, z, nx, nz),
   },
 });
@@ -1025,7 +1026,7 @@ function rebuildFarTiles() {
     );
     mat.uniforms.uCellReg.value = 1;
     mat.uniforms.uTileOrigin.value.set(ox, oz);
-    // The clipmap stays centred on its own tile: uniform (coarse) detail across it
+    // Until the first frame sets the focus (see the render loop): centred on its own tile
     mat.uniforms.uFocusPos.value.set(ox, 0, oz);
     mat.uniforms.uVScale.value = state.vScale;
     const mesh = new THREE.Mesh(farGeo, mat);
@@ -1949,10 +1950,16 @@ function summonVehicle(kind) {
     showToast(res.reason);
     return;
   }
+  if (res.swapped) {
+    showToast(`${res.label} (${VEHICLES[kind].key.toUpperCase()} again for the next look)`);
+    return;
+  }
   player.velY = 0;
   player.grounded = true;
   camRig.yaw = vehicles.state.heading + Math.PI; // start out looking over the vehicle's tail
-  showToast(`${VEHICLES[kind].label}: W/S speed, A/D steer, E to get off`);
+  const cfg = VEHICLES[kind];
+  const extra = cfg.jump ? ', Space jumps' : cfg.climb ? ', hold Space to catch the wind' : res.skins > 1 ? `, ${cfg.key.toUpperCase()} again changes boat` : '';
+  showToast(`${res.label}: W/S speed, A/D steer${extra}, E to get off`);
 }
 
 function leaveVehicle() {
@@ -1973,14 +1980,18 @@ function toggleMount() {
 }
 
 function updateRiding(dt, forwardInput, rightInput, sprint) {
-  const res = vehicles.update(dt, { throttle: forwardInput, steer: rightInput, boost: sprint }, clock.elapsedTime);
+  const res = vehicles.update(dt, { throttle: forwardInput, steer: rightInput, boost: sprint, action: keys.has(' ') }, clock.elapsedTime);
   const v = vehicles.state;
   const cfg = VEHICLES[v.kind];
   // The chase camera turns with the vehicle; dragging still looks around
   camRig.yaw += res.turned;
   player.pos.set(v.x, v.y, v.z);
   player.yaw = v.heading;
-  player.activity = v.blocked && forwardInput !== 0 ? (cfg.medium === 'water' ? 'SHALLOWS' : 'TOO STEEP') : cfg.activity;
+  if (v.blocked === 'edge') player.activity = atlas ? 'TERRAIN LOADING' : 'MAP EDGE';
+  else if (v.blocked && forwardInput !== 0) player.activity = cfg.medium === 'water' ? 'NO WATER AHEAD' : 'TOO STEEP';
+  else if (v.lifting) player.activity = 'SOARING';
+  else if (v.air && cfg.jump) player.activity = 'JUMPING';
+  else player.activity = cfg.activity;
   vehicles.placeRider(explorer);
   explorer.visible = state.camMode !== 'first' && !vehicles.hideRider;
   character.holder.position.y = 0;
@@ -2071,7 +2082,12 @@ function animate() {
     terrainMat.uniforms.uTime.value = t;
     terrainMat.uniforms.uFocusPos.value.copy(focus);
   }
-  for (const m of farMats()) m.uniforms.uTime.value = t;
+  for (const m of farMats()) {
+    m.uniforms.uTime.value = t;
+    // A far tile's finest rings follow the player too, so what is drawn next to (or briefly
+    // under) them is the same 256² surface that sampleFarHeight stands them on
+    m.uniforms.uFocusPos.value.copy(focus);
+  }
   if (waterMat) waterMat.uniforms.uTime.value = t;
   for (const r of allRivers()) r.material.uniforms.uTime.value = t;
   for (const l of allLakes()) l.material.uniforms.uTime.value = t;
