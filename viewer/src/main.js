@@ -6,6 +6,7 @@ import { createGrassField } from './grass.js';
 import { buildWorldProps, updatePropsTransform } from './props.js';
 import { buildTerrainClipmapGeometry } from './clipmap.js';
 import { createTileStreamController } from './tileStream.js';
+import { CHARACTER_PRESETS, createCharacter } from './character.js';
 import {
   buildSeamAtlas,
   sampleAtlasClimate,
@@ -135,8 +136,35 @@ const explorer = new THREE.Group();
   shadow.rotation.x = -Math.PI / 2;
   shadow.position.y = 0.08;
   explorer.add(shadow);
+  shadow.name = 'blob-shadow';
 }
 scene.add(explorer);
+
+// The rigged character replaces the placeholder figure above once it has loaded; if the
+// assets are missing the placeholder simply stays.
+const EXPLORER_HEIGHT = 3.3;
+const character = createCharacter({
+  parent: explorer,
+  height: EXPLORER_HEIGHT,
+  onReady: () => {
+    for (const part of explorer.children) {
+      if (part !== character.holder && part.name !== 'blob-shadow') part.visible = false;
+    }
+  },
+});
+character.holder.rotation.y = Math.PI; // the group's front is -Z, the model's is +Z
+
+function setCharacter(index) {
+  const n = CHARACTER_PRESETS.length;
+  const i = ((index % n) + n) % n;
+  try {
+    localStorage.setItem('terragrok.character', CHARACTER_PRESETS[i].id);
+  } catch {
+    // private browsing: the choice just does not persist
+  }
+  document.querySelectorAll('[data-char]').forEach((b) => b.classList.toggle('active', Number(b.dataset.char) === i));
+  character.setPreset(i).catch((err) => console.warn('[character] load failed', err.message));
+}
 
 // ---------- Isometric Explorer Pin & Cursor Reticle (visible ONLY in Mode 3 / Diorama) ----------
 const explorerPin = new THREE.Group();
@@ -627,6 +655,7 @@ window.addEventListener('keydown', (e) => {
   if (k === '3') setCameraMode('diorama');
   if (k === 'v') setStyleMode((state.styleMode + 1) % 3);
   if (k === 'h') document.body.classList.toggle('hud-hidden');
+  if (k === 'c') setCharacter(character.presetIndex + 1);
   if (k === 't' && state.camMode === 'diorama') {
     const hit = pointerNdc.inside ? pickTerrainAtNdc(pointerNdc.x, pointerNdc.y) : null;
     if (hit) {
@@ -1516,7 +1545,17 @@ function setStyleMode(styleIdx) {
   }
   if (grassObj) grassObj.mesh.visible = styleIdx === 0 && state.camMode !== 'diorama';
   for (const g of allProps()) g.visible = styleIdx !== 2;
-  document.querySelectorAll('[data-style]').forEach((b) => b.classList.toggle('active', Number(b.dataset.style) === styleIdx));
+  document.querySelectorAll('[data-char]').forEach((b) => b.addEventListener('click', () => setCharacter(Number(b.dataset.char))));
+{
+  let saved = null;
+  try {
+    saved = localStorage.getItem('terragrok.character');
+  } catch {
+    // ignore
+  }
+  setCharacter(Math.max(0, CHARACTER_PRESETS.findIndex((c) => c.id === saved)));
+}
+document.querySelectorAll('[data-style]').forEach((b) => b.classList.toggle('active', Number(b.dataset.style) === styleIdx));
 }
 
 function updateSun() {
@@ -1758,6 +1797,9 @@ function updateMovement(dt) {
     }
 
     player.activity = 'DIORAMA VIEW';
+    character.holder.position.y = 0;
+    character.setMotion('idle');
+    character.update(dt);
     return;
   }
 
@@ -1804,9 +1846,23 @@ function updateMovement(dt) {
   explorer.position.copy(player.pos);
   explorer.rotation.y = player.yaw + Math.PI;
   explorer.rotation.x = climbing && moving ? 0.25 : 0;
-  if (moving && player.grounded) {
+  if (moving && player.grounded && !character.ready) {
     explorer.position.y += Math.abs(Math.sin(t * (sprint ? 13 : 9))) * (climbing ? 0.22 : 0.4);
   }
+
+  // Deep enough to float: the sea below the shoreline shallows, or a lake
+  const swimming = player.grounded && (groundY < -0.25 || m.lake > 0.4);
+  if (!player.grounded) character.setMotion('jump');
+  else if (swimming) character.setMotion(moving ? 'swim' : 'tread', sprint ? 1.5 : 1.0);
+  else if (!moving) character.setMotion('idle');
+  else if (climbing) character.setMotion('walk', sprint ? 1.5 : 1.1);
+  else if (inWater) character.setMotion('walk', 1.3);
+  else character.setMotion(sprint ? 'sprint' : 'jog', sprint ? 1.25 : 1.1);
+  // Swim clips are authored with the water surface at the model's origin, while the player
+  // stands on the bed: lift the body to the surface (sea level is 0; a lake's is estimated)
+  const lift = swimming ? (groundY < -0.25 ? -player.pos.y : 0.5) : 0;
+  character.holder.position.y += (lift - character.holder.position.y) * Math.min(1, dt * 6);
+  character.update(dt);
   const cape = explorer.getObjectByName('cape');
   if (cape) cape.rotation.x = 0.2 + (moving ? 0.35 : 0.05) + Math.sin(t * 6) * 0.08;
 

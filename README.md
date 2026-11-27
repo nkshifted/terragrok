@@ -71,6 +71,13 @@ re-synthesis) the first time their world is opened.
 **The explorer.** [`viewer/src/main.js`](viewer/src/main.js) renders with a geometry clipmap, a
 custom terrain shader, river ribbons, lake surfaces, instanced grass and props.
 
+**The explorer's body.** [`viewer/src/character.js`](viewer/src/character.js) loads a rigged
+glTF character and plays walk / jog / sprint / swim / jump clips to match what the player is
+doing; `C` (or the Explorer buttons) switches between four presets. Each preset is an outfit
+(a headless clothed body) with a head, skin tone and hair attached to its skeleton. The
+models and animations are Quaternius's CC0 kits, packed into `viewer/public/characters/` by
+`experiments/pack_characters.py`.
+
 ## Layout
 
 | Path | What is there |
