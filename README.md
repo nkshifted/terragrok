@@ -78,6 +78,14 @@ doing; `C` (or the Explorer buttons) switches between four presets. Each preset 
 models and animations are Quaternius's CC0 kits, packed into `viewer/public/characters/` by
 `experiments/pack_characters.py`.
 
+**Vehicles.** `B`, `R`, `J` and `G` summon a boat, horse, jeep or glider and put the explorer on
+it; `E` gets off, or back on when standing next to it. W/S is speed and A/D steers. A boat
+stays on water, a jeep refuses steep slopes that a horse will climb, and a glider launches with
+a kick, sinks slowly, dives with W and flares with S.
+[`viewer/src/vehiclePhysics.js`](viewer/src/vehiclePhysics.js) holds those rules (pure, unit
+tested); [`viewer/src/vehicles.js`](viewer/src/vehicles.js) holds the meshes, which are
+built from primitives for now.
+
 ## Layout
 
 | Path | What is there |

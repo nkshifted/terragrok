@@ -19,8 +19,8 @@ just dev
 Starts the Stage 2 server (:8765) and the viewer (:5173). `.claude/launch.json` defines the
 viewer for preview tooling. To exercise streaming end to end you need a synthesized home world,
 which means the model: Apple Silicon, ~30 s per 2K tile. `window.__terragrok` in the explorer
-exposes `relocateExplorer(x, z)`, `focusDiorama(x, z, dist)` and `setCameraMode(mode)` for
-driving it from a console.
+exposes `relocateExplorer(x, z)`, `focusDiorama(x, z, dist)`, `setCameraMode(mode)`,
+`summonVehicle(kind)` and `getVehicle()` for driving it from a console.
 
 A browser tab that is hidden has its timers throttled, so the explorer's heartbeat slows to
 about one a minute. If tiles stop synthesizing while you test headlessly, post the heartbeat
@@ -67,6 +67,7 @@ that is cropped afterwards. New filters belong before that crop in `_synthesize_
 - `viewer/src/stage1Conditioning.js` and `tectonics.js` run in the browser **and** under node
   (`experiments/stage1_patch.mjs`). Keep them free of three.js and DOM APIs.
 - `viewer/src/seamAtlas.js` is pure for the same reason: it is unit-tested under node.
+- `viewer/src/vehiclePhysics.js` likewise: keep meshes and anything three.js in `vehicles.js`.
 
 ## Housekeeping
 

@@ -7,6 +7,8 @@ import { buildWorldProps, updatePropsTransform } from './props.js';
 import { buildTerrainClipmapGeometry } from './clipmap.js';
 import { createTileStreamController } from './tileStream.js';
 import { CHARACTER_PRESETS, createCharacter } from './character.js';
+import { createVehicles } from './vehicles.js';
+import { VEHICLES } from './vehiclePhysics.js';
 import {
   buildSeamAtlas,
   sampleAtlasClimate,
@@ -153,6 +155,17 @@ const character = createCharacter({
   },
 });
 character.holder.rotation.y = Math.PI; // the group's front is -Z, the model's is +Z
+
+// ---------- Vehicles ----------
+const vehicles = createVehicles({
+  scene,
+  terrain: {
+    height: (x, z) => sampleHeight(x, z),
+    lake: (x, z) => sampleMasks(x, z).lake,
+    move: (x, z, nx, nz) => resolveWalk(x, z, nx, nz),
+  },
+});
+
 
 function setCharacter(index) {
   const n = CHARACTER_PRESETS.length;
@@ -623,6 +636,7 @@ function pickTerrainAtNdc(ndcX, ndcY) {
 }
 
 function relocateExplorerTo(x, z) {
+  vehicles.release();
   if (!world) return false;
   // A pin dropped on a ghost / unsynthesized tile is ignored rather than snapped elsewhere
   if (atlas && !canWalk(x, z)) return false;
@@ -656,6 +670,10 @@ window.addEventListener('keydown', (e) => {
   if (k === 'v') setStyleMode((state.styleMode + 1) % 3);
   if (k === 'h') document.body.classList.toggle('hud-hidden');
   if (k === 'c') setCharacter(character.presetIndex + 1);
+  if (k === 'e') toggleMount();
+  for (const [kind, cfg] of Object.entries(VEHICLES)) {
+    if (k === cfg.key) summonVehicle(kind);
+  }
   if (k === 't' && state.camMode === 'diorama') {
     const hit = pointerNdc.inside ? pickTerrainAtNdc(pointerNdc.x, pointerNdc.y) : null;
     if (hit) {
@@ -1257,6 +1275,7 @@ function disposeWorldScene() {
 
 // ---------- Load World ----------
 async function loadWorld(worldId) {
+  vehicles.release();
   const loader = document.getElementById('loading');
   loader.classList.remove('hidden');
 
@@ -1447,6 +1466,7 @@ async function loadWorld(worldId) {
 
 // ---------- Teleport & Modes ----------
 function teleportTo(landmarkKey) {
+  vehicles.release();
   if (!world) return;
   const pt = world.meta.landmarks[landmarkKey] || [0.5, 0.5];
   const rawX = (pt[0] - 0.5) * world.meta.worldSpan;
@@ -1487,6 +1507,7 @@ function syncFogDensity() {
 
 function setCameraMode(mode) {
   // Leaving the isometric view: keep looking the way it was turned, so the compass does not jump
+  if (mode === 'diorama' && vehicles.riding) leaveVehicle();
   if (state.camMode === 'diorama' && mode !== 'diorama') {
     camRig.yaw = camRig.dioramaYaw;
     player.yaw = camRig.dioramaYaw + Math.PI;
@@ -1546,6 +1567,7 @@ function setStyleMode(styleIdx) {
   if (grassObj) grassObj.mesh.visible = styleIdx === 0 && state.camMode !== 'diorama';
   for (const g of allProps()) g.visible = styleIdx !== 2;
   document.querySelectorAll('[data-char]').forEach((b) => b.addEventListener('click', () => setCharacter(Number(b.dataset.char))));
+document.querySelectorAll('[data-vehicle]').forEach((b) => b.addEventListener('click', () => summonVehicle(b.dataset.vehicle)));
 {
   let saved = null;
   try {
@@ -1803,6 +1825,40 @@ function updateMovement(dt) {
     return;
   }
 
+  if (vehicles.riding) updateRiding(dt, forwardInput, rightInput, sprint);
+  else {
+    vehicles.update(dt, null, clock.elapsedTime);
+    updateOnFoot(dt, forwardInput, rightInput, sprint);
+  }
+
+  if (state.camMode === 'first') {
+    const eye = new THREE.Vector3(player.pos.x, player.pos.y + 4.2, player.pos.z);
+    const lookDir = new THREE.Vector3(
+      -Math.sin(camRig.yaw) * Math.cos(camRig.pitch),
+      -Math.sin(camRig.pitch),
+      -Math.cos(camRig.yaw) * Math.cos(camRig.pitch)
+    ).normalize();
+    const aheadH = sampleHeight(eye.x + lookDir.x * 8, eye.z + lookDir.z * 8);
+    if (aheadH + 2.0 > eye.y) eye.y = aheadH + 2.0;
+    camera.position.copy(eye);
+    camera.lookAt(eye.clone().add(lookDir));
+  } else {
+    const target = new THREE.Vector3(player.pos.x, player.pos.y + 4.2, player.pos.z);
+    const hDist = Math.cos(camRig.pitch) * camRig.dist;
+    const vDist = Math.sin(camRig.pitch) * camRig.dist;
+    const camPos = new THREE.Vector3(
+      target.x + Math.sin(camRig.yaw) * hDist,
+      target.y + vDist,
+      target.z + Math.cos(camRig.yaw) * hDist
+    );
+    const camFloor = sampleHeight(camPos.x, camPos.z) + 2.5;
+    if (camPos.y < camFloor) camPos.y = camFloor;
+    camera.position.copy(camPos);
+    camera.lookAt(target);
+  }
+}
+
+function updateOnFoot(dt, forwardInput, rightInput, sprint) {
   const slopeDeg = sampleSlopeDeg(player.pos.x, player.pos.z);
   const m = sampleMasks(player.pos.x, player.pos.z);
   const groundY = sampleHeight(player.pos.x, player.pos.z);
@@ -1844,8 +1900,7 @@ function updateMovement(dt) {
   const t = clock.elapsedTime;
   const moving = move.lengthSq() > 0.01;
   explorer.position.copy(player.pos);
-  explorer.rotation.y = player.yaw + Math.PI;
-  explorer.rotation.x = climbing && moving ? 0.25 : 0;
+  explorer.rotation.set(climbing && moving ? 0.25 : 0, player.yaw + Math.PI, 0, 'YXZ');
   if (moving && player.grounded && !character.ready) {
     explorer.position.y += Math.abs(Math.sin(t * (sprint ? 13 : 9))) * (climbing ? 0.22 : 0.4);
   }
@@ -1872,32 +1927,65 @@ function updateMovement(dt) {
   else if (climbing) player.activity = 'CLIMBING';
   else if (moving) player.activity = sprint ? 'SPRINTING' : 'WALKING';
   else player.activity = 'EXPLORING';
+}
 
-  if (state.camMode === 'first') {
-    const eye = new THREE.Vector3(player.pos.x, player.pos.y + 4.2, player.pos.z);
-    const lookDir = new THREE.Vector3(
-      -Math.sin(camRig.yaw) * Math.cos(camRig.pitch),
-      -Math.sin(camRig.pitch),
-      -Math.cos(camRig.yaw) * Math.cos(camRig.pitch)
-    ).normalize();
-    const aheadH = sampleHeight(eye.x + lookDir.x * 8, eye.z + lookDir.z * 8);
-    if (aheadH + 2.0 > eye.y) eye.y = aheadH + 2.0;
-    camera.position.copy(eye);
-    camera.lookAt(eye.clone().add(lookDir));
-  } else {
-    const target = new THREE.Vector3(player.pos.x, player.pos.y + 4.2, player.pos.z);
-    const hDist = Math.cos(camRig.pitch) * camRig.dist;
-    const vDist = Math.sin(camRig.pitch) * camRig.dist;
-    const camPos = new THREE.Vector3(
-      target.x + Math.sin(camRig.yaw) * hDist,
-      target.y + vDist,
-      target.z + Math.cos(camRig.yaw) * hDist
-    );
-    const camFloor = sampleHeight(camPos.x, camPos.z) + 2.5;
-    if (camPos.y < camFloor) camPos.y = camFloor;
-    camera.position.copy(camPos);
-    camera.lookAt(target);
+let toastTimer = 0;
+function showToast(text) {
+  const el = document.getElementById('toast');
+  if (!el) return;
+  el.textContent = text;
+  el.classList.add('show');
+  window.clearTimeout(toastTimer);
+  toastTimer = window.setTimeout(() => el.classList.remove('show'), 2600);
+}
+
+function summonVehicle(kind) {
+  if (!world || state.camMode === 'diorama') {
+    showToast('Leave the isometric view to summon a vehicle');
+    return;
   }
+  const res = vehicles.summon(kind, player.pos.x, player.pos.z, player.yaw);
+  if (!res.ok) {
+    showToast(res.reason);
+    return;
+  }
+  player.velY = 0;
+  player.grounded = true;
+  camRig.yaw = vehicles.state.heading + Math.PI; // start out looking over the vehicle's tail
+  showToast(`${VEHICLES[kind].label}: W/S speed, A/D steer, E to get off`);
+}
+
+function leaveVehicle() {
+  const out = vehicles.dismount();
+  if (!out) return;
+  player.pos.set(out.x, out.y, out.z);
+  player.yaw = out.heading;
+  player.velY = out.vy;
+  player.grounded = !out.airborne;
+}
+
+function toggleMount() {
+  if (vehicles.riding) leaveVehicle();
+  else if (state.camMode !== 'diorama' && !vehicles.mountNearby(player.pos.x, player.pos.z) && vehicles.kind) {
+    showToast(`Walk up to the ${VEHICLES[vehicles.kind].label.toLowerCase()} to get on`);
+  }
+}
+
+function updateRiding(dt, forwardInput, rightInput, sprint) {
+  const res = vehicles.update(dt, { throttle: forwardInput, steer: rightInput, boost: sprint }, clock.elapsedTime);
+  const v = vehicles.state;
+  const cfg = VEHICLES[v.kind];
+  // The chase camera turns with the vehicle; dragging still looks around
+  camRig.yaw += res.turned;
+  player.pos.set(v.x, v.y, v.z);
+  player.yaw = v.heading;
+  player.activity = v.blocked && forwardInput !== 0 ? (cfg.medium === 'water' ? 'SHALLOWS' : 'TOO STEEP') : cfg.activity;
+  vehicles.placeRider(explorer);
+  character.holder.position.y = 0;
+  // A glider pilot hangs level: the swim pose, held still
+  character.setMotion(cfg.rider, cfg.rider === 'swim' ? 0.02 : 1);
+  character.update(dt);
+  if (res.landed) leaveVehicle();
 }
 
 function updateTelemetry() {
@@ -2030,6 +2118,9 @@ async function init() {
 }
 
 window.__terragrok = {
+  summonVehicle,
+  toggleMount,
+  getVehicle: () => (vehicles.state ? { ...vehicles.state, riding: vehicles.riding } : null),
   loadWorld,
   teleportTo,
   setCameraMode,
