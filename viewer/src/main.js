@@ -16,6 +16,7 @@ import {
   sampleAtlasMasks,
   seamOffsetAt,
   tileAt,
+  tileKey,
 } from './seamAtlas.js';
 
 // ---------- Renderer & Scene ----------
@@ -162,6 +163,7 @@ const vehicles = createVehicles({
   terrain: {
     height: (x, z) => sampleHeight(x, z),
     lake: (x, z) => sampleMasks(x, z).lake,
+    lakeLevel: (x, z) => lakeLevelAt(x, z),
     river: (x, z) => sampleMasks(x, z).river,
     move: (x, z, nx, nz) => resolveWalk(x, z, nx, nz),
   },
@@ -1175,6 +1177,65 @@ function sampleSlopeDeg(x, z) {
   return THREE.MathUtils.radToDeg(Math.atan(Math.hypot(hx, hz)));
 }
 
+// Lake cells -> water level, built once per tile's lake list
+const lakeIndexes = new WeakMap();
+function lakeIndexFor(lakes, gridSize) {
+  let index = lakeIndexes.get(lakes);
+  if (!index) {
+    index = new Map();
+    for (const lake of lakes) {
+      for (const [r, c] of lake.cells || []) index.set(r * gridSize + c, lake.level);
+    }
+    lakeIndexes.set(lakes, index);
+  }
+  return index;
+}
+
+/**
+ * Height of the lake surface at (x, z), in the same units as sampleHeight, or null when the
+ * point is not on a lake. The lake MASK says where lakes are; only the lake list knows how high
+ * each one's water stands above its bed.
+ */
+function lakeLevelAt(x, z) {
+  if (!world) return null;
+  let lakes = world.lakes;
+  let meta = world.meta;
+  let ox = 0;
+  let oz = 0;
+  let seam = 0;
+  if (atlas) {
+    const span = atlas.meta.worldSpan;
+    const t = tileAt(span, x, z);
+    const key = tileKey(t.qi, t.qj);
+    const inWindow = tileStream.getWindow().tiles.get(key);
+    const entry = inWindow || tileStream.getFarTiles().find((e) => e.key === key);
+    if (!entry || !entry.lakes?.length) return null;
+    lakes = entry.lakes;
+    meta = entry.meta;
+    ox = t.qi * span;
+    oz = t.qj * span;
+    // Window tiles are drawn on the seam-corrected surface, and so are their lakes
+    if (inWindow && atlas.slots.has(key)) seam = seamOffsetAt(atlas, x, z);
+  }
+  if (!lakes?.length) return null;
+  const g = meta.lakeGridSize || meta.size;
+  const span = meta.worldSpan || world.meta.worldSpan;
+  const index = lakeIndexFor(lakes, g);
+  const c0 = Math.round(((x - ox) / span + 0.5) * (g - 1));
+  const r0 = Math.round(((z - oz) / span + 0.5) * (g - 1));
+  // The drawn sheet reaches two cells past the basin, where the shore tapers out
+  for (let reach = 0; reach <= 2; reach++) {
+    for (let dr = -reach; dr <= reach; dr++) {
+      for (let dc = -reach; dc <= reach; dc++) {
+        if (Math.max(Math.abs(dr), Math.abs(dc)) !== reach) continue;
+        const level = index.get((r0 + dr) * g + (c0 + dc));
+        if (level !== undefined) return (level + seam) * state.vScale;
+      }
+    }
+  }
+  return null;
+}
+
 function sampleMasks(x, z) {
   if (!world) return { river: 0, lake: 0, curv: 0.5, moisture: 0.5 };
   if (atlas) {
@@ -1885,7 +1946,13 @@ function updateOnFoot(dt, forwardInput, rightInput, sprint) {
     player.yaw = Math.atan2(move.x, move.z);
   }
 
-  const floorY = Math.max(sampleHeight(player.pos.x, player.pos.z), -0.4);
+  // In water over waist depth the player floats: they are held just under the surface (the sea's
+  // is 0, a lake's is its own level) and never sink to the bed, so the camera, the shadow and
+  // the swim pose all stay at the water. There is no diving.
+  const bedY = sampleHeight(player.pos.x, player.pos.z);
+  const lakeTop = sampleMasks(player.pos.x, player.pos.z).lake > 0.4 ? lakeLevelAt(player.pos.x, player.pos.z) : null;
+  const lakeDepth = lakeTop === null ? 0 : lakeTop - bedY;
+  const floorY = Math.max(bedY, lakeDepth > 1.1 ? lakeTop - 0.4 : -0.4);
   if (keys.has(' ') && player.grounded) {
     player.velY = 22;
     player.grounded = false;
@@ -1906,8 +1973,10 @@ function updateOnFoot(dt, forwardInput, rightInput, sprint) {
     explorer.position.y += Math.abs(Math.sin(t * (sprint ? 13 : 9))) * (climbing ? 0.22 : 0.4);
   }
 
-  // Deep enough to float: the sea below the shoreline shallows, or a lake
-  const swimming = player.grounded && (groundY < -0.25 || m.lake > 0.4);
+  // Deep enough to float: the sea below the shoreline shallows, or a lake over waist depth
+  // (a lake whose level is not known counts as one, with its surface guessed just above the bed)
+  const inLake = lakeDepth > 1.1 || (lakeTop === null && m.lake > 0.4);
+  const swimming = player.grounded && (inLake || groundY < -0.25);
   if (!player.grounded) character.setMotion('jump');
   else if (swimming) character.setMotion(moving ? 'swim' : 'tread', sprint ? 1.5 : 1.0);
   else if (!moving) character.setMotion('idle');
@@ -1915,8 +1984,10 @@ function updateOnFoot(dt, forwardInput, rightInput, sprint) {
   else if (inWater) character.setMotion('walk', 1.3);
   else character.setMotion(sprint ? 'sprint' : 'jog', sprint ? 1.25 : 1.1);
   // Swim clips are authored with the water surface at the model's origin, while the player
-  // stands on the bed: lift the body to the surface (sea level is 0; a lake's is estimated)
-  const lift = swimming ? (groundY < -0.25 ? -player.pos.y : 0.5) : 0;
+  // stands on the bed: lift the body to the surface (sea level is 0; a lake has its own level)
+  // Measured from where the player stands, which is clamped and so not always the bed itself
+  const surfaceY = lakeDepth > 1.1 ? lakeTop : inLake ? player.pos.y + 0.5 : 0;
+  const lift = swimming ? surfaceY - player.pos.y : 0;
   character.holder.position.y += (lift - character.holder.position.y) * Math.min(1, dt * 6);
   character.update(dt);
   const cape = explorer.getObjectByName('cape');

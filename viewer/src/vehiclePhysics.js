@@ -11,6 +11,7 @@
  * The world is reached through a `terrain` object:
  *   height(x, z)            ground height (viewer metres, sea level 0)
  *   lake(x, z)              lake mask 0..1
+ *   lakeLevel(x, z)         height of the lake surface there, or null (optional)
  *   river(x, z)             river mask 0..1 (optional; only small craft use it)
  *   move(x, z, nx, nz)      -> { x, z, blocked }: clamps a step to the loaded, walkable world
  */
@@ -42,8 +43,13 @@ export function isWater(terrain, x, z, rivers = false) {
 /** Height of the water surface at a point that `isWater`. */
 export function waterLevel(terrain, x, z) {
   const h = terrain.height(x, z);
+  if (terrain.lake(x, z) > LAKE_MASK) {
+    // The real surface when the terrain knows it; a lake can be metres deep, or sit below sea level
+    const level = terrain.lakeLevel ? terrain.lakeLevel(x, z) : null;
+    return level != null && level > h ? level : h + 0.5;
+  }
   if (h < SEA_DEPTH) return 0;
-  return h + (terrain.lake(x, z) > LAKE_MASK ? 0.5 : 0.3);
+  return h + 0.3;
 }
 
 export function slopeDegAlong(terrain, x, z, heading, reach = 6) {
@@ -155,8 +161,16 @@ function stepWater(s, cfg, input, dt, terrain) {
       s.speed = 0;
     }
   }
-  s.y = isWater(terrain, s.x, s.z, cfg.rivers) ? waterLevel(terrain, s.x, s.z) : terrain.height(s.x, s.z) + 0.15;
-  s.pitch = 0;
+  const surface = (x, z) => (isWater(terrain, x, z, cfg.rivers) ? waterLevel(terrain, x, z) : terrain.height(x, z) + 0.15);
+  s.y = surface(s.x, s.z);
+  if (cfg.rivers) {
+    // A river runs downhill: the hull lies along the water's slope, bow down on a steep reach.
+    // Lakes and the sea are level, so this is zero there.
+    const fx = Math.sin(s.heading) * 3;
+    const fz = Math.cos(s.heading) * 3;
+    const slope = Math.atan2(surface(s.x + fx, s.z + fz) - surface(s.x - fx, s.z - fz), 6);
+    s.pitch += (slope - s.pitch) * Math.min(1, dt * 6);
+  } else s.pitch = 0;
   s.roll = approach(s.roll, input.steer * 0.12 * Math.min(1, Math.abs(s.speed) / cfg.maxSpeed), dt);
 }
 

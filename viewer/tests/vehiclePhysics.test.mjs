@@ -188,6 +188,15 @@ test('summoning respects the medium', () => {
   assert.equal(summonSpot('glider', FLAT, 0, 0).ok, true);
 });
 
+test('a boat rides at the real lake surface when the terrain knows it', () => {
+  // A basin 6 deep: bed at 40, water standing at 46
+  const tarn = { ...world(() => 40, { lake: (x) => (Math.abs(x) < 50 ? 1 : 0) }), lakeLevel: (x) => (Math.abs(x) < 50 ? 46 : null) };
+  const s = createVehicleState('boat', 0, 0, EAST, tarn);
+  assert.equal(s.y, 46);
+  run(s, tarn, { throttle: 1 }, 2);
+  assert.equal(s.y, 46);
+});
+
 test('a lake floats a boat above its bed', () => {
   const lake = world(() => 40, { lake: (x) => (Math.abs(x) < 50 ? 1 : 0) });
   const s = createVehicleState('boat', 0, 0, EAST, lake);
@@ -241,6 +250,18 @@ test('a canoe keeps going down a narrow, winding, cluttered creek', () => {
   assert.ok(Math.abs(manual.z) < 20 && manual.blocked === 'terrain', `held the key and ran aground at z=${manual.z}`);
   // A boat gets no such help
   assert.equal(summonSpot('boat', creek, 0, 0).ok, false);
+});
+
+test('a canoe tilts with a river that runs downhill, and lies level on a lake', () => {
+  // A river along z = 0 dropping 35 degrees to the east, into a level lake beyond x = 300
+  const drop = Math.tan((35 * Math.PI) / 180);
+  const falls = world((x) => 400 - Math.min(x, 300) * drop, { river: (x, z) => (x <= 300 && Math.abs(z) < 6 ? 1 : 0), lake: (x) => (x > 300 ? 1 : 0) });
+  const down = run(createVehicleState('canoe', 0, 0, EAST, falls), falls, { throttle: 1 }, 4);
+  assert.ok(Math.abs(down.pitch + (35 * Math.PI) / 180) < 0.05, `bow down going downstream (pitch ${down.pitch})`);
+  const up = run(createVehicleState('canoe', 200, 0, -EAST, falls), falls, { throttle: 1 }, 4);
+  assert.ok(up.pitch > 0.5, `bow up going upstream (pitch ${up.pitch})`);
+  const lake = run(createVehicleState('canoe', 400, 0, EAST, falls), falls, { throttle: 1 }, 4);
+  assert.ok(Math.abs(lake.pitch) < 1e-6);
 });
 
 test('holding the action key lifts a glider, up to its ceiling', () => {
