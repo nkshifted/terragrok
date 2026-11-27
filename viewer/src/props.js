@@ -20,7 +20,18 @@ export function buildWorldProps(worldData, vScale = 1.0, opts = {}) {
   const group = new THREE.Group();
   const { size, worldSpan, maxElev, hasClimate, tempRange, precipRange } = worldData.meta;
   const climateSize = worldData.meta.climateSize || size;
-  const { heights, masks, climate } = worldData;
+  const { heights, masks, climate, rock } = worldData;
+  // Fresh lava and cinder (the volcanic channel above the regional cap, see volcano.py) is
+  // bare: nothing has had time to grow on it and no loose boulders lie on it. So is a salt
+  // flat (the limestone channel above the cap, see basins.py) and the crust around a hot
+  // spring (the granite channel above it).
+  const onYoungLava = (gx, gy) => {
+    if (!rock) return false;
+    const cu = Math.max(0, Math.min(climateSize - 1, Math.round((gx / Math.max(size - 1, 1)) * (climateSize - 1))));
+    const cv = Math.max(0, Math.min(climateSize - 1, Math.round((gy / Math.max(size - 1, 1)) * (climateSize - 1))));
+    const ri = (cv * climateSize + cu) * 4;
+    return rock[ri] > 214 || rock[ri + 1] > 214 || rock[ri + 2] > 214;
+  };
   const cellSize = worldSpan / (size - 1);
   const spanFactor = Math.min(Math.max(worldSpan / 2400, 1.0), 2.1);
   const maxTrees = Math.round(5200 * spanFactor * density);
@@ -65,6 +76,7 @@ export function buildWorldProps(worldData, vScale = 1.0, opts = {}) {
 
     const hNorm = elev / Math.max(maxElev, 1);
     if (elev < 5.5 || lake > 0.2 || river > 0.26) continue;
+    if (onYoungLava(gx, gy)) continue;
 
     let tempC = 14.0 - hNorm * 18.0;
     let precipNorm = moisture;
@@ -119,6 +131,7 @@ export function buildWorldProps(worldData, vScale = 1.0, opts = {}) {
     const river = masks[mIdx] / 255;
     const lake = masks[mIdx + 1] / 255;
     if (elev < 1.5 || lake > 0.4) continue;
+    if (onYoungLava(gx, gy)) continue;
 
     const dzx = (heights[idx + 1] - heights[idx - 1]) / (2 * cellSize);
     const dzy = (heights[idx + size] - heights[idx - size]) / (2 * cellSize);

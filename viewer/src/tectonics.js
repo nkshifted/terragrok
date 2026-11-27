@@ -1386,6 +1386,22 @@ function pickVolcanoes(seed, N, heights, unitX, unitY, unitZ, volcPot, volcKind,
       if (count.shield >= k.most || tooClose(isl.p[0], isl.p[1], isl.p[2])) return;
       add('shield', isl.p[0], isl.p[1], isl.p[2], seed * 131 + i, Math.max(k.radius[0], Math.min(k.radius[1], isl.r * 1.5)));
     });
+
+  // One of the planet's big volcanoes is not erupting but simmering: its crater holds a hot,
+  // mineral-rich pool that steams (see fill_hot_springs in experiments/volcano.py)
+  let spring = null;
+  let springScore = -1;
+  for (const v of out) {
+    const h = hash01(v.id * 7 + 5);
+    if (v.kind !== 'cinder' && h > springScore) {
+      spring = v;
+      springScore = h;
+    }
+  }
+  if (spring) {
+    spring.hotSpring = true;
+    spring.active = false;
+  }
   return out;
 }
 

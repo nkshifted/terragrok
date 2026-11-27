@@ -69,6 +69,15 @@ limestone, blue-grey tilted slate. Active volcanoes get a lava pool in the crate
 strengthens as the sun drops, and a smoke column ([`viewer/src/volcanoFx.js`](viewer/src/volcanoFx.js)). Worlds made before this get a rock map on first use, but
 no cones.
 
+Craters and water: an erupting crater is hidden from the river and lake solver, so it stays
+dry; a dormant one may fill with an ordinary lake. One big volcano per planet is a hot spring
+instead (turquoise on the globe): its crater holds a pool ringed in orange, yellow and green
+with pale mineral crust around it, and it steams (`fill_hot_springs` in `volcano.py`).
+
+A hollow below sea level that is cut off from the ocean and too dry to hold a lake becomes a
+salt flat ([`experiments/basins.py`](experiments/basins.py)); left alone, the sea would show
+through it.
+
 **Streaming: the patch grows.** The home patch defines a *chart*: a flat projection of the planet
 centred on it. Each further tile is the same chart shifted by whole tiles, synthesized as a
 shifted window of the *same* diffusion world with the same seed, settings and vertical scale.

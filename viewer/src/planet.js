@@ -1617,7 +1617,7 @@ function buildSphericalForest(R, maxElev) {
 
 /**
  * A cone on the globe for each of the planet's volcanoes, drawn taller than life so they can be
- * found from orbit: red-orange if active, dark if dormant. The real ones are built into the
+ * found from orbit: red-orange if active, dark if dormant, turquoise for the hot spring. The real ones are built into the
  * terrain when a region is synthesized.
  */
 function buildVolcanoMarkers(R) {
@@ -1641,7 +1641,10 @@ function buildVolcanoMarkers(R) {
     dummy.scale.set(radius, radius * tall[v.kind], radius);
     dummy.updateMatrix();
     inst.setMatrixAt(i, dummy.matrix);
-    inst.setColorAt(i, v.active ? color.setRGB(0.95, 0.33, 0.1) : color.setRGB(0.24, 0.2, 0.19));
+    if (v.hotSpring) color.setRGB(0.1, 0.85, 0.8);
+    else if (v.active) color.setRGB(0.95, 0.33, 0.1);
+    else color.setRGB(0.24, 0.2, 0.19);
+    inst.setColorAt(i, color);
   });
   inst.count = list.length;
   inst.instanceMatrix.needsUpdate = true;

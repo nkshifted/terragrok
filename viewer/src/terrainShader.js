@@ -375,11 +375,18 @@ export function createTerrainMaterial(
         float wLime = 0.0;
         float wMeta = 0.0;
         float youngLava = 0.0;
+        float saltPan = 0.0;
+        float sinter = 0.0;
         if (uHasRock == 1) {
           vec2 nudge = (vec2(fbm3(vWorldPos.xz * 0.011), fbm3(vWorldPos.zx * 0.011 + 31.7)) - 0.5) * (90.0 / uWorldSpan);
           vec4 rk = texture2D(uRock, clamp(vUv + nudge, 0.0, 1.0));
           // Cones are small and exact: read them without the nudge
-          youngLava = smoothstep(0.84, 0.98, texture2D(uRock, vUv).g);
+          vec4 rkExact = texture2D(uRock, vUv);
+          youngLava = smoothstep(0.84, 0.98, rkExact.g);
+          // Likewise a dry basin floor (limestone channel above the regional cap, see basins.py)
+          saltPan = smoothstep(0.84, 0.98, rkExact.b);
+          // ...and the mineral crust around a hot spring (granite channel, see volcano.py)
+          sinter = smoothstep(0.84, 0.98, rkExact.r);
           wGranite = smoothstep(0.18, 0.5, rk.r);
           wVolcanic = max(smoothstep(0.18, 0.5, rk.g), youngLava);
           wLime = smoothstep(0.18, 0.5, rk.b);
@@ -483,6 +490,21 @@ export function createTerrainMaterial(
         float bareGround = clamp(desertMask * 0.55 + (1.0 - smoothstep(0.15, 0.5, effMoist)) * 0.25, 0.0, 1.0) * wRock;
         albedo = mix(albedo, mix(albedo, rockCol, 0.6), bareGround * smoothstep(2.0, 7.5, elev));
         albedo = mix(albedo, rockCol, screeMask);
+        // Salt flat: blinding white crust broken into polygons by darker, damp cracks
+        if (saltPan > 0.01) {
+          float cell = vnoise(vWorldPos.xz * 0.22) * 0.6 + vnoise(vWorldPos.xz * 0.51 + 9.3) * 0.4;
+          float crackLine = 1.0 - smoothstep(0.0, 0.05, abs(cell - 0.5));
+          vec3 salt = mix(vec3(0.93, 0.92, 0.88), vec3(0.80, 0.76, 0.68), macroNoise * 0.6);
+          salt = mix(salt, vec3(0.55, 0.50, 0.44), crackLine * 0.55);
+          albedo = mix(albedo, salt, saltPan * smoothstep(0.2, 0.6, elev));
+        }
+        // Hot spring: pale silica crust, stained orange and rust where warm water runs over it
+        if (sinter > 0.01) {
+          vec3 crust = mix(vec3(0.90, 0.88, 0.82), vec3(0.74, 0.70, 0.62), macroNoise * 0.6);
+          float mats = smoothstep(0.45, 0.68, vnoise(vWorldPos.xz * 0.07) * 0.6 + vnoise(vWorldPos.xz * 0.27 + 4.0) * 0.4);
+          crust = mix(crust, mix(vec3(0.86, 0.52, 0.12), vec3(0.56, 0.25, 0.08), fineNoise), mats * 0.75);
+          albedo = mix(albedo, crust, sinter);
+        }
 
         // Snow & Polar Ice accumulation (polar ice sheets reach sea level; temperate snow follows freezing isotherm)
         float snowMask = 0.0;
@@ -509,6 +531,7 @@ export function createTerrainMaterial(
         // Underwater lakebeds get dark rocky silt beneath the real 3D flat lake mesh
         if (lake > 0.35 && elev > 0.0) {
           vec3 lakeBed = mix(vec3(0.22, 0.24, 0.21), vec3(0.12, 0.16, 0.18), fineNoise);
+          lakeBed = mix(lakeBed, vec3(0.84, 0.56, 0.14), sinter); // a hot pool's bed is bright with mats
           albedo = mix(albedo, lakeBed, smoothstep(0.35, 0.7, lake) * 0.85);
           wetSpec = max(wetSpec, 0.35);
         }
@@ -630,7 +653,8 @@ export function createWaterMaterial(heightFloatTex, maskTex, worldSpan, gridSize
 
       void main() {
         vec3 pos = position;
-        pos.y += sin(pos.x * 0.045 + uTime * 1.7) * 0.24 + cos(pos.z * 0.055 - uTime * 1.35) * 0.20;
+        // A slow swell (9 to 12 s per wave): faster reads as the whole sea sloshing in and out
+        pos.y += sin(pos.x * 0.045 + uTime * 0.68) * 0.24 + cos(pos.z * 0.055 - uTime * 0.54) * 0.20;
         vec4 wp = modelMatrix * vec4(pos, 1.0);
         vWorldPos = wp.xyz;
         gl_Position = projectionMatrix * viewMatrix * wp;
@@ -692,7 +716,7 @@ export function createWaterMaterial(heightFloatTex, maskTex, worldSpan, gridSize
 
         // Animated shoreline foam bands
         float shoreMask = 1.0 - smoothstep(0.0, 3.8, depthM);
-        float foamRipple = sin(depthM * 3.8 - uTime * 3.2 + w1 * 3.0) * 0.5 + 0.5;
+        float foamRipple = sin(depthM * 3.8 - uTime * 1.1 + w1 * 3.0) * 0.5 + 0.5;
         float foam = smoothstep(0.42, 0.72, shoreMask + foamRipple * shoreMask * 0.5);
         baseCol = mix(baseCol, vec3(0.92, 0.97, 1.0), foam * 0.85);
 

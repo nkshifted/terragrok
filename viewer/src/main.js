@@ -911,6 +911,7 @@ function rebuildChart() {
     const gu = grassObj.material.uniforms;
     gu.uHeightTex.value = heightFloatTex;
     gu.uMasks.value = maskTex;
+    gu.uRock.value = rockTex;
     gu.uWorldSpan.value = atlasSpan;
     gu.uTexOrigin.value.set(centerX, centerZ);
   }
@@ -942,9 +943,15 @@ function refreshVolcanoFx() {
   const list = [];
   const add = (meta, ox, oz) => {
     for (const v of meta?.volcanoes || []) {
-      if (!v.active) continue;
       const x = v.x + ox;
       const z = v.z + oz;
+      if (v.hotSpring) {
+        // Steam off the pool, if this crater came to hold one
+        if (v.springLevelM != null) list.push({ id: v.id, kind: v.kind, x, z, y: v.springLevelM, radiusM: v.radiusM, steam: true });
+        continue;
+      }
+      // A crater that filled with rain (regions made before craters were kept dry) has gone quiet
+      if (!v.active || lakeLevelAt(x, z) != null) continue;
       // The crater floor: the ground at the cone's centre (heights are stored unscaled)
       const ground = sampleHeight(x, z) / state.vScale;
       list.push({ id: v.id, kind: v.kind, x, z, y: ground > 0.5 ? ground : v.summitM - 6, radiusM: v.radiusM });
@@ -1090,6 +1097,7 @@ function rebuildFarTiles() {
           heights: e.heights,
           masks,
           climate: e.climate,
+          rock: e.rock,
         },
         state.vScale,
         { originX: ox, originZ: oz, seed: (4242 + e.qi * 7919 + e.qj * 104729) >>> 0, density: 0.3 }
@@ -1173,6 +1181,7 @@ function rebuildTileDecor(win) {
         heights: e.slot.grid,
         masks: e.slot.masks,
         climate: e.slot.climate,
+        rock: e.slot.rock,
       },
       state.vScale,
       { originX: ox, originZ: oz, surfaceAt: surface, seed: (4242 + e.qi * 7919 + e.qj * 104729) >>> 0 }
@@ -1501,6 +1510,7 @@ async function loadWorld(worldId) {
   // 4. GPU-Instanced 48,000-Blade Wind-Swaying 3D Grass Ring
   grassObj = createGrassField(heightFloatTex, maskTex, worldSpan, maxElev, 48000, 155.0);
   grassObj.material.uniforms.uVScale.value = state.vScale;
+  if (rockTex) grassObj.material.uniforms.uRock.value = rockTex;
   scene.add(grassObj.mesh);
 
   // 5. Multi-Tier Conifers, Broadleaf Valley Trees & Craggy Cliff/River Boulders

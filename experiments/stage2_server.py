@@ -75,7 +75,8 @@ from chart import (  # noqa: E402
 from tile_ghost import list_tiles_for_home, write_ghost_tile  # noqa: E402
 from tile_grid import chart_tile_id  # noqa: E402
 from tile_stream import TILE_STREAMS  # noqa: E402
-from volcano import ROCK_VERSION, decode_rock, pack_rock, stamp_volcanoes  # noqa: E402
+from basins import dry_landlocked_basins  # noqa: E402
+from volcano import ROCK_VERSION, crater_plugs, decode_rock, fill_hot_springs, pack_rock, stamp_volcanoes  # noqa: E402
 from world_cache import CATALOG_LOCK, load_synth_catalog, save_synth_catalog  # noqa: E402
 
 # Back-compat alias used throughout this module
@@ -888,16 +889,17 @@ class WarmStage2Engine:
             # cone shared with a neighbouring tile is the same on both sides (see volcano.py).
             volcanoes = payload.get("volcanoes") if isinstance(payload.get("volcanoes"), list) else None
             lava = None
+            plugs = None
             placed_volcanoes: list[dict] = []
             if volcanoes:
-                elev_viewer, lava, placed_volcanoes = stamp_volcanoes(
-                    elev_viewer,
-                    volcanoes,
+                cone_args = dict(
                     tile_px=out_n,
                     margin_px=margin,
                     world_span_m=world_span_m,
                     base_to_viewer=lambda dem: float(dem_to_viewer(np.float32([dem]), v_scale)[0]),
                 )
+                elev_viewer, lava, placed_volcanoes = stamp_volcanoes(elev_viewer, volcanoes, **cone_args)
+                plugs = crater_plugs(volcanoes, elev_viewer.shape, **cone_args)
 
             # Stage 1's planetary climate with a share of TD30m's local detail, blended per pixel so
             # it is continuous across the tiles of a chart (see blend_climate)
@@ -922,6 +924,10 @@ class WarmStage2Engine:
                 t_season = np.ascontiguousarray(t_season[crop, crop])
                 if lava is not None:
                     lava = np.ascontiguousarray(lava[crop, crop])
+                if plugs is not None:
+                    plugs = np.ascontiguousarray(plugs[crop, crop])
+            if plugs is not None and not plugs.any():
+                plugs = None
 
             res_scale = (out_n / 512.0) ** 2
             hydro_prof = _compute_biome_hydrology_profile(elev_refined, temp_c, precip_mm, res_scale)
@@ -936,13 +942,27 @@ class WarmStage2Engine:
             )
 
             t_h0 = time.perf_counter()
+            # An erupting crater must not fill with rain and spill a river: the solver sees those
+            # craters filled to the rim, and they are hollowed out again afterwards
             carved, riv_u8, lak_u8, lakes_data, rivers_data, lake_grid_size = solve_hydrology_multires(
-                elev=elev_refined,
+                elev=elev_refined if plugs is None else elev_refined + plugs,
                 world_span_m=world_span_m,
                 hydro_prof=hydro_prof,
                 min_lake_depth_m=0.55,
                 inflows=payload.get("inflows"),
             )
+            sinter = None
+            spring_levels: dict[int, float] = {}
+            if plugs is not None:
+                carved = (carved - plugs).astype(np.float32)
+                # The planet's one hot spring gets its pool here (see fill_hot_springs)
+                lakes_data = list(lakes_data)
+                sinter, spring_levels = fill_hot_springs(
+                    carved, lak_u8, lakes_data, volcanoes, world_span_m=world_span_m, lake_grid=lake_grid_size
+                )
+            # Hollows below sea level that are cut off from the ocean and did not become lakes
+            # would show the sea through the land: they become dry salt pans (see basins.py)
+            carved, salt_pans = dry_landlocked_basins(carved, lak_u8)
             t_hydro = time.perf_counter() - t_h0
 
             self.status.update(
@@ -990,9 +1010,9 @@ class WarmStage2Engine:
             ref_rock = None
             if payload.get("refRock"):
                 ref_rock = decode_rock(payload["refRock"], ref_full)[ref_pad : ref_pad + ref_size, ref_pad : ref_pad + ref_size]
-            has_rock = ref_rock is not None or lava is not None
+            has_rock = ref_rock is not None or lava is not None or bool(salt_pans.any())
             if has_rock:
-                pack_rock(ref_rock, lava, climate_n).tofile(VIEWER_WORLDS_DIR / f"{world_id}.rock.u8")
+                pack_rock(ref_rock, lava, climate_n, salt_pans, sinter).tofile(VIEWER_WORLDS_DIR / f"{world_id}.rock.u8")
 
             # Absolute biome moisture + riparian wetness ONLY where real rivers/lakes exist!
             wet_seed = np.clip((riv_u8.astype(np.float32) + lak_u8.astype(np.float32)) / 255.0, 0.0, 1.0)
@@ -1038,6 +1058,12 @@ class WarmStage2Engine:
                         "id": v["id"],
                         "kind": v["kind"],
                         "active": bool(v.get("active")),
+                        # A hot spring: `springLevelM` is the height of its pool, when it has one
+                        **(
+                            {"hotSpring": True, "springLevelM": spring_levels.get(int(v["id"]))}
+                            if v.get("hotSpring")
+                            else {}
+                        ),
                         # Viewer world metres from the tile centre (x east, z south)
                         "x": round(float(v["x"]) * world_span_m, 1),
                         "z": round(float(v["z"]) * world_span_m, 1),

@@ -144,6 +144,15 @@ test('the chart inverse undoes chartToUnitDir', () => {
   }
 });
 
+test('one big volcano per planet is a hot spring and does not erupt', () => {
+  for (const [seed, archetype] of [[7, 'rifting'], [4242, 'supercontinent'], [9, 'archipelago']]) {
+    const p = generateTectonicPlanet({ seed, archetype, faceSize: 64 });
+    const springs = p.volcanoes.filter((v) => v.hotSpring);
+    assert.equal(springs.length, 1, `seed ${seed}`);
+    assert.ok(springs[0].kind !== 'cinder' && springs[0].active === false);
+  }
+});
+
 test('neighbouring tiles agree on where a shared volcano stands', () => {
   const p = generateStage1Planet({ seed: 101, archetype: 'earth' });
   const v = p.volcanoes.find((x) => x.kind === 'strato');

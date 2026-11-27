@@ -320,6 +320,7 @@ export function buildLakeSystem(lakesData, gridSize, worldSpan, heightFloatTex, 
   const positions = [];
   const levels = [];
   const edgeFades = [];
+  const hots = [];
   const indices = [];
 
   for (const lake of lakesData) {
@@ -401,6 +402,7 @@ export function buildLakeSystem(lakesData, gridSize, worldSpan, heightFloatTex, 
         positions.push(wx, y, wz);
         levels.push(y);
         edgeFades.push(vertFade(vr, vc));
+        hots.push(lake.hotSpring ? 1 : 0);
         vertMap.set(key, idx);
       }
       return idx;
@@ -421,6 +423,8 @@ export function buildLakeSystem(lakesData, gridSize, worldSpan, heightFloatTex, 
   geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
   geo.setAttribute('aLevel', new THREE.Float32BufferAttribute(levels, 1));
   geo.setAttribute('aEdgeFade', new THREE.Float32BufferAttribute(edgeFades, 1));
+  // 1 on a volcano's hot spring pool (see fill_hot_springs in experiments/volcano.py)
+  geo.setAttribute('aHot', new THREE.Float32BufferAttribute(hots, 1));
   geo.setIndex(indices);
 
   const mat = new THREE.ShaderMaterial({
@@ -442,13 +446,16 @@ export function buildLakeSystem(lakesData, gridSize, worldSpan, heightFloatTex, 
     vertexShader: /* glsl */ `
       attribute float aLevel;
       attribute float aEdgeFade;
+      attribute float aHot;
       varying float vLevel;
       varying float vEdgeFade;
+      varying float vHot;
       varying vec3 vWorldPos;
 
       void main() {
         vLevel = aLevel;
         vEdgeFade = aEdgeFade;
+        vHot = aHot;
         vec4 wp = modelMatrix * vec4(position, 1.0);
         vWorldPos = wp.xyz;
         gl_Position = projectionMatrix * viewMatrix * wp;
@@ -468,6 +475,7 @@ export function buildLakeSystem(lakesData, gridSize, worldSpan, heightFloatTex, 
 
       varying float vLevel;
       varying float vEdgeFade;
+      varying float vHot;
       varying vec3 vWorldPos;
 
       float hash21(vec2 p) {
@@ -485,6 +493,7 @@ export function buildLakeSystem(lakesData, gridSize, worldSpan, heightFloatTex, 
       }
 
       void main() {
+        float hot = step(0.5, vHot);
         // Compute exact continuous water depth from Float32 heightmap
         vec2 uv = (vWorldPos.xz - uTexOrigin) / uWorldSpan + 0.5;
         uv.y = 1.0 - uv.y;
@@ -509,13 +518,28 @@ export function buildLakeSystem(lakesData, gridSize, worldSpan, heightFloatTex, 
 
         // Delicate organic shoreline foam ring
         float shoreFoam = (1.0 - smoothstep(0.0, 0.65, depth)) * (0.45 + 0.35 * sin(uTime * 2.2 + w1 * 5.0));
-        waterCol = mix(waterCol, vec3(0.90, 0.96, 1.0), shoreFoam * 0.55);
+        waterCol = mix(waterCol, vec3(0.90, 0.96, 1.0), shoreFoam * 0.55 * (1.0 - hot));
+
+        // A hot spring: rings of heat-loving microbes, each colour at the depth (and so the
+        // temperature) it can stand, around water too hot for anything and so a clear deep blue
+        if (hot > 0.5) {
+          float d = depth + (vnoise(vWorldPos.xz * 0.11) - 0.5) * 1.1;
+          vec3 c = vec3(0.62, 0.24, 0.06);
+          c = mix(c, vec3(0.93, 0.52, 0.08), smoothstep(0.1, 0.7, d));
+          c = mix(c, vec3(0.95, 0.83, 0.22), smoothstep(0.7, 1.6, d));
+          c = mix(c, vec3(0.22, 0.74, 0.44), smoothstep(1.6, 2.8, d));
+          c = mix(c, vec3(0.04, 0.68, 0.80), smoothstep(2.8, 4.6, d));
+          c = mix(c, vec3(0.02, 0.26, 0.66), smoothstep(5.0, 16.0, d));
+          // Steam lying on the surface, drifting
+          float wisps = vnoise(vWorldPos.xz * 0.05 + vec2(uTime * 0.05, -uTime * 0.03)) * vnoise(vWorldPos.xz * 0.13 - uTime * 0.04);
+          waterCol = mix(c, vec3(0.94, 0.96, 0.96), smoothstep(0.22, 0.6, wisps) * 0.4);
+        }
 
         // Mirror-like Fresnel sky reflection + crisp sun glints
         vec3 V = normalize(cameraPosition - vWorldPos);
         float fresnel = pow(1.0 - max(dot(N, V), 0.0), 3.2);
         vec3 skyRefl = mix(vec3(0.26, 0.54, 0.80), uFogColor, 0.55);
-        waterCol = mix(waterCol, skyRefl, clamp(fresnel * 0.68, 0.0, 0.68));
+        waterCol = mix(waterCol, skyRefl, clamp(fresnel * 0.68, 0.0, 0.68) * (1.0 - 0.6 * hot));
 
         vec3 H = normalize(normalize(uSunDir) + V);
         float spec = pow(max(dot(N, H), 0.0), 120.0);
@@ -529,6 +553,11 @@ export function buildLakeSystem(lakesData, gridSize, worldSpan, heightFloatTex, 
         // Feather smoothly to alpha=0 right at the waterline AND outer spillway pad rim!
         float rimFade = smoothstep(0.0, 0.55, vEdgeFade);
         float alpha = clamp(smoothstep(0.0, 0.40, depth) * rimFade * (0.68 + smoothstep(0.0, 2.5, depth) * 0.28 + fresnel * 0.12), 0.0, 0.95);
+        // The mineral colours are in the water itself: a hot pool hides its bed
+        alpha = mix(alpha, clamp(smoothstep(0.0, 0.25, depth) * rimFade * 0.96, 0.0, 0.96), hot);
+        // A crater rim is a thin crest with lower ground just outside it: keep the pool to the
+        // lake mask, or its sheet shows on the outer slope
+        if (hot > 0.5) alpha *= smoothstep(0.12, 0.45, texture2D(uMasks, uv).g);
         if (alpha < 0.015) discard;
         gl_FragColor = vec4(waterCol, alpha);
       }

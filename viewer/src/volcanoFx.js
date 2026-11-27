@@ -3,6 +3,7 @@ import * as THREE from 'three';
 /**
  * What an active volcano does in the explorer: a pool of lava on the crater floor, a glow
  * above it that strengthens as the sun goes down, and a column of smoke that leans downwind.
+ * A hot spring (`steam`) has none of the fire: a low, white cloud of steam drifts off its pool.
  *
  * Everything is animated in the shaders from a clock, so there is no per-frame work on the
  * CPU beyond setting uniforms. Positions are in unscaled viewer metres; the terrain's
@@ -17,22 +18,26 @@ const SMOKE_VERT = /* glsl */ `
   attribute vec3 aBase;   // crater floor
   attribute float aSeed;
   attribute float aSize;  // crater radius (m)
+  attribute float aSteam; // 1 for a hot spring's steam, 0 for an eruption's ash
   uniform float uTime;
   uniform float uVScale;
   uniform float uPixels;  // viewport height / (2 tan(fov / 2))
   uniform vec2 uWind;
   varying float vAge;
   varying float vSeed;
+  varying float vSteam;
   void main() {
     float speed = 0.028 + 0.012 * fract(aSeed * 7.31);
     float age = fract(uTime * speed + aSeed);
     vAge = age;
     vSeed = aSeed;
-    float rise = aSize * 13.0 * pow(age, 0.82);
+    vSteam = aSteam;
+    // Steam has no force behind it: it rises a third as high and starts all over the pool
+    float rise = aSize * mix(13.0, 4.5, aSteam) * pow(age, 0.82);
     float ang = aSeed * 39.7 + uTime * 0.07;
-    float spread = aSize * (0.25 + 2.1 * age);
+    float spread = aSize * (mix(0.25, 0.85, aSteam) + 2.1 * age);
     vec3 p = vec3(aBase.x, aBase.y * uVScale, aBase.z);
-    p.y += rise + aSize * 0.4;
+    p.y += rise + aSize * mix(0.4, 0.1, aSteam);
     p.xz += vec2(cos(ang), sin(ang)) * spread * fract(aSeed * 13.7);
     // The column bends over as it climbs into the wind
     p.xz += uWind * aSize * 9.0 * age * age;
@@ -47,6 +52,7 @@ const SMOKE_FRAG = /* glsl */ `
   uniform vec3 uSunColor;
   varying float vAge;
   varying float vSeed;
+  varying float vSteam;
   void main() {
     vec2 c = gl_PointCoord - 0.5;
     float d = length(c) * 2.0;
@@ -54,11 +60,12 @@ const SMOKE_FRAG = /* glsl */ `
     if (soft < 0.01) discard;
     // Ash-dark where it leaves the vent, paling as it thins out
     vec3 col = mix(vec3(0.16, 0.15, 0.15), vec3(0.72, 0.71, 0.70), smoothstep(0.05, 0.7, vAge));
+    col = mix(col, vec3(0.95, 0.96, 0.97), vSteam);
     col *= mix(0.86, 1.08, fract(vSeed * 5.3));
     // Lit from above by the sun, from below by the crater
     col *= mix(0.42, 1.0, 1.0 - uNight) * mix(vec3(1.0), uSunColor, 0.35);
-    col += vec3(1.0, 0.36, 0.08) * (1.0 - smoothstep(0.0, 0.2, vAge)) * (0.25 + 0.75 * uNight) * (0.6 - c.y);
-    float alpha = soft * smoothstep(0.0, 0.06, vAge) * pow(1.0 - vAge, 1.3) * 0.58;
+    col += vec3(1.0, 0.36, 0.08) * (1.0 - smoothstep(0.0, 0.2, vAge)) * (0.25 + 0.75 * uNight) * (0.6 - c.y) * (1.0 - vSteam);
+    float alpha = soft * smoothstep(0.0, 0.06, vAge) * pow(1.0 - vAge, 1.3) * mix(0.58, 0.34, vSteam);
     gl_FragColor = vec4(col, alpha);
   }
 `;
@@ -130,10 +137,11 @@ const GLOW_FRAG = /* glsl */ `
 /**
  * @param {THREE.Scene} scene
  * @returns {{
- *   set: (volcanoes: {id: number, kind: string, x: number, z: number, y: number, radiusM: number}[]) => void,
+ *   set: (volcanoes: {id: number, kind: string, x: number, z: number, y: number, radiusM: number, steam?: boolean}[]) => void,
  *   update: (t: number, camera: THREE.PerspectiveCamera, viewportHeight: number, sunDir: THREE.Vector3, vScale: number) => void,
  *   dispose: () => void,
- * }} `set` takes the active volcanoes in view, with `y` the unscaled height of the crater floor.
+ * }} `set` takes the active volcanoes in view, with `y` the unscaled height of the crater floor
+ *    (for a hot spring, of its pool).
  */
 export function createVolcanoFx(scene) {
   const uniforms = {
@@ -158,7 +166,7 @@ export function createVolcanoFx(scene) {
   }
 
   function set(volcanoes) {
-    const sig = volcanoes.map((v) => `${v.id}:${v.x.toFixed(0)},${v.z.toFixed(0)},${v.y.toFixed(1)}`).join('|');
+    const sig = volcanoes.map((v) => `${v.id}:${v.x.toFixed(0)},${v.z.toFixed(0)},${v.y.toFixed(1)}${v.steam ? 's' : ''}`).join('|');
     if (sig === signature) return;
     signature = sig;
     clear();
@@ -171,12 +179,14 @@ export function createVolcanoFx(scene) {
     const sBase = new Float32Array(n * PUFFS * 3);
     const sSeed = new Float32Array(n * PUFFS);
     const sSize = new Float32Array(n * PUFFS);
+    const sSteam = new Float32Array(n * PUFFS);
     volcanoes.forEach((v, i) => {
       for (let k = 0; k < PUFFS; k++) {
         const o = i * PUFFS + k;
         sBase.set([v.x, v.y, v.z], o * 3);
         sSeed[o] = (k + ((v.id * 0.6180339) % 1)) / PUFFS + ((k * 0.754877) % 1) * 0.01;
         sSize[o] = size(v);
+        sSteam[o] = v.steam ? 1 : 0;
       }
     });
     const smokeGeo = new THREE.BufferGeometry();
@@ -184,6 +194,7 @@ export function createVolcanoFx(scene) {
     smokeGeo.setAttribute('aBase', new THREE.BufferAttribute(sBase, 3));
     smokeGeo.setAttribute('aSeed', new THREE.BufferAttribute(sSeed, 1));
     smokeGeo.setAttribute('aSize', new THREE.BufferAttribute(sSize, 1));
+    smokeGeo.setAttribute('aSteam', new THREE.BufferAttribute(sSteam, 1));
     const smoke = new THREE.Points(
       smokeGeo,
       new THREE.ShaderMaterial({ uniforms, vertexShader: SMOKE_VERT, fragmentShader: SMOKE_FRAG, transparent: true, depthWrite: false })
@@ -191,15 +202,21 @@ export function createVolcanoFx(scene) {
     smoke.frustumCulled = false;
     smoke.renderOrder = 6;
 
-    // One vertex per volcano for the glow, and a disc each for the lava
-    const base = new Float32Array(n * 3);
-    const sizes = new Float32Array(n);
-    volcanoes.forEach((v, i) => {
+    group.add(smoke);
+    scene.add(group);
+
+    // One vertex per erupting volcano for the glow, and a disc each for the lava
+    const fiery = volcanoes.filter((v) => !v.steam);
+    const nf = fiery.length;
+    if (!nf) return;
+    const base = new Float32Array(nf * 3);
+    const sizes = new Float32Array(nf);
+    fiery.forEach((v, i) => {
       base.set([v.x, v.y, v.z], i * 3);
       sizes[i] = size(v);
     });
     const glowGeo = new THREE.BufferGeometry();
-    glowGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(n * 3), 3));
+    glowGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(nf * 3), 3));
     glowGeo.setAttribute('aBase', new THREE.BufferAttribute(base, 3));
     glowGeo.setAttribute('aSize', new THREE.BufferAttribute(sizes, 1));
     const glow = new THREE.Points(
@@ -222,15 +239,14 @@ export function createVolcanoFx(scene) {
     lavaGeo.setAttribute('position', disc.getAttribute('position'));
     lavaGeo.setAttribute('aBase', new THREE.InstancedBufferAttribute(base, 3));
     lavaGeo.setAttribute('aSize', new THREE.InstancedBufferAttribute(sizes.map((s) => s * 0.8), 1));
-    lavaGeo.instanceCount = n;
+    lavaGeo.instanceCount = nf;
     const lava = new THREE.Mesh(
       lavaGeo,
       new THREE.ShaderMaterial({ uniforms, vertexShader: LAVA_VERT, fragmentShader: LAVA_FRAG, transparent: true })
     );
     lava.frustumCulled = false;
 
-    group.add(lava, glow, smoke);
-    scene.add(group);
+    group.add(lava, glow);
   }
 
   function update(t, camera, viewportHeight, sunDir, vScale) {

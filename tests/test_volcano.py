@@ -79,3 +79,56 @@ def test_pack_rock_resamples_and_lava_overrides():
     assert tuple(rock[2, 2]) == (0, 255, 0, 0)
     assert tuple(rock[13, 13]) == (204, 0, 0, 0)
     assert pack_rock(None, None, 8).sum() == 0
+
+
+# ---------- Craters and water ----------
+
+from volcano import crater_plugs, fill_hot_springs  # noqa: E402
+
+
+def plugs(volcanoes, margin=MARGIN):
+    n = TILE + 2 * margin
+    return crater_plugs(volcanoes, (n, n), tile_px=TILE, margin_px=margin, world_span_m=SPAN, base_to_viewer=lambda d: d)
+
+
+def test_only_erupting_and_hot_spring_craters_are_plugged():
+    assert not plugs([cone()]).any()  # dormant: the solver may give it a lake
+    for flag in ("active", "hotSpring"):
+        v = cone(**{flag: True})
+        out, _, _ = stamp(flat(), [v])
+        plug = plugs([v])
+        c = MARGIN + TILE // 2
+        assert plug[c, c] > 1.0 and plug[4, 4] == 0.0
+        # Filled, the crater is no longer a hollow: its floor stands level with its rim
+        r = int(0.1 * 0.12 * TILE)
+        filled = (out + plug)[c - r : c + r + 1, c - r : c + r + 1]
+        assert filled[r, r] > filled.max() - 0.05 * plug[c, c]
+
+
+def test_hot_spring_fills_its_crater_below_the_rim():
+    v = cone(hotSpring=True, radius=0.4, aspect=0.2)
+    out, _, _ = stamp(flat(margin=0), [v], margin=0)
+    lak = np.zeros(out.shape, dtype=np.uint8)
+    lakes = [{"id": 3, "level": 1.0, "cells": []}]
+    before = out.copy()
+    sinter, levels = fill_hot_springs(out, lak, lakes, [v], world_span_m=SPAN, lake_grid=TILE // 2)
+    assert np.array_equal(out, before)  # the ground is never touched
+    c = TILE // 2
+    pool = lakes[-1]
+    assert pool["hotSpring"] and pool["id"] == 4 and levels == {7: pool["level"]}
+    assert out[c, c] < pool["level"] < out.max()
+    assert lak[c, c] == 255 and lak[4, 4] == 0
+    assert all(0 <= r < TILE // 2 and 0 <= col < TILE // 2 and d > 0 for r, col, d in pool["cells"])
+    assert [c // 2, c // 2] in [cell[:2] for cell in pool["cells"]]
+    # A crust around the pool, shown in the granite channel above the regional cap
+    assert sinter[c, c] == 1.0 and sinter[4, 4] == 0.0
+    rock = pack_rock(None, None, 64, None, sinter)
+    assert rock[32, 32, 0] > 214 and rock[2, 2, 0] == 0
+
+
+def test_no_pool_without_a_hot_spring():
+    out, _, _ = stamp(flat(margin=0), [cone(active=True)], margin=0)
+    lak = np.zeros(out.shape, dtype=np.uint8)
+    lakes: list[dict] = []
+    sinter, levels = fill_hot_springs(out, lak, lakes, [cone(active=True)], world_span_m=SPAN, lake_grid=TILE)
+    assert not lakes and not levels and not lak.any() and not sinter.any()

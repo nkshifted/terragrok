@@ -1,4 +1,5 @@
 import * as THREE from 'three';
+import { blankRockTexture } from './terrainShader.js';
 
 /**
  * GPU-Instanced 3D Wind-Swaying Grass Field (45,000+ curved blades in 1 draw call).
@@ -58,6 +59,8 @@ export function createGrassField(heightFloatTex, maskTex, worldSpan, maxElev, bl
     uniforms: {
       uHeightTex: { value: heightFloatTex },
       uMasks: { value: maskTex },
+      // Bedrock weights on the same uv as the masks; blades stay off fresh lava
+      uRock: { value: blankRockTexture() },
       uWorldSpan: { value: worldSpan },
       uTexOrigin: { value: new THREE.Vector2(0, 0) },
       uMaxElev: { value: maxElev },
@@ -77,6 +80,7 @@ export function createGrassField(heightFloatTex, maskTex, worldSpan, maxElev, bl
 
       uniform sampler2D uHeightTex;
       uniform sampler2D uMasks;
+      uniform sampler2D uRock;
       uniform float uWorldSpan;
       uniform vec2 uTexOrigin;
       uniform float uMaxElev;
@@ -156,6 +160,10 @@ export function createGrassField(heightFloatTex, maskTex, worldSpan, maxElev, bl
         valid *= (1.0 - smoothstep(0.09, 0.16, slope));
         valid *= (1.0 - smoothstep(0.32, 0.55, riverWet));
         valid *= (1.0 - smoothstep(0.20, 0.45, lake));
+        if (inBounds) {
+          vec4 rk = texture2D(uRock, uv);
+          valid *= 1.0 - smoothstep(0.82, 0.92, max(rk.r, max(rk.g, rk.b))); // hot spring crust, fresh lava, salt flat
+        }
 
         // Taller lush reeds right near riverbanks, shorter dry grass in steppe
         float reedBoost = smoothstep(0.06, 0.28, riverWet) * (1.0 - smoothstep(0.30, 0.50, riverWet)) * 0.85;

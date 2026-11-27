@@ -123,6 +123,7 @@ export function chartTileVolcanoes(planet, { reliefScale = 1.0, homeLatDeg, home
       crater: k.crater,
       craterDepth: k.craterDepth,
       active: v.active,
+      ...(v.hotSpring ? { hotSpring: true } : {}),
       baseDem: Number(stage1ElevToDem(baseElev, reliefScale).toFixed(1)),
     });
   }
