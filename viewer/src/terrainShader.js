@@ -518,6 +518,7 @@ export function createTerrainMaterial(
           float snowLine = 0.62 + (macroNoise - 0.5) * 0.10 + (1.0 - moisture) * 0.06;
           snowMask = smoothstep(snowLine, snowLine + 0.13, hNorm) * (1.0 - smoothstep(0.18, 0.36, baseSlope));
         }
+        snowMask *= 1.0 - sinter; // warm ground around a hot spring holds no snow
         albedo = mix(albedo, snowCol, snowMask);
 
         // Wet riverbanks & gravel bed under the 3D flowing river ribbons

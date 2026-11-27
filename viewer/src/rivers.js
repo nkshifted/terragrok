@@ -555,9 +555,11 @@ export function buildLakeSystem(lakesData, gridSize, worldSpan, heightFloatTex, 
         float alpha = clamp(smoothstep(0.0, 0.40, depth) * rimFade * (0.68 + smoothstep(0.0, 2.5, depth) * 0.28 + fresnel * 0.12), 0.0, 0.95);
         // The mineral colours are in the water itself: a hot pool hides its bed
         alpha = mix(alpha, clamp(smoothstep(0.0, 0.25, depth) * rimFade * 0.96, 0.0, 0.96), hot);
-        // A crater rim is a thin crest with lower ground just outside it: keep the pool to the
-        // lake mask, or its sheet shows on the outer slope
-        if (hot > 0.5) alpha *= smoothstep(0.12, 0.45, texture2D(uMasks, uv).g);
+        // The sheet reaches a little past its basin, which is right on a rising shore. But a
+        // crater rim is a thin crest with lower ground just outside it: without the lake mask
+        // the water would show as a ring on the outer slope
+        float inBasin = texture2D(uMasks, uv).g;
+        alpha *= mix(smoothstep(0.03, 0.22, inBasin), smoothstep(0.12, 0.45, inBasin), hot);
         if (alpha < 0.015) discard;
         gl_FragColor = vec4(waterCol, alpha);
       }
