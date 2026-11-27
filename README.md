@@ -79,18 +79,21 @@ models and animations are Quaternius's CC0 kits, packed into `viewer/public/char
 `experiments/pack_characters.py`.
 
 **Vehicles.** `B`, `K`, `R`, `J` and `G` summon a boat, canoe, horse, jeep or glider and put the
-explorer on it; `E` gets off, or back on when standing next to it. W/S is speed and A/D steers.
+explorer on it; `E` gets off, or back on when standing next to it. W/S is speed; steer with A/D,
+or hold W and turn the camera, as on foot.
 A boat stays on lakes and the sea (`B` again switches between speedboat and sailboat), while
-the canoe also follows rivers. The horse climbs slopes up to about 60° and the jeep up to 50°,
+the canoe also follows rivers: it is slim, turns with the bends by itself and scrapes over
+small bars and reeds. The horse climbs slopes up to about 60° and the jeep up to 50°,
 both losing speed as it steepens; Space makes either jump, and both leave the ground by
-themselves over a crest taken at speed. A glider launches with a kick, sinks slowly, dives with
+themselves over a crest taken at speed; one that comes down in deep water is lost and leaves
+its rider swimming. A glider launches with a kick, sinks slowly, dives with
 W, flares with S and climbs while Space is held.
 [`viewer/src/vehiclePhysics.js`](viewer/src/vehiclePhysics.js) holds those rules (pure, unit
 tested); [`viewer/src/vehicles.js`](viewer/src/vehicles.js) holds the meshes. The horse
 (Quaternius, with walk and gallop clips), the SUV that stands in for a jeep and the boats
-(Kenney; its small rowing boat stands in for a canoe) are CC0 models packed into `viewer/public/vehicles/` by
-`experiments/pack_vehicles.py`; the glider is built in code, as are the stand-ins shown while
-a model loads.
+(Kenney) are CC0 models packed into `viewer/public/vehicles/` by
+`experiments/pack_vehicles.py`; the glider and the canoe are built in code, as are the
+stand-ins shown while a model loads.
 
 ## Layout
 

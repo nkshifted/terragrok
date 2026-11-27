@@ -6,6 +6,7 @@
  * is the direction of travel as atan2(dx, dz): forward is (sin h, cos h), the same convention as
  * `player.yaw`. Steering right DEcreases it (x is east, z is south, seen from above).
  * `blocked` is false, 'terrain' (too steep, too deep, no water) or 'edge' (the loaded world ends).
+ * `swamped` is set when a land vehicle comes down in water too deep for it: it is lost.
  *
  * The world is reached through a `terrain` object:
  *   height(x, z)            ground height (viewer metres, sea level 0)
@@ -17,7 +18,7 @@
 export const VEHICLES = {
   boat: { label: 'Boat', key: 'b', medium: 'water', maxSpeed: 95, reverse: 25, accel: 38, coast: 0.5, turn: 1.0, steerNeedsSpeed: true, activity: 'SAILING', rider: 'sit' },
   // Light enough for rivers as well as lakes and the sea, and turns on the spot
-  canoe: { label: 'Canoe', key: 'k', medium: 'water', rivers: true, maxSpeed: 46, reverse: 20, accel: 30, coast: 0.9, turn: 1.7, activity: 'PADDLING', rider: 'sit' },
+  canoe: { label: 'Canoe', key: 'k', medium: 'water', rivers: true, portage: 14, maxSpeed: 46, reverse: 20, accel: 30, coast: 0.9, turn: 1.7, activity: 'PADDLING', rider: 'sit' },
   horse: { label: 'Horse', key: 'r', medium: 'land', maxSpeed: 62, boost: 1.75, reverse: 14, accel: 85, coast: 2.2, turn: 2.3, maxSlope: 62, wadeDepth: 1.6, jump: 27, activity: 'RIDING', rider: 'sit' },
   jeep: { label: 'Jeep', key: 'j', medium: 'land', maxSpeed: 135, reverse: 38, accel: 52, coast: 0.9, turn: 1.35, steerNeedsSpeed: true, maxSlope: 50, wadeDepth: 0.7, jump: 21, activity: 'DRIVING', rider: 'drive' },
   glider: { label: 'Glider', key: 'g', medium: 'air', cruise: 72, dive: 128, flare: 42, sinkCruise: 6.5, sinkDive: 24, sinkFlare: 3.2, climb: 13, ceiling: 700, turn: 0.85, launch: 34, activity: 'GLIDING', rider: 'swim' },
@@ -25,7 +26,9 @@ export const VEHICLES = {
 
 const SEA_DEPTH = -0.25; // ground below this is under open water
 const LAKE_MASK = 0.4;
-const RIVER_MASK = 0.42;
+// Rivers are a blurred mask: this low a value is the reedy margin of a creek, which a canoe
+// still floats over (walking counts as "in the river" only above 0.42)
+const RIVER_MASK = 0.12;
 const GRAVITY = 58; // the same as the player's jump
 // Ground falling away faster than this (m/s) under a moving vehicle leaves it in the air
 const TAKEOFF_RATE = 25;
@@ -84,7 +87,7 @@ export function summonSpot(kind, terrain, x, z) {
 export function createVehicleState(kind, x, z, heading, terrain) {
   const cfg = VEHICLES[kind];
   const ground = terrain.height(x, z);
-  const s = { kind, x, z, y: ground, heading, speed: 0, vy: 0, vyGround: 0, pitch: 0, roll: 0, age: 0, air: false, lifting: false, blocked: false, landed: false };
+  const s = { kind, x, z, y: ground, heading, speed: 0, vy: 0, vyGround: 0, bent: 0, pitch: 0, roll: 0, age: 0, air: false, lifting: false, blocked: false, landed: false, swamped: false };
   if (cfg.medium === 'water') s.y = waterLevel(terrain, x, z);
   if (cfg.medium === 'air') {
     // A launch kick, so a glider is usable from flat ground as well as from a summit
@@ -115,17 +118,44 @@ function advance(s, terrain, nx, nz) {
   }
 }
 
+/** Is there water within `reach` further along `heading` from (x, z)? */
+function waterAhead(terrain, x, z, heading, reach, rivers) {
+  for (let d = 2; d <= reach; d += 2) {
+    if (isWater(terrain, x + Math.sin(heading) * d, z + Math.cos(heading) * d, rivers)) return true;
+  }
+  return false;
+}
+
 function stepWater(s, cfg, input, dt, terrain) {
   if (s.speed !== 0) {
-    const nx = s.x + Math.sin(s.heading) * s.speed * dt;
-    const nz = s.z + Math.cos(s.heading) * s.speed * dt;
+    const dist = s.speed * dt;
+    const nx = s.x + Math.sin(s.heading) * dist;
+    const nz = s.z + Math.cos(s.heading) * dist;
     if (isWater(terrain, nx, nz, cfg.rivers)) advance(s, terrain, nx, nz);
-    else {
+    else if (cfg.portage) {
+      // A small craft in a narrow channel: follow the bend if the water turns, and scrape
+      // over a gravel bar or a spit of bank when there is water again just beyond it
+      const bend = [0.3, -0.3, 0.6, -0.6, 0.95, -0.95].find((a) =>
+        isWater(terrain, s.x + Math.sin(s.heading + a) * dist, s.z + Math.cos(s.heading + a) * dist, cfg.rivers)
+      );
+      if (bend !== undefined && !input.steerKey) {
+        const turn = bend * Math.min(1, dt * 6);
+        s.heading += turn;
+        s.bent += turn;
+        advance(s, terrain, s.x + Math.sin(s.heading) * dist, s.z + Math.cos(s.heading) * dist);
+      } else if (waterAhead(terrain, nx, nz, s.heading, cfg.portage, cfg.rivers)) {
+        advance(s, terrain, nx, nz);
+        s.speed *= Math.exp(-2.5 * dt); // dragging over the shallows
+      } else {
+        s.blocked = 'terrain';
+        s.speed = 0;
+      }
+    } else {
       s.blocked = 'terrain';
       s.speed = 0;
     }
   }
-  s.y = waterLevel(terrain, s.x, s.z);
+  s.y = isWater(terrain, s.x, s.z, cfg.rivers) ? waterLevel(terrain, s.x, s.z) : terrain.height(s.x, s.z) + 0.15;
   s.pitch = 0;
   s.roll = approach(s.roll, input.steer * 0.12 * Math.min(1, Math.abs(s.speed) / cfg.maxSpeed), dt);
 }
@@ -136,21 +166,26 @@ function stepAirborne(s, cfg, dt, terrain) {
   if (s.speed !== 0) {
     const nx = s.x + Math.sin(s.heading) * s.speed * dt;
     const nz = s.z + Math.cos(s.heading) * s.speed * dt;
-    const ahead = terrain.height(nx, nz);
-    // A rock face ahead, or open water it could not get out of: stop and drop
-    if (ahead > s.y + 2.5 || ahead < -cfg.wadeDepth) {
+    // A rock face ahead: stop and drop. Open water is no obstacle to something in the air.
+    if (terrain.height(nx, nz) > s.y + 2.5) {
       s.blocked = 'terrain';
       s.speed = 0;
     } else advance(s, terrain, nx, nz);
   }
   s.y += s.vy * dt;
-  const ground = Math.max(terrain.height(s.x, s.z), -cfg.wadeDepth);
+  const bed = terrain.height(s.x, s.z);
+  const ground = Math.max(bed, -cfg.wadeDepth);
   if (s.y <= ground) {
     s.y = ground;
     s.vy = 0;
     s.vyGround = 0;
     s.air = false;
     s.speed *= 0.92;
+    if (bed < -cfg.wadeDepth) {
+      // Came down in water it cannot drive or wade out of
+      s.swamped = true;
+      s.speed = 0;
+    }
   }
   s.pitch = approach(s.pitch, Math.atan2(s.vy, Math.abs(s.speed) + 20) * 0.6, dt * 3);
   s.roll = approach(s.roll, 0, dt * 2);
@@ -161,7 +196,9 @@ function stepLand(s, cfg, input, dt, terrain) {
   if (s.speed !== 0) {
     const nx = s.x + Math.sin(s.heading) * s.speed * dt;
     const nz = s.z + Math.cos(s.heading) * s.speed * dt;
-    const tooDeep = terrain.height(nx, nz) < -cfg.wadeDepth;
+    // Water it would wade into is a barrier; water at the foot of a drop is not (it goes over)
+    const bedAhead = terrain.height(nx, nz);
+    const tooDeep = bedAhead < -cfg.wadeDepth && s.y - bedAhead < 3 + cfg.wadeDepth;
     const climb = slopeDegAlong(terrain, nx, nz, s.heading) * Math.sign(s.speed);
     if (tooDeep || climb > cfg.maxSlope) {
       s.blocked = 'terrain';
@@ -252,12 +289,16 @@ function stepGlider(s, cfg, input, dt, terrain) {
 
 /**
  * Advance a vehicle by dt.
- * @param {{throttle: number, steer: number, boost: boolean, action: boolean}} input
- *        throttle and steer in -1..1; `action` is the jump key (a glider's "catch the wind")
+ * @param {{throttle: number, steer: number, steerKey?: boolean, boost: boolean, action: boolean}} input
+ *        throttle and steer in -1..1; `steerKey` when the steering comes from a key (a canoe then
+ *        stops following bends by itself); `action` is the jump key (a glider's "catch the wind")
  * @returns {number} the change in heading, so a chase camera can turn with the vehicle
  */
 export function stepVehicle(s, input, dt, terrain) {
   const cfg = VEHICLES[s.kind];
+  // A frame can report no elapsed time; rates divide by dt, and one NaN would stick for good
+  if (!(dt > 0)) return 0;
   s.age += dt;
+  s.bent = 0; // heading change this step that the vehicle made by itself (following a river)
   return cfg.medium === 'air' ? stepGlider(s, cfg, input, dt, terrain) : stepSurface(s, cfg, input, dt, terrain);
 }

@@ -9,7 +9,8 @@
  * explorer group and in explorer scale (the character stands 3.3 units tall); `seat` is where
  * the rider's origin goes, in the vehicle's frame. The builders make a stand-in from primitives
  * that is on screen at once. MODELS then swaps in a downloaded glTF (packed by
- * experiments/pack_vehicles.py) when it has loaded; the glider has none and keeps its stand-in.
+ * experiments/pack_vehicles.py) when it has loaded; the glider and the canoe have none and are
+ * simply what their builders make.
  */
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
@@ -47,7 +48,7 @@ function hullSlab(outline, depth, top, material) {
   return m;
 }
 
-function buildBoat(k = 1) {
+function buildBoat() {
   const group = new THREE.Group();
   const outline = (s) => [
     [-1.7 * s, 4.3 * s],
@@ -66,18 +67,55 @@ function buildBoat(k = 1) {
   box(group, 2.6, 0.18, 0.7, wood, 0, 1.25, -1.6);
   box(group, 0.7, 1.3, 0.8, mat('#30363d'), 0, 1.5, 4.5); // outboard motor
   box(group, 0.16, 0.16, 1.5, mat('#30363d'), 0.5, 1.9, 3.6);
-  for (const part of group.children) {
-    part.scale.multiplyScalar(k);
-    part.position.multiplyScalar(k);
-  }
   return {
     group,
-    seat: new THREE.Vector3(0, 0.35 * k, 1.2 * k),
+    seat: new THREE.Vector3(0, 0.35, 1.2),
     animate(state, dt, t) {
       const run = Math.min(1, Math.abs(state.speed) / VEHICLES.boat.maxSpeed);
       group.position.y += Math.sin(t * 1.7) * 0.12;
       group.rotation.x += Math.sin(t * 1.3) * 0.025 + run * 0.07; // the bow lifts under power
       group.rotation.z += Math.sin(t * 1.1 + 1) * 0.03;
+    },
+  };
+}
+
+/** A slim open canoe, 1.5 wide: narrow enough for a creek. Built here; there is no model. */
+function buildCanoe() {
+  const group = new THREE.Group();
+  const outline = (w, l) => [
+    [0, -3.7 * l],
+    [0.5 * w, -2.5 * l],
+    [0.75 * w, -0.9 * l],
+    [0.75 * w, 0.9 * l],
+    [0.5 * w, 2.5 * l],
+    [0, 3.7 * l],
+    [-0.5 * w, 2.5 * l],
+    [-0.75 * w, 0.9 * l],
+    [-0.75 * w, -0.9 * l],
+    [-0.5 * w, -2.5 * l],
+  ];
+  group.add(hullSlab(outline(1, 1), 0.8, 0.62, mat('#2f7d5b')));
+  group.add(hullSlab(outline(1.08, 1.01), 0.1, 0.68, mat('#d9c08a')));
+  group.add(hullSlab(outline(0.8, 0.9), 0.06, 0.7, mat('#3a2a1c'))); // the open inside
+  const wood = mat('#c9a26b');
+  box(group, 1.3, 0.1, 0.3, wood, 0, 0.72, -1.5);
+  box(group, 1.3, 0.1, 0.3, wood, 0, 0.72, 1.9);
+  // A paddle laid across the gunwales in front of the paddler
+  const paddle = new THREE.Group();
+  tube(paddle, 0.05, [-1.5, 0, 0], [1.1, 0, 0], wood);
+  box(paddle, 0.75, 0.05, 0.36, wood, 1.45, 0, 0);
+  paddle.position.set(0, 0.8, -0.35);
+  paddle.rotation.y = 0.25;
+  group.add(paddle);
+  return {
+    group,
+    seat: new THREE.Vector3(0, -0.42, 0.75),
+    animate(state, dt, t) {
+      group.position.y += Math.sin(t * 2.1) * 0.06;
+      group.rotation.z += Math.sin(t * 1.6) * 0.035;
+      // The paddle dips side to side with the stroke
+      const stroke = Math.min(1, Math.abs(state.speed) / 12);
+      paddle.rotation.z = Math.sin(t * 4.2) * 0.45 * stroke;
     },
   };
 }
@@ -217,7 +255,7 @@ function buildGlider() {
   return { group, seat: new THREE.Vector3(0, 0, 0.4), animate() {} };
 }
 
-const BUILDERS = { boat: () => buildBoat(1), canoe: () => buildBoat(0.6), horse: buildHorse, jeep: buildJeep, glider: buildGlider };
+const BUILDERS = { boat: buildBoat, canoe: buildCanoe, horse: buildHorse, jeep: buildJeep, glider: buildGlider };
 
 /**
  * Downloaded models. `fit` scales the model so that its length (along Z) or height matches, in
@@ -230,8 +268,6 @@ const MODELS = {
     // The helm is inside the cabin, so the sailor is not drawn
     { label: 'Sailboat', url: '/vehicles/watercraft/boat-sail-a.glb', fit: { length: 9.6 }, yaw: Math.PI, y: -0.5, seat: [0, 0.75, 2.6], hideRider: true },
   ],
-  // The kit has no canoe or kayak; its small rowing boat is the closest
-  canoe: [{ label: 'Rowing boat', url: '/vehicles/watercraft/boat-row-small.glb', fit: { length: 5.8 }, yaw: Math.PI, y: -0.3, seat: [0, -0.1, 0.5] }],
   // A closed cab: the driver is inside and not drawn
   jeep: [{ url: '/vehicles/car/suv.glb', fit: { length: 8.0 }, yaw: Math.PI, y: 0, seat: [0, 1.0, 0], hideRider: true, wheels: /^wheel-(front|back)-(left|right)$/ }],
   horse: [{ url: '/vehicles/horse/horse.glb', fit: { height: 4.5 }, yaw: Math.PI, y: 0, seat: [0, 2.05, -0.55], clips: { idle: 'Idle', walk: 'Walk', gallop: 'Gallop' } }],
@@ -426,7 +462,7 @@ export function createVehicles({ scene, terrain }) {
 
     /**
      * @param {{throttle: number, steer: number, boost: boolean}} input
-     * @returns {{turned: number, landed: boolean} | null} null when nobody is riding
+     * @returns {{turned: number, landed: boolean, swamped: boolean} | null} null when nobody is riding
      */
     update(dt, input, t) {
       if (!state) return null;
@@ -437,7 +473,7 @@ export function createVehicles({ scene, terrain }) {
       state.steer = input.steer;
       const turned = stepVehicle(state, input, dt, terrain);
       pose(t, dt);
-      return { turned, landed: state.landed };
+      return { turned, landed: state.landed, swamped: state.swamped };
     },
 
     /** Put the rider group on the seat, turned and tilted with the vehicle. */

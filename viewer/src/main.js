@@ -1940,12 +1940,13 @@ function showToast(text) {
   toastTimer = window.setTimeout(() => el.classList.remove('show'), 2600);
 }
 
-function summonVehicle(kind) {
+/** @param {number} [heading] direction to face (atan2(dx, dz)); the player's by default */
+function summonVehicle(kind, heading) {
   if (!world || state.camMode === 'diorama') {
     showToast('Leave the isometric view to summon a vehicle');
     return;
   }
-  const res = vehicles.summon(kind, player.pos.x, player.pos.z, player.yaw);
+  const res = vehicles.summon(kind, player.pos.x, player.pos.z, Number.isFinite(heading) ? heading : player.yaw);
   if (!res.ok) {
     showToast(res.reason);
     return;
@@ -1980,11 +1981,22 @@ function toggleMount() {
 }
 
 function updateRiding(dt, forwardInput, rightInput, sprint) {
-  const res = vehicles.update(dt, { throttle: forwardInput, steer: rightInput, boost: sprint, action: keys.has(' ') }, clock.elapsedTime);
+  // Steering, as on foot: hold W and turn the camera, and the vehicle comes round to face where
+  // you look, as fast as it can turn. A/D still steer directly, and then the camera follows.
+  // Not while stopped or reversing (you can look around freely), nor in the air.
+  const before = vehicles.state;
+  const byCamera = rightInput === 0 && forwardInput > 0 && VEHICLES[before.kind].medium !== 'air';
+  let steer = rightInput;
+  if (byCamera) {
+    let off = camRig.yaw - Math.PI - before.heading; // camera forward, as a heading
+    off = Math.atan2(Math.sin(off), Math.cos(off));
+    if (Math.abs(off) > 0.02) steer = THREE.MathUtils.clamp(-off * 3, -1, 1);
+  }
+  const res = vehicles.update(dt, { throttle: forwardInput, steer, steerKey: rightInput !== 0, boost: sprint, action: keys.has(' ') }, clock.elapsedTime);
   const v = vehicles.state;
   const cfg = VEHICLES[v.kind];
-  // The chase camera turns with the vehicle; dragging still looks around
-  camRig.yaw += res.turned;
+  // Steered with A/D (or carried round a river bend), the chase camera turns with the vehicle
+  camRig.yaw += byCamera ? v.bent : res.turned;
   player.pos.set(v.x, v.y, v.z);
   player.yaw = v.heading;
   if (v.blocked === 'edge') player.activity = atlas ? 'TERRAIN LOADING' : 'MAP EDGE';
@@ -1999,6 +2011,12 @@ function updateRiding(dt, forwardInput, rightInput, sprint) {
   character.setMotion(cfg.rider, cfg.rider === 'swim' ? 0.02 : 1);
   character.update(dt);
   if (res.landed) leaveVehicle();
+  else if (res.swamped) {
+    // Driven or ridden off into deep water: the rider swims, the vehicle is gone
+    leaveVehicle();
+    vehicles.release();
+    showToast(`The ${cfg.label.toLowerCase()} is lost to the water. ${cfg.key.toUpperCase()} summons another on land`);
+  }
 }
 
 function updateTelemetry() {

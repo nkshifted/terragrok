@@ -23,7 +23,7 @@ from pathlib import Path
 from paths import REPO_ROOT, main_checkout_root
 
 OUT = REPO_ROOT / "viewer" / "public" / "vehicles"
-KENNEY = {"car": ["suv.glb"], "watercraft": ["boat-speed-e.glb", "boat-sail-a.glb", "boat-row-small.glb"]}
+KENNEY = {"car": ["suv.glb"], "watercraft": ["boat-speed-e.glb", "boat-sail-a.glb"]}
 
 
 def vendor_root() -> Path:

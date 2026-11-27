@@ -131,13 +131,50 @@ test('rolling ground does not make a vehicle hop', () => {
   assert.equal(hops, 0);
 });
 
-test('land vehicles stop at deep water and a boat stops at the shore', () => {
-  const jeep = run(createVehicleState('jeep', -60, 0, EAST, COAST), COAST, { throttle: 1 }, 6);
-  assert.ok(jeep.x < 3 && jeep.blocked === 'terrain');
+// A beach: dry land sloping gently under the sea to the east
+const BEACH = world((x) => 3 - Math.max(0, x + 60) * 0.05);
+
+test('land vehicles stop where a beach gets too deep, and a boat stops at the shore', () => {
+  const jeep = run(createVehicleState('jeep', -60, 0, EAST, BEACH), BEACH, { throttle: 1 }, 8);
+  assert.ok(BEACH.height(jeep.x) >= -VEHICLES.jeep.wadeDepth - 0.2 && jeep.blocked === 'terrain' && !jeep.swamped, `jeep at x=${jeep.x}`);
+  const horse = run(createVehicleState('horse', -60, 0, EAST, BEACH), BEACH, { throttle: 1 }, 8);
+  assert.ok(horse.x > jeep.x + 5 && !horse.swamped, 'a horse wades further out');
   const boat = run(createVehicleState('boat', 80, 0, -EAST, COAST), COAST, { throttle: 1 }, 8);
   assert.ok(boat.x >= 0 && boat.x < 3 && boat.blocked === 'terrain', `boat reached x=${boat.x}`);
   assert.equal(boat.y, 0);
   assert.ok(isWater(COAST, boat.x, boat.z));
+});
+
+test('driving off a cliff into the sea is an arc and a splash, not a wall', () => {
+  // A 60-high cliff at x = 0 with deep sea below it
+  const cliff = world((x) => (x < 0 ? 60 : -25));
+  for (const kind of ['jeep', 'horse']) {
+    const s = createVehicleState(kind, -150, 0, EAST, cliff);
+    let flew = false;
+    let stalled = false;
+    let t = 0;
+    while (!s.swamped && t < 15) {
+      stepVehicle(s, { throttle: 1, steer: 0, boost: true, action: false }, DT, cliff);
+      flew ||= s.air;
+      stalled ||= s.air && s.speed === 0;
+      for (const k of ['x', 'y', 'z', 'vy', 'speed', 'pitch']) assert.ok(Number.isFinite(s[k]), `${kind} ${k} is ${s[k]}`);
+      t += DT;
+    }
+    assert.ok(flew && !stalled, `${kind} keeps moving through the air`);
+    assert.ok(s.swamped && s.x > 30, `${kind} came down out at sea (x=${s.x})`);
+    assert.ok(s.y <= 0 && s.y >= -VEHICLES[kind].wadeDepth, `${kind} ends at the surface (y=${s.y})`);
+  }
+});
+
+test('a frame with no elapsed time changes nothing', () => {
+  const s = run(createVehicleState('jeep', 0, 0, EAST, FLAT), FLAT, { throttle: 1 }, 2);
+  const before = JSON.stringify(s);
+  assert.equal(stepVehicle(s, { throttle: 1, steer: 1, boost: false, action: true }, 0, FLAT), 0);
+  assert.equal(JSON.stringify(s), before);
+  // ...and a jump afterwards is still a finite arc
+  stepVehicle(s, { throttle: 1, steer: 0, boost: false, action: true }, DT, FLAT);
+  run(s, FLAT, { throttle: 1 }, 1);
+  assert.ok(Number.isFinite(s.y) && Number.isFinite(s.vy));
 });
 
 test('summoning respects the medium', () => {
@@ -168,10 +205,42 @@ test('a canoe follows a river that a boat cannot enter', () => {
   assert.ok(put.ok && Math.abs(put.z) < 8, 'the canoe appears on the river');
   const canoe = run(createVehicleState('canoe', 0, 0, EAST, land), land, { throttle: 1 }, 8);
   assert.ok(canoe.x > 250, 'downriver and out onto the lake');
-  const ashore = run(createVehicleState('canoe', 0, 0, 0, land), land, { throttle: 1 }, 3);
+  const ashore = run(createVehicleState('canoe', 0, 0, 0, land), land, { throttle: 1, steerKey: true }, 3);
   assert.ok(Math.abs(ashore.z) < 8.5 && ashore.blocked === 'terrain', 'but not up the bank');
   const boat = run(createVehicleState('boat', 300, 0, -EAST, land), land, { throttle: 1 }, 8);
   assert.ok(boat.x > 199, 'the boat stays on the lake');
+});
+
+test('a canoe keeps going down a narrow, winding, cluttered creek', () => {
+  // A creek only 5 wide, snaking east (centre line z = 14 sin(x / 40)), with a strong mask only
+  // in mid-channel, a 6-long gravel bar across it at x = 150 and reeds thinning the mask
+  const centre = (x) => 14 * Math.sin(x / 40);
+  const creek = world(() => 30, {
+    river: (x, z) => {
+      if (x > 150 && x < 156) return 0;
+      const off = Math.abs(z - centre(x));
+      return off < 1 ? 0.8 : off < 2.5 ? 0.2 : 0;
+    },
+  });
+  const s = createVehicleState('canoe', 0, 0, EAST, creek);
+  let stuck = 0;
+  let bent = 0;
+  let worst = 0;
+  for (let i = 0; i < 40 / DT && s.x < 400; i++) {
+    stepVehicle(s, { throttle: 1, steer: 0, boost: false, action: false }, DT, creek);
+    if (s.blocked) stuck++;
+    bent += Math.abs(s.bent);
+    if (!(s.x > 148 && s.x < 158)) worst = Math.max(worst, Math.abs(s.z - centre(s.x)));
+  }
+  assert.ok(s.x >= 400, `reached x=${s.x} (blocked on ${stuck} steps)`);
+  assert.ok(worst < 6, `stayed in or beside the channel (strayed ${worst})`);
+  assert.ok(bent > 1, 'it turned with the creek by itself');
+  // Steering by key turns that help off: aimed at the bank, it stops
+  const manual = createVehicleState('canoe', 0, 0, 0, creek);
+  for (let i = 0; i < 4 / DT; i++) stepVehicle(manual, { throttle: 1, steer: 0, steerKey: true, boost: false, action: false }, DT, creek);
+  assert.ok(Math.abs(manual.z) < 20 && manual.blocked === 'terrain', `held the key and ran aground at z=${manual.z}`);
+  // A boat gets no such help
+  assert.equal(summonSpot('boat', creek, 0, 0).ok, false);
 });
 
 test('holding the action key lifts a glider, up to its ceiling', () => {
