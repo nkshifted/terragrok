@@ -203,7 +203,7 @@ test('a canoe follows a river that a boat cannot enter', () => {
   assert.equal(summonSpot('boat', land, 0, 0).ok, false);
   const put = summonSpot('canoe', land, 0, 40);
   assert.ok(put.ok && Math.abs(put.z) < 8, 'the canoe appears on the river');
-  const canoe = run(createVehicleState('canoe', 0, 0, EAST, land), land, { throttle: 1 }, 8);
+  const canoe = run(createVehicleState('canoe', 0, 0, EAST, land), land, { throttle: 1 }, 16);
   assert.ok(canoe.x > 250, 'downriver and out onto the lake');
   const ashore = run(createVehicleState('canoe', 0, 0, 0, land), land, { throttle: 1, steerKey: true }, 3);
   assert.ok(Math.abs(ashore.z) < 8.5 && ashore.blocked === 'terrain', 'but not up the bank');

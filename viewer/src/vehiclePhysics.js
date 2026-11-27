@@ -17,8 +17,8 @@
 
 export const VEHICLES = {
   boat: { label: 'Boat', key: 'b', medium: 'water', maxSpeed: 95, reverse: 25, accel: 38, coast: 0.5, turn: 1.0, steerNeedsSpeed: true, activity: 'SAILING', rider: 'sit' },
-  // Light enough for rivers as well as lakes and the sea, and turns on the spot
-  canoe: { label: 'Canoe', key: 'k', medium: 'water', rivers: true, portage: 14, maxSpeed: 46, reverse: 20, accel: 30, coast: 0.9, turn: 1.7, activity: 'PADDLING', rider: 'sit' },
+  // Paddled, so slower than a person sprinting; light enough for rivers, and turns on the spot
+  canoe: { label: 'Canoe', key: 'k', medium: 'water', rivers: true, portage: 14, maxSpeed: 22, reverse: 10, accel: 14, coast: 0.9, turn: 1.7, activity: 'PADDLING', rider: 'sit' },
   horse: { label: 'Horse', key: 'r', medium: 'land', maxSpeed: 62, boost: 1.75, reverse: 14, accel: 85, coast: 2.2, turn: 2.3, maxSlope: 62, wadeDepth: 1.6, jump: 27, activity: 'RIDING', rider: 'sit' },
   jeep: { label: 'Jeep', key: 'j', medium: 'land', maxSpeed: 135, reverse: 38, accel: 52, coast: 0.9, turn: 1.35, steerNeedsSpeed: true, maxSlope: 50, wadeDepth: 0.7, jump: 21, activity: 'DRIVING', rider: 'drive' },
   glider: { label: 'Glider', key: 'g', medium: 'air', cruise: 72, dive: 128, flare: 42, sinkCruise: 6.5, sinkDive: 24, sinkFlare: 3.2, climb: 13, ceiling: 700, turn: 0.85, launch: 34, activity: 'GLIDING', rider: 'swim' },
