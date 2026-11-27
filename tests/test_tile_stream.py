@@ -162,3 +162,16 @@ def test_existing_catalog_tiles_are_adopted_only_from_this_chart_scheme():
 
 def test_status_for_unknown_world():
     assert TileStreamRegistry().status("nope")["ok"] is False
+
+
+def test_rewritten_tiles_are_announced_by_a_new_revision():
+    reg, _clock = _registry()
+    reg.mark_tile(HOME, 1, 0, chart_tile_id(HOME, 1, 0), "2k")
+    before = reg.status(HOME)
+    assert before["homeRev"] == 0
+    reg.bump_rev(HOME, 1, 0)
+    reg.bump_rev(HOME, 0, 0)
+    reg.bump_rev(HOME, 5, 5)  # unknown tile: ignored
+    after = reg.status(HOME)
+    assert after["homeRev"] == 1
+    assert after["tiles"][0]["rev"] == before["tiles"][0]["rev"] + 1

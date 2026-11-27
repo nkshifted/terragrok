@@ -200,6 +200,19 @@ export function createTileStreamController({ onChange, getPlayerPos }) {
         onChange();
       }
 
+      // The server rewrote the home tile's files (e.g. a climate refresh): reload it in place
+      const home = tiles.get(tileKey(0, 0));
+      if (home && st.homeRev > 0 && st.homeRev !== home.rev) {
+        try {
+          const entry = await loadTile({ tileId: homeWorldId, qi: 0, qj: 0, rev: st.homeRev, quality: home.quality });
+          if (gen !== generation) return;
+          remember(entry);
+          changed = true;
+        } catch (err) {
+          console.warn('[tile-stream] home reload failed', err.message);
+        }
+      }
+
       // Window tiles first (they are walkable terrain), nearest first
       const wanted = (st.tiles || []).filter((t) => !(t.qi === 0 && t.qj === 0));
       for (const t of wanted) {

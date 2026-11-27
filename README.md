@@ -50,7 +50,10 @@ centred on it. Each further tile is the same chart shifted by whole tiles, synth
 shifted window of the *same* diffusion world with the same seed, settings and vertical scale.
 Because the model seeds its noise by world coordinate, adjacent tiles agree at their shared edge
 to within about a metre on gentle ground and a few metres in mountains. Rivers that leave a tile
-through an edge are injected as inflow into the tile beyond when it is synthesized.
+through an edge are injected as inflow into the tile beyond when it is synthesized. Climate is blended
+per pixel from the planet's and the model's, so biomes and the snow line run straight through
+seams; tiles from before that was true have their climate recomputed (about 2 s each, no
+re-synthesis) the first time their world is opened.
 
 - [`experiments/tile_stream.py`](experiments/tile_stream.py) plans what to synthesize: the
   explorer posts the player's position every two seconds and the server works on the nearest

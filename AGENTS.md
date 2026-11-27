@@ -54,6 +54,10 @@ these per tile brings the cliffs back:
 - resolution, `quality` and `fidelity` (1K and 2K are different model scales, not a ladder)
 - `vScale` (`dem_to_viewer`)
 - world-anchored procedural detail (`origin_px` in the refinement functions)
+- climate: `blend_climate` and `pack_climate` in `chart.py` are per-pixel with fixed ranges.
+  Nothing may be centred or scaled by a statistic of the tile (a mean, a percentile); that
+  put a straight climate line on every seam. If the rasters change meaning, bump
+  `CLIMATE_VERSION`: older tiles are then recomputed by `_refresh_tile_climate` on first use
 
 Post-processing that looks at a neighbourhood (blurs, relaxation) runs on a 64-pixel margin
 that is cropped afterwards. New filters belong before that crop in `_synthesize_on_worker`.

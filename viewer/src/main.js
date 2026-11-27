@@ -1457,6 +1457,11 @@ function syncFogDensity() {
 }
 
 function setCameraMode(mode) {
+  // Leaving the isometric view: keep looking the way it was turned, so the compass does not jump
+  if (state.camMode === 'diorama' && mode !== 'diorama') {
+    camRig.yaw = camRig.dioramaYaw;
+    player.yaw = camRig.dioramaYaw + Math.PI;
+  }
   state.camMode = mode;
   document.querySelectorAll('[data-cam]').forEach((b) => b.classList.toggle('active', b.dataset.cam === mode));
 

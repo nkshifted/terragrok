@@ -13,6 +13,7 @@ Run via:
 from __future__ import annotations
 
 import argparse
+import collections
 import gc
 import itertools
 import json
@@ -53,7 +54,11 @@ from world_cache import (  # noqa: E402
     prune_unbookmarked_worlds,
 )
 from chart import (  # noqa: E402
+    CLIMATE_PRECIP_RANGE,
+    CLIMATE_TEMP_RANGE,
+    CLIMATE_VERSION,
     GHOST_SIZE,
+    blend_climate,
     chart_from_home_meta,
     chart_seed,
     coarse_size_for,
@@ -61,8 +66,10 @@ from chart import (  # noqa: E402
     decode_f32,
     dem_to_viewer,
     estimate_home_v_scale,
+    pack_climate,
     relief_v_scale,
     run_stage1_patch,
+    viewer_to_dem,
 )
 from tile_ghost import list_tiles_for_home, write_ghost_tile  # noqa: E402
 from tile_grid import chart_tile_id  # noqa: E402
@@ -358,6 +365,8 @@ class WarmStage2Engine:
         # the worker asks the tile-stream planner for the nearest missing tile when idle.
         self._job_queue: queue.PriorityQueue = queue.PriorityQueue()
         self._job_seq = itertools.count()
+        # (home, qi, qj, tile id) whose climate raster predates CLIMATE_VERSION; worker thread only pops
+        self._climate_jobs: collections.deque = collections.deque()
         self.status = {
             "busy": False,
             "phase": "initializing",
@@ -380,6 +389,10 @@ class WarmStage2Engine:
                 _prio, _seq, kind, payload, done_evt, holder = self._job_queue.get(timeout=0.5)
             except queue.Empty:
                 if self.ready:
+                    if self._climate_jobs:
+                        # Quick (coarse model only), and the tiles are already on screen
+                        self._refresh_tile_climate(*self._climate_jobs.popleft())
+                        continue
                     job = TILE_STREAMS.next_synth_job()
                     if job:
                         self._run_tile_job(job)
@@ -436,6 +449,83 @@ class WarmStage2Engine:
             self.status.update({"busy": False, "phase": "idle", "message": f"Tile {qi},{qj} failed: {exc}"})
             print(f"[TileStream] {tile_id} FAILED: {exc}", flush=True)
 
+    def _refresh_tile_climate(self, home: str, qi: int, qj: int, tile_id: str) -> None:
+        """
+        Recompute one existing tile's climate raster with `blend_climate`, without re-synthesizing
+        it: the model's climate comes from its coarse stage plus a lapse rate on elevation, and
+        the elevation is already on disk. Runs on the worker thread.
+        """
+        try:
+            chart = TILE_STREAMS.chart(home)
+            meta_path = VIEWER_WORLDS_DIR / f"{tile_id}.json"
+            if not chart or not meta_path.exists():
+                return
+            meta = json.loads(meta_path.read_text())
+            n = int(meta["size"])
+            cs = coarse_size_for(meta.get("resolution") or chart["tileResolution"])
+            px = 256 // self.coarse_pooling
+            if cs * px != n:
+                raise ValueError(f"size {n} does not match {cs} coarse cells")
+            t0 = time.perf_counter()
+            p = run_stage1_patch(chart, [{"qi": qi, "qj": qj, "coarseSize": cs, "margin": True}])[0]
+            padding = int(p.get("padding", 64))
+            fc = cs + 2 * padding
+            rs, rp = int(p["refSize"]), int(p.get("refPad", 0))
+            rf = rs + 2 * rp
+            margin = (rp * n) // rs
+            pad_n = n + 2 * margin
+            crop = slice(margin, margin + n)
+            ref_temp = zoom(decode_f32(p["refTemp"], (rf, rf)), pad_n / rf, order=1)[crop, crop]
+            ref_precip = zoom(decode_f32(p["refPrecip"], (rf, rf)), pad_n / rf, order=1)[crop, crop]
+            heights = np.fromfile(VIEWER_WORLDS_DIR / f"{tile_id}.height.f32", dtype=np.float32).reshape(n, n)
+            elev_dem = viewer_to_dem(heights, float(meta.get("vScale") or chart["vScale"]))
+
+            oi, oj = qj * cs, qi * cs
+            pi1, pj1 = (padding + oi) * px, (padding + oj) * px
+            prev_cwd = os.getcwd()
+            os.chdir(VENDOR_TD)
+            try:
+                conds = (("condElev", -1500.0), ("condTemp", 12.0), ("condTempStd", 600.0), ("condPrecip", 900.0), ("condPrecipCv", 35.0))
+                for ch, (key, default) in enumerate(conds):
+                    self.world.set_custom_conditioning_import(ch, decode_f32(p[key], (fc, fc)), oi, oj, default_value=default, rebuild=False)
+                self.world.seed = chart_seed(chart["seed"], chart["homeLatDeg"], chart["homeLonDeg"])
+                self.world.onestep_latent = chart["quality"] == "fast"
+                self.world.rebuild()
+                with torch.no_grad():
+                    # The pipeline keeps its coarse map on the CPU, where it expects elevation too
+                    elev_t = torch.from_numpy(elev_dem)
+                    raw = self.world._compute_climate(pi1, pj1, pi1 + n, pj1 + n, elev_t, scale=self.world.latent_compression)
+                raw = raw.detach().float().cpu().numpy()
+                self.world.empty_cache()
+            finally:
+                os.chdir(prev_cwd)
+
+            temp_c, precip_mm = blend_climate(raw[0], raw[2], ref_temp, ref_precip)
+            t_season = np.where(np.isfinite(raw[1]), np.abs(raw[1]), 450.0)
+            climate_n = int(meta.get("climateSize") or min(n, 512))
+            tmp = VIEWER_WORLDS_DIR / f"{tile_id}.climate.u8.tmp"
+            pack_climate(temp_c, precip_mm, t_season, climate_n).tofile(tmp)
+            update = {
+                "climateVersion": CLIMATE_VERSION,
+                "climateSize": climate_n,
+                "tempRange": list(CLIMATE_TEMP_RANGE),
+                "precipRange": list(CLIMATE_PRECIP_RANGE),
+            }
+            with CATALOG_LOCK:
+                os.replace(tmp, VIEWER_WORLDS_DIR / f"{tile_id}.climate.u8")
+                meta.update(update)
+                meta_path.write_text(json.dumps(meta, indent=2))
+                catalog = load_synth_catalog()
+                for e in catalog:
+                    if e.get("id") == tile_id:
+                        e.update(update)
+                save_synth_catalog(catalog)
+            TILE_STREAMS.bump_rev(home, qi, qj)
+            print(f"[TileStream] {tile_id}: climate refreshed ({time.perf_counter() - t0:.1f}s)", flush=True)
+        except Exception as exc:
+            # Not retried this run; the tile keeps its old climate and is picked up next start
+            print(f"[TileStream] {tile_id}: climate refresh FAILED: {exc}", flush=True)
+
     def open_tile_stream(self, home_world_id: str) -> None:
         """Create the planner session for a home world (idempotent)."""
         if TILE_STREAMS.has_session(home_world_id):
@@ -462,7 +552,20 @@ class WarmStage2Engine:
                         e["vScaleEstimated"] = True
                 save_synth_catalog(catalog)
             print(f"[TileStream] {home_world_id}: estimated vScale={chart['vScale']:.4f}", flush=True)
-        TILE_STREAMS.open_session(home_world_id, chart, list_tiles_for_home(home_world_id))
+        existing = list_tiles_for_home(home_world_id)
+        TILE_STREAMS.open_session(home_world_id, chart, existing)
+        # Tiles written before climate was made continuous across seams: recompute theirs
+        stale = [(0, 0, home_world_id)] if int(meta.get("climateVersion") or 1) < CLIMATE_VERSION else []
+        for e in existing:
+            to = e.get("tileOrigin") or {}
+            if to.get("scheme") != "chart" or e.get("quality") == "ghost" or not e.get("hasClimate"):
+                continue
+            if int(e.get("climateVersion") or 1) < CLIMATE_VERSION:
+                stale.append((int(to["qi"]), int(to["qj"]), e["id"]))
+        stale.sort(key=lambda t: max(abs(t[0]), abs(t[1])))
+        self._climate_jobs.extend((home_world_id, qi, qj, tid) for qi, qj, tid in stale)
+        if stale:
+            print(f"[TileStream] {home_world_id}: refreshing climate of {len(stale)} older tile(s)", flush=True)
         print(
             f"[TileStream] Stream open for {home_world_id} "
             f"(tiles at {chart['tileResolution']}, vScale={chart['vScale']:.4f})",
@@ -729,19 +832,11 @@ class WarmStage2Engine:
                 iterations=repose_iters,
             )
 
-            # Preserve Stage 1 planetary climate mean EXACTLY, adding ONLY TD30m's zero-mean local spatial
-            # anomaly so Sahara deserts stay bone-dry (<220mm) and polar glaciers stay genuinely frozen (<-5°C)!
+            # Stage 1's planetary climate with a share of TD30m's local detail, blended per pixel so
+            # it is continuous across the tiles of a chart (see blend_climate)
             ref_temp_up = zoom(ref_temp, pad_n / ref_full, order=1).astype(np.float32)
             ref_precip_up = zoom(ref_precip, pad_n / ref_full, order=1).astype(np.float32)
-            valid_t = np.isfinite(climate_raw[0])
-            td_t_mean = float(np.mean(climate_raw[0][valid_t])) if valid_t.any() else 10.0
-            td_t_anom = np.where(valid_t, (climate_raw[0] - td_t_mean) * 0.28, 0.0)
-            temp_c = np.clip(ref_temp_up + td_t_anom, -22.0, 38.0).astype(np.float32)
-
-            valid_p = np.isfinite(climate_raw[2]) & (climate_raw[2] > 1.0)
-            td_p_mean = float(np.mean(climate_raw[2][valid_p])) if valid_p.any() else 600.0
-            td_p_ratio = np.where(valid_p, np.clip(climate_raw[2] / max(td_p_mean, 50.0), 0.72, 1.32), 1.0)
-            precip_mm = np.clip(ref_precip_up * td_p_ratio, 35.0, 3500.0).astype(np.float32)
+            temp_c, precip_mm = blend_climate(climate_raw[0], climate_raw[2], ref_temp_up, ref_precip_up)
             t_season = np.where(np.isfinite(climate_raw[1]), np.abs(climate_raw[1]), 450.0).astype(np.float32)
 
             elev_refined = _apply_biome_surface_refinement(
@@ -810,19 +905,9 @@ class WarmStage2Engine:
 
             # Climate varies smoothly over km -> pack at <=512x512 (1 MB max even for 4K worlds!)
             climate_n = min(out_n, 512)
-            temp_range = [-16.0, 32.0]
-            precip_range = [0.0, 1800.0]
-            if climate_n < out_n:
-                c_scale = climate_n / float(out_n)
-                t_c_sm = zoom(temp_c, c_scale, order=1)
-                p_c_sm = zoom(precip_mm, c_scale, order=1)
-                s_c_sm = zoom(t_season, c_scale, order=1)
-            else:
-                t_c_sm, p_c_sm, s_c_sm = temp_c, precip_mm, t_season
-            t_u8 = np.clip((t_c_sm - temp_range[0]) / (temp_range[1] - temp_range[0]) * 255.0, 0, 255).astype(np.uint8)
-            p_u8 = np.clip((p_c_sm - precip_range[0]) / (precip_range[1] - precip_range[0]) * 255.0, 0, 255).astype(np.uint8)
-            s_u8 = np.clip(s_c_sm / max(float(np.percentile(s_c_sm, 98)), 1.0) * 255.0, 0, 255).astype(np.uint8)
-            clim_rgba = np.stack([t_u8, p_u8, s_u8, np.full((climate_n, climate_n), 255, dtype=np.uint8)], axis=-1)
+            temp_range = list(CLIMATE_TEMP_RANGE)
+            precip_range = list(CLIMATE_PRECIP_RANGE)
+            clim_rgba = pack_climate(temp_c, precip_mm, t_season, climate_n)
             clim_rgba.tofile(VIEWER_WORLDS_DIR / f"{world_id}.climate.u8")
 
             # Absolute biome moisture + riparian wetness ONLY where real rivers/lakes exist!
@@ -861,6 +946,7 @@ class WarmStage2Engine:
                 "maxElev": round(float(carved.max()), 2),
                 "seaLevel": 0.0,
                 "hasClimate": True,
+                "climateVersion": CLIMATE_VERSION,
                 "tempRange": temp_range,
                 "precipRange": precip_range,
                 "riverCount": len(rivers_data),

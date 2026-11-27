@@ -56,6 +56,64 @@ def dem_to_viewer(elev_dem: np.ndarray, v_scale: float) -> np.ndarray:
     return np.where(out > 330.0, 330.0 + 115.0 * np.tanh((out - 330.0) / 150.0), out).astype(np.float32)
 
 
+def viewer_to_dem(elev_viewer: np.ndarray, v_scale: float) -> np.ndarray:
+    """Inverse of `dem_to_viewer` on land (sea comes back as 0: nothing below it is needed)."""
+    h = np.asarray(elev_viewer, dtype=np.float32)
+    knee = 330.0 + 150.0 * np.arctanh(np.clip((h - 330.0) / 115.0, 0.0, 0.999))
+    return (np.maximum(np.where(h > 330.0, knee, h), 0.0) / max(float(v_scale), 1e-6)).astype(np.float32)
+
+
+# Bump when the climate rasters on disk change meaning; older tiles are refreshed on first use
+CLIMATE_VERSION = 2
+CLIMATE_TEMP_RANGE = [-16.0, 32.0]
+CLIMATE_PRECIP_RANGE = [0.0, 1800.0]
+CLIMATE_SEASON_MAX = 1500.0
+_TD_CLIMATE_WEIGHT = 0.28
+
+
+def blend_climate(raw_temp, raw_precip, ref_temp, ref_precip) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Final temperature (deg C) and rainfall (mm/yr): the planet's climate pulled 28% of the way
+    towards the diffusion model's, which adds lapse-rate and rain-shadow detail.
+
+    Strictly per-pixel on purpose. Both inputs are continuous across the tiles of a chart, so the
+    result is too; anything computed over a tile (a mean to centre on, a percentile to scale by)
+    differs from tile to tile and shows up as a straight climate line along every seam.
+    """
+    ref_temp = np.asarray(ref_temp, dtype=np.float32)
+    ref_precip = np.asarray(ref_precip, dtype=np.float32)
+    raw_temp = np.asarray(raw_temp, dtype=np.float32)
+    raw_precip = np.asarray(raw_precip, dtype=np.float32)
+    d_t = np.where(np.isfinite(raw_temp), raw_temp - ref_temp, 0.0)
+    temp_c = np.clip(ref_temp + _TD_CLIMATE_WEIGHT * d_t, -22.0, 38.0)
+    ok = np.isfinite(raw_precip) & (raw_precip > 1.0)
+    ratio = np.where(ok, np.maximum(raw_precip, 1.0) / np.maximum(ref_precip, 1.0), 1.0)
+    precip_mm = np.clip(ref_precip * np.clip(ratio**_TD_CLIMATE_WEIGHT, 0.72, 1.32), 35.0, 3500.0)
+    return temp_c.astype(np.float32), precip_mm.astype(np.float32)
+
+
+def pack_climate(temp_c: np.ndarray, precip_mm: np.ndarray, t_season: np.ndarray, climate_n: int) -> np.ndarray:
+    """RGBA8 climate raster (temp, rainfall, seasonality, 255) at climate_n², fixed ranges."""
+    from scipy.ndimage import zoom
+
+    def fit(a):
+        a = np.asarray(a, dtype=np.float32)
+        return a if a.shape[0] == climate_n else zoom(a, climate_n / float(a.shape[0]), order=1)
+
+    def u8(a, lo, hi):
+        return np.clip((fit(a) - lo) / (hi - lo) * 255.0, 0, 255).astype(np.uint8)
+
+    return np.stack(
+        [
+            u8(temp_c, *CLIMATE_TEMP_RANGE),
+            u8(precip_mm, *CLIMATE_PRECIP_RANGE),
+            u8(t_season, 0.0, CLIMATE_SEASON_MAX),
+            np.full((climate_n, climate_n), 255, dtype=np.uint8),
+        ],
+        axis=-1,
+    )
+
+
 def chart_from_home_meta(meta: dict) -> dict:
     """Chart parameters for a synthesized home world. Raises if it has no planet origin."""
     po = meta.get("planetOrigin")

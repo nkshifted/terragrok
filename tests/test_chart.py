@@ -128,3 +128,59 @@ def test_edge_inflows_come_only_from_rivers_leaving_through_the_shared_edge(tmp_
     # South-west tile (-1, 1): the west tile's south-edge river; the ghost beside it contributes nothing
     assert collect_edge_inflows(home, -1, 1, catalog, tmp_path) == [{"edge": "N", "t": 0.375, "q": 55.5}]
     assert collect_edge_inflows(home, 1, 0, catalog, tmp_path) == []
+
+
+def _smooth_field(rows: int, cols: int, col0: int, scale: float, offset: float) -> np.ndarray:
+    yy, xx = np.mgrid[0:rows, col0 : col0 + cols].astype(np.float32)
+    return (offset + scale * np.sin(xx / 37.0) * np.cos(yy / 23.0) + scale * xx / 90.0).astype(np.float32)
+
+
+def test_climate_blend_is_continuous_across_a_seam():
+    """Two tiles cut from one world must get the climate the whole world would have got."""
+    from chart import blend_climate
+
+    n = 64
+    raw_t = _smooth_field(n, 2 * n, 0, 9.0, 4.0)
+    ref_t = _smooth_field(n, 2 * n, 5, 8.0, 5.0)
+    raw_p = 900.0 + 60.0 * _smooth_field(n, 2 * n, 11, 5.0, 0.0)
+    ref_p = 700.0 + 50.0 * _smooth_field(n, 2 * n, 3, 5.0, 0.0)
+    whole_t, whole_p = blend_climate(raw_t, raw_p, ref_t, ref_p)
+    west_t, west_p = blend_climate(raw_t[:, :n], raw_p[:, :n], ref_t[:, :n], ref_p[:, :n])
+    east_t, east_p = blend_climate(raw_t[:, n:], raw_p[:, n:], ref_t[:, n:], ref_p[:, n:])
+    # The two halves have very different means: a per-tile mean would show up here
+    assert abs(float(raw_t[:, :n].mean() - raw_t[:, n:].mean())) > 3.0
+    np.testing.assert_array_equal(np.hstack([west_t, east_t]), whole_t)
+    np.testing.assert_array_equal(np.hstack([west_p, east_p]), whole_p)
+
+
+def test_climate_blend_stays_near_the_planet_climate():
+    from chart import blend_climate
+
+    ref_t = np.full((8, 8), 10.0, np.float32)
+    ref_p = np.full((8, 8), 100.0, np.float32)
+    t, p = blend_climate(ref_t + 10.0, ref_p * 50.0, ref_t, ref_p)
+    assert np.allclose(t, 12.8, atol=1e-4)
+    assert np.allclose(p, 132.0, atol=1e-2)  # a desert stays a desert
+    t, p = blend_climate(np.full((8, 8), np.nan, np.float32), np.zeros((8, 8), np.float32), ref_t, ref_p)
+    assert np.allclose(t, 10.0) and np.allclose(p, 100.0)
+
+
+def test_climate_packing_does_not_depend_on_the_tile():
+    from chart import pack_climate
+
+    t = np.full((16, 16), 8.0, np.float32)
+    p = np.full((16, 16), 900.0, np.float32)
+    calm = pack_climate(t, p, np.full((16, 16), 300.0, np.float32), 8)
+    wild = pack_climate(t, p, np.linspace(300.0, 1400.0, 256, dtype=np.float32).reshape(16, 16), 8)
+    assert calm.shape == (8, 8, 4) and calm.dtype == np.uint8
+    assert calm[0, 0, 2] == wild[0, 0, 2] == 51  # same seasonality, same byte, whatever else is in the tile
+    assert calm[0, 0, 0] == 127 and calm[0, 0, 1] == 127 and calm[0, 0, 3] == 255
+
+
+def test_viewer_to_dem_inverts_the_vertical_mapping_on_land():
+    from chart import viewer_to_dem
+
+    dem = np.array([0.5, 40.0, 900.0, 2000.0, 2600.0], dtype=np.float32)
+    back = viewer_to_dem(dem_to_viewer(dem, 0.18), 0.18)
+    np.testing.assert_allclose(back, dem, rtol=2e-3)
+    assert viewer_to_dem(dem_to_viewer(np.array([-800.0], np.float32), 0.18), 0.18)[0] == 0.0

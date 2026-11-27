@@ -75,6 +75,7 @@ class TileStreamRegistry:
                     "tiles": {},
                     "active": None,
                     "ghostBusy": False,
+                    "homeRev": 0,
                 }
                 self._sessions[home_world_id] = sess
             else:
@@ -178,6 +179,17 @@ class TileStreamRegistry:
             if sess["active"] and (sess["active"]["qi"], sess["active"]["qj"]) == key and q != "ghost":
                 sess["active"] = None
 
+    def bump_rev(self, home_world_id: str, qi: int, qj: int) -> None:
+        """A tile's files were rewritten in place: tell explorers to reload it."""
+        with self._lock:
+            sess = self._sessions.get(home_world_id)
+            if not sess:
+                return
+            if (int(qi), int(qj)) == (0, 0):
+                sess["homeRev"] += 1
+            elif (int(qi), int(qj)) in sess["tiles"]:
+                sess["tiles"][(int(qi), int(qj))]["rev"] += 1
+
     def mark_failed(self, home_world_id: str, qi: int, qj: int) -> None:
         with self._lock:
             sess = self._sessions.get(home_world_id)
@@ -220,6 +232,8 @@ class TileStreamRegistry:
                 "playerQj": pqj,
                 "tileResolution": sess["chart"].get("tileResolution"),
                 "worldSpan": sess["chart"].get("worldSpan"),
+                # The home tile is not in `tiles`; this changes when its files are rewritten
+                "homeRev": sess["homeRev"],
                 "active": dict(sess["active"]) if sess["active"] else None,
                 "tiles": tiles,
             }
