@@ -5,7 +5,7 @@
  * conditioning / ghost rasters for the requested chart tiles, so the Stage 2 server can
  * synthesize neighbours without a browser tab doing the sampling.
  *
- * stdin : { seed, archetype, climateMode, seaLevelBias, reliefScale,
+ * stdin : { seed, archetype, climateMode, seaLevelBias, geoTimeMyr, reliefScale,
  *           homeLatDeg, homeLonDeg, spanDeg,
  *           tiles: [{ qi, qj, coarseSize?, margin?, ghostSize? }] }
  *           A tile with coarseSize gets conditioning; one with ghostSize gets ghost elevation.
@@ -39,6 +39,7 @@ const planet = generateStage1Planet({
   archetype: req.archetype || 'earth',
   climateMode: req.climateMode || 'earth',
   seaLevelBias: Number(req.seaLevelBias ?? 0),
+  geoTimeMyr: Number(req.geoTimeMyr ?? 0),
 });
 
 const tiles = (req.tiles || []).map((t) => {

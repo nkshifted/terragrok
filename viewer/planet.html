@@ -473,6 +473,12 @@
           <span>Sea Level <strong id="sea-val">Normal</strong></span>
           <input id="sea-slider" type="range" min="-0.14" max="0.14" step="0.02" value="0.0" />
         </label>
+        <label title="Move every tectonic plate backward or forward in time. Continents drift, collide and raise mountain ranges. Synthesized regions belong to the moment they were made at.">
+          <span><span>Geological Time
+            <button id="btn-time-today" type="button" title="Back to the planet as generated" style="display:inline-block;width:auto;flex:none;margin:0 0 0 6px;padding:0 7px;border-radius:6px;background:rgba(14,22,36,0.9);color:#dce9fa;border:1px solid rgba(130,180,240,0.28);font-size:10px;line-height:15px;cursor:pointer;">Reset</button></span>
+            <strong id="time-val">Today</strong></span>
+          <input id="time-slider" type="range" min="-150" max="200" step="5" value="0" />
+        </label>
         <label>
           <span>Relief Scale <strong id="relief-val">1.0×</strong></span>
           <input id="relief-slider" type="range" min="0.5" max="2.4" step="0.1" value="1.0" />
@@ -484,6 +490,10 @@
         <label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-top:2px;">
           <input id="chk-tectonics" type="checkbox" style="width:auto;" />
           <span>Show Plate Boundaries (Rifts / Subduction)</span>
+        </label>
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-top:2px;" title="Red-orange cones are active, dark ones dormant. Synthesize a region that contains one to walk on it.">
+          <input id="chk-volcanoes" type="checkbox" checked style="width:auto;" />
+          <span>Show Volcanoes</span>
         </label>
         <label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-top:2px;">
           <input id="chk-poles" type="checkbox" checked style="width:auto;" />

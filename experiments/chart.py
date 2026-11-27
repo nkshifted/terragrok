@@ -114,6 +114,11 @@ def pack_climate(temp_c: np.ndarray, precip_mm: np.ndarray, t_season: np.ndarray
     )
 
 
+# Bump when Stage 1 picks different volcano sites: a chart only gets cones in new tiles if its
+# home tile was built from the same set (see viewer/src/tectonics.js pickVolcanoes)
+VOLCANO_VERSION = 2
+
+
 def chart_from_home_meta(meta: dict) -> dict:
     """Chart parameters for a synthesized home world. Raises if it has no planet origin."""
     po = meta.get("planetOrigin")
@@ -127,6 +132,11 @@ def chart_from_home_meta(meta: dict) -> dict:
         # Older home worlds did not record these; they were synthesized with the defaults
         "climateMode": po.get("climateMode") or "earth",
         "seaLevelBias": float(po.get("seaLevelBias") or 0.0),
+        # Geological time of the planet this chart was cut from (0 = the planet as first generated)
+        "geoTimeMyr": float(po.get("geoTimeMyr") or 0.0),
+        # Cones are built into the terrain only for charts whose home tile has them; adding
+        # them to the later tiles of an older chart would put a cliff where a cone meets its seam
+        "volcanoes": int(po.get("volcanoVersion") or 0) == VOLCANO_VERSION,
         "reliefScale": float(po.get("reliefScale") or 1.0),
         "homeLatDeg": float(po["latDeg"]),
         "homeLonDeg": float(po["lonDeg"]),
@@ -144,10 +154,8 @@ def run_stage1_patch(chart: dict, tiles: list[dict], timeout_s: float = 60.0) ->
     node = shutil.which("node")
     if not node:
         raise RuntimeError("node not found on PATH (start the server through `just`/mise so it is)")
-    req = {
-        k: chart[k]
-        for k in ("seed", "archetype", "climateMode", "seaLevelBias", "reliefScale", "homeLatDeg", "homeLonDeg", "spanDeg")
-    }
+    req = {k: chart[k] for k in ("seed", "archetype", "climateMode", "seaLevelBias", "reliefScale", "homeLatDeg", "homeLonDeg", "spanDeg")}
+    req["geoTimeMyr"] = chart.get("geoTimeMyr", 0.0)
     req["tiles"] = tiles
     proc = subprocess.run(
         [node, str(STAGE1_PATCH_SCRIPT)],

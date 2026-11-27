@@ -1,5 +1,15 @@
 import * as THREE from 'three';
 
+let blankRock = null;
+/** A 1×1 rock map of plain sediment, for worlds that have no rock raster. */
+export function blankRockTexture() {
+  if (!blankRock) {
+    blankRock = new THREE.DataTexture(new Uint8Array([0, 0, 0, 0]), 1, 1, THREE.RGBAFormat, THREE.UnsignedByteType);
+    blankRock.needsUpdate = true;
+  }
+  return blankRock;
+}
+
 /**
  * High-Detail Stylized-Realistic GLSL Terrain Shader:
  *   - Real heightmap ray-marched mountain self-shadowing across valleys (soft penumbra)
@@ -31,6 +41,10 @@ export function createTerrainMaterial(
       uHeightTex: { value: heightFloatTex },
       uClimate: { value: climateTex },
       uHasClimate: { value: hasClimate ? 1 : 0 },
+      // Bedrock weights (granite, volcanic, limestone, metamorphic) on the climate raster's
+      // grid; set by the caller when the world has a rock map
+      uRock: { value: blankRockTexture() },
+      uHasRock: { value: 0 },
       uTempRange: { value: new THREE.Vector2(tempRange[0], tempRange[1]) },
       uPrecipRange: { value: new THREE.Vector2(precipRange[0], precipRange[1]) },
       uWorldSpan: { value: worldSpan },
@@ -140,6 +154,8 @@ export function createTerrainMaterial(
       uniform sampler2D uHeightTex;
       uniform sampler2D uClimate;
       uniform int uHasClimate;
+      uniform sampler2D uRock;
+      uniform int uHasRock;
       uniform vec2 uTempRange;
       uniform vec2 uPrecipRange;
       uniform float uWorldSpan;
@@ -351,6 +367,28 @@ export function createTerrainMaterial(
           precipNorm = clamp(precipMm / 650.0, 0.0, 1.0);
         }
 
+        // Bedrock: how much of each rock type lies under this spot. The lookup is nudged by
+        // noise so the coarse map's boundaries come out ragged, and the weights are sharpened
+        // so a hillside reads as one rock, not a blend.
+        float wGranite = 0.0;
+        float wVolcanic = 0.0;
+        float wLime = 0.0;
+        float wMeta = 0.0;
+        float youngLava = 0.0;
+        if (uHasRock == 1) {
+          vec2 nudge = (vec2(fbm3(vWorldPos.xz * 0.011), fbm3(vWorldPos.zx * 0.011 + 31.7)) - 0.5) * (90.0 / uWorldSpan);
+          vec4 rk = texture2D(uRock, clamp(vUv + nudge, 0.0, 1.0));
+          // Cones are small and exact: read them without the nudge
+          youngLava = smoothstep(0.84, 0.98, texture2D(uRock, vUv).g);
+          wGranite = smoothstep(0.18, 0.5, rk.r);
+          wVolcanic = max(smoothstep(0.18, 0.5, rk.g), youngLava);
+          wLime = smoothstep(0.18, 0.5, rk.b);
+          wMeta = smoothstep(0.18, 0.5, rk.a);
+          float wSum = max(1.0, wGranite + wVolcanic + wLime + wMeta);
+          wGranite /= wSum; wVolcanic /= wSum; wLime /= wSum; wMeta /= wSum;
+        }
+        float wRock = wGranite + wVolcanic + wLime + wMeta;
+
         // Biome ground blend driven by temperature + precipitation + riparian wetness
         float effMoist = clamp(mix(moisture, precipNorm, uHasClimate == 1 ? 0.55 : 0.0) + riverWet * 0.45, 0.0, 1.0);
         vec3 warmGround = mix(aridSteppe, warmScrub, smoothstep(0.18, 0.48, effMoist));
@@ -389,6 +427,9 @@ export function createTerrainMaterial(
 
         // Beach transition (wet shore -> dry sand -> grass/desert/glacier)
         vec3 sandCol = mix(wetSand, drySand, smoothstep(0.3, 2.8, elev));
+        // Beaches are ground-up bedrock: black on volcanic coasts, near-white on limestone
+        sandCol = mix(sandCol, vec3(0.15, 0.14, 0.15), wVolcanic * 0.85);
+        sandCol = mix(sandCol, vec3(0.93, 0.90, 0.80), wLime * 0.6);
         sandCol = mix(sandCol, glacierIce * 0.95, glacierMask * 0.85);
         vec3 albedo = mix(seabed, sandCol, smoothstep(-5.0, 0.8, elev));
         albedo = mix(albedo, grassCol, smoothstep(2.0, 7.5, elev));
@@ -399,6 +440,35 @@ export function createTerrainMaterial(
         vec3 rockCol = mix(rockWarm, rockSlate, coldRockT);
         rockCol = mix(rockCol, redMesa, desertMask * 0.78);
         rockCol = mix(rockDark, rockCol * 1.16, strataBand);
+        if (wRock > 0.01) {
+          vec3 wp = vWorldPos;
+          // Stripes finer than a pixel shimmer into moiré from afar: fade each pattern to its
+          // average as its wavelength nears the size of a pixel on the ground
+          vec3 fw = fwidth(wp);
+          float pxSize = max(fw.x, max(fw.y, fw.z));
+          float fineFade = 1.0 - smoothstep(0.25, 1.1, pxSize * 2.0);
+          float bandFade = 1.0 - smoothstep(0.25, 1.1, pxSize * 1.2);
+          float speck = mix(0.5, vnoise(wp.xz * 2.3 + wp.y * 1.7), fineFade);
+          float joints = rockPattern(vec2(wp.x * 0.05 - wp.z * 0.03, wp.y * 0.05 + wp.z * 0.04));
+          // Granite: pale, speckled, broken by widely spaced joints into rounded blocks
+          vec3 granite = mix(vec3(0.40, 0.37, 0.36), vec3(0.74, 0.69, 0.65), joints * 0.7 + speck * 0.3);
+          granite = mix(granite, vec3(0.80, 0.66, 0.60), smoothstep(0.55, 0.9, midNoise) * 0.35);
+          // Basalt: near black, in vertical columns on cliffs and rubbly on gentle ground
+          float columns = 0.5 + 0.5 * fineFade * sin((wp.x * 0.83 + wp.z * 0.71) * 1.9 + fbm3(wp.xz * 0.05) * 5.0);
+          vec3 basalt = mix(vec3(0.09, 0.09, 0.10), vec3(0.25, 0.23, 0.22), mix(speck, columns, smoothstep(0.25, 0.5, baseSlope) * 0.75));
+          // A young cone is loose cinder: rust red where it oxidised, black ash elsewhere
+          vec3 cinder = mix(vec3(0.11, 0.10, 0.10), vec3(0.36, 0.18, 0.13), smoothstep(0.42, 0.78, fbm3(wp.xz * 0.02 + 11.0)));
+          basalt = mix(basalt, cinder * (0.8 + 0.4 * speck), youngLava);
+          // Limestone: cream to pale grey in thin, even, level beds, streaked dark by rain
+          float beds = 0.5 + 0.5 * bandFade * sin(wp.y * 1.15 + fbm3(wp.xz * 0.02) * 2.4);
+          float streaks = fbm3(vec2((wp.x + wp.z) * 0.4, wp.y * 0.05));
+          vec3 lime = mix(vec3(0.62, 0.61, 0.57), vec3(0.90, 0.87, 0.78), beds * 0.6 + 0.4) * mix(0.78, 1.0, streaks);
+          // Slate and schist: blue-grey sheets tilted steeply, with a faint sheen
+          float folia = 0.5 + 0.5 * bandFade * sin(dot(wp, vec3(0.55, 0.80, 0.35)) * 1.5 + fbm3(wp.xz * 0.03) * 3.0);
+          vec3 slate = mix(vec3(0.17, 0.20, 0.25), vec3(0.42, 0.47, 0.54), folia);
+          vec3 typed = (granite * wGranite + basalt * wVolcanic + lime * wLime + slate * wMeta) / wRock;
+          rockCol = mix(rockCol, typed, wRock);
+        }
         // Darken rock crevices using fine rock noise + cavity AO
         rockCol *= (0.72 + 0.42 * curvAO);
         // Steep slopes on polar ice sheets expose gleaming pale-blue glacier ice + dark nunatak rock
@@ -406,6 +476,12 @@ export function createTerrainMaterial(
         rockCol = mix(rockCol, glacialSlope, glacierMask * 0.82);
         // High-altitude rocky scree even on moderate slopes (suppressed on flat sandy deserts & glaciers)
         float screeMask = clamp(rockMask * (1.0 - desertMask * 0.45) + smoothstep(0.58, 0.82, hNorm) * 0.65 * (1.0 - desertMask * 0.6), 0.0, 1.0);
+        // Granite and limestone crop out through thin soil; a young cone is bare all over
+        screeMask = clamp(screeMask + (wGranite + wLime) * 0.22 * smoothstep(0.03, 0.14, baseSlope), 0.0, 1.0);
+        screeMask = max(screeMask, youngLava * smoothstep(1.0, 4.0, elev) * 0.94);
+        // Thin or absent plant cover lets the bedrock colour the ground itself
+        float bareGround = clamp(desertMask * 0.55 + (1.0 - smoothstep(0.15, 0.5, effMoist)) * 0.25, 0.0, 1.0) * wRock;
+        albedo = mix(albedo, mix(albedo, rockCol, 0.6), bareGround * smoothstep(2.0, 7.5, elev));
         albedo = mix(albedo, rockCol, screeMask);
 
         // Snow & Polar Ice accumulation (polar ice sheets reach sea level; temperate snow follows freezing isotherm)
@@ -462,7 +538,7 @@ export function createTerrainMaterial(
           vec3 V = normalize(cameraPosition - vWorldPos);
           vec3 H = normalize(sunDir + V);
           float specPow = mix(24.0, 64.0, wetSpec);
-          float specAmt = (wetSpec * 0.65 + snowMask * 0.22 + rockMask * 0.08);
+          float specAmt = (wetSpec * 0.65 + snowMask * 0.22 + rockMask * (0.08 + wMeta * 0.16));
           vec3 spec = sunColor * pow(max(dot(N, H), 0.0), specPow) * specAmt * directShadow;
 
           color = albedo * (ambient + direct) + spec;

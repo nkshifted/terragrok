@@ -16,6 +16,7 @@ WORLD_FILE_SUFFIXES = (
     ".height.f32",
     ".masks.u8",
     ".climate.u8",
+    ".rock.u8",
     ".rivers.json",
     ".lakes.json",
     ".ghost.height.f32",

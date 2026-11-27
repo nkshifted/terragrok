@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import {
   CUBE_FACES as TEC_FACES,
+  GEO_TIME_RANGE_MYR,
   generateTectonicPlanet,
   faceUVToUnitDir as tecFaceUVToUnitDir,
   unitDirToFaceUV as tecUnitDirToFaceUV,
@@ -65,6 +66,7 @@ scene.add(buildStarfield());
 let currentPlanet = null; // { meta, faces }
 let planetGroup = null;
 let poleGroup = null;
+let volcanoMarkers = null;
 let faceMeshes = [];
 let oceanMesh = null;
 let atmoMesh = null;
@@ -78,6 +80,7 @@ const urlParams = new URLSearchParams(window.location.search);
 const initialSeed = Number(urlParams.get('seed')) || 523;
 const initialArch = urlParams.get('archetype') || 'earth';
 const initialClimate = urlParams.get('climate') || 'earth';
+const initialGeoTime = Math.max(GEO_TIME_RANGE_MYR[0], Math.min(GEO_TIME_RANGE_MYR[1], Math.round(Number(urlParams.get('time')) || 0)));
 const genState = {
   seed: initialSeed, // Starts on a rich multi-continent Earth-like tectonic seed!
   planetNumber: 1,
@@ -86,6 +89,8 @@ const genState = {
     : 'earth',
   climateMode: ['earth', 'arid', 'frozen', 'lush'].includes(initialClimate) ? initialClimate : 'earth',
   seaLevelBias: 0.0,
+  // Geological time in million years; 0 is the planet as generated (see tectonics.js)
+  geoTimeMyr: initialGeoTime,
   reliefScale: 1.0,
   showTectonics: false,
   magNorth: new THREE.Vector3(0.16, 0.98, 0.12).normalize(),
@@ -535,6 +540,7 @@ function disposePlanet() {
   oceanMesh = null;
   atmoMesh = null;
   poleGroup = null;
+  volcanoMarkers = null;
 }
 
 function buildPlanetMesh() {
@@ -665,6 +671,10 @@ function buildPlanetMesh() {
 
   planetGroup.add(buildSphericalForest(R, maxElev));
 
+  volcanoMarkers = buildVolcanoMarkers(R);
+  volcanoMarkers.visible = document.getElementById('chk-volcanoes').checked;
+  planetGroup.add(volcanoMarkers);
+
   poleGroup = buildPoleMarkers(R);
   poleGroup.visible = document.getElementById('chk-poles').checked;
   planetGroup.add(poleGroup);
@@ -790,6 +800,8 @@ function syncSeedInputAndUrl() {
   } else {
     url.searchParams.delete('climate');
   }
+  if (genState.geoTimeMyr) url.searchParams.set('time', String(genState.geoTimeMyr));
+  else url.searchParams.delete('time');
   window.history.replaceState(null, '', `${url.pathname}?${url.searchParams.toString()}`);
 }
 
@@ -1227,6 +1239,8 @@ async function loadCachedRegionsForPlanet({ focusFreshId = null, freshData = nul
       if (!w || !w.planetOrigin || w.drillOrigin) return false;
       const o = w.planetOrigin;
       if (Number(o.seed) !== targetSeed) return false;
+      // A region belongs to the moment it was synthesized at
+      if (Number(o.geoTimeMyr || 0) !== genState.geoTimeMyr) return false;
       return o.archetype === genState.archetype || o.archetype === resolvedArch;
     });
   } catch {
@@ -1409,6 +1423,7 @@ function extractStage2PayloadAt(latDeg, lonDeg, spanDeg, opts = {}) {
     archetype: genState.archetype,
     climateMode: genState.climateMode,
     seaLevelBias: genState.seaLevelBias,
+    geoTimeMyr: genState.geoTimeMyr,
     reliefScale: genState.reliefScale,
     resolution,
     quality: opts.quality || document.getElementById('sel-stage2-quality')?.value || 'high',
@@ -1600,6 +1615,40 @@ function buildSphericalForest(R, maxElev) {
   return inst;
 }
 
+/**
+ * A cone on the globe for each of the planet's volcanoes, drawn taller than life so they can be
+ * found from orbit: red-orange if active, dark if dormant. The real ones are built into the
+ * terrain when a region is synthesized.
+ */
+function buildVolcanoMarkers(R) {
+  const list = currentPlanet.volcanoes || [];
+  const inst = new THREE.InstancedMesh(
+    new THREE.ConeGeometry(1, 1, 12).translate(0, 0.5, 0),
+    new THREE.MeshLambertMaterial({ color: '#ffffff' }),
+    Math.max(1, list.length)
+  );
+  const dummy = new THREE.Object3D();
+  const upY = new THREE.Vector3(0, 1, 0);
+  const dir = new THREE.Vector3();
+  const color = new THREE.Color();
+  const tall = { strato: 1.1, shield: 0.7, cinder: 1.3 };
+  list.forEach((v, i) => {
+    dir.set(v.dir[0], v.dir[1], v.dir[2]);
+    const ground = Math.max(0, sampleSphereSurface(dir).elev);
+    const radius = R * v.radius * (v.kind === 'cinder' ? 1.5 : v.kind === 'shield' ? 0.4 : 0.7);
+    dummy.position.copy(dir).multiplyScalar(R + ground - 2);
+    dummy.quaternion.setFromUnitVectors(upY, dir);
+    dummy.scale.set(radius, radius * tall[v.kind], radius);
+    dummy.updateMatrix();
+    inst.setMatrixAt(i, dummy.matrix);
+    inst.setColorAt(i, v.active ? color.setRGB(0.95, 0.33, 0.1) : color.setRGB(0.24, 0.2, 0.19));
+  });
+  inst.count = list.length;
+  inst.instanceMatrix.needsUpdate = true;
+  if (inst.instanceColor) inst.instanceColor.needsUpdate = true;
+  return inst;
+}
+
 function buildPoleMarkers(R) {
   const g = new THREE.Group();
   const magN = genState.magNorth.clone();
@@ -1735,7 +1784,10 @@ function setMode(mode) {
 }
 
 // ---------- True Live Spherical Plate-Tectonics Planet Generation ----------
-function generatePlanetFromState(customSeed = null) {
+// `keepView` leaves the camera where it is (scrubbing time); `preview` is the coarse planet shown
+// while the time slider is being dragged. Synthesis samples currentPlanet, so a preview must
+// always be followed by a full generation before anything else uses it.
+function generatePlanetFromState(customSeed = null, { keepView = false, preview = false } = {}) {
   if (customSeed !== null) genState.seed = customSeed;
   const loading = document.getElementById('loading');
   loading.style.display = '';
@@ -1746,45 +1798,88 @@ function generatePlanetFromState(customSeed = null) {
     seed: genState.seed,
     archetype: genState.archetype,
     climateMode: genState.climateMode,
-    faceSize: 128,
+    faceSize: preview ? 64 : 128,
     radius: 3000,
     seaLevelBias: genState.seaLevelBias,
+    geoTimeMyr: genState.geoTimeMyr,
     maxElev: 240,
   });
 
   genState.magNorth.set(...currentPlanet.meta.magNorth).normalize();
   buildPlanetMesh();
+  if (preview) {
+    // Keep the target square draped on the moving ground
+    rebuildTargetPatchOverlay();
+    loading.style.display = 'none';
+    return;
+  }
+  // The list of continents changes length, which would scroll the panel under the slider
+  const panel = keepView ? document.getElementById('time-slider')?.closest('#hud-left, .panel, aside') : null;
+  const panelScroll = panel ? panel.scrollTop : 0;
   refreshContinentButtons();
+  if (panel) panel.scrollTop = panelScroll;
 
   // Drop prior planet's cache list immediately so stale footprints / 75% snap can't fire mid-roll
   stage2.cachedRegions = [];
   const progWrap = document.getElementById('synth-progress-wrap');
   if (progWrap) progWrap.style.display = 'none';
   // Aim the orbit camera at the largest continent for drama — but do NOT pre-place the cyan Stage 2 square
-  if (currentPlanet.meta.landmasses.length > 0) {
+  if (!keepView && currentPlanet.meta.landmasses.length > 0) {
     const d = currentPlanet.meta.landmasses[0].dir;
     nav.orbitYaw = Math.atan2(d[0], d[2]);
     nav.orbitPitch = THREE.MathUtils.clamp(Math.asin(Math.max(-0.8, Math.min(0.8, d[1]))), -0.75, 0.75);
   }
-  clearStage2Target();
+  if (keepView && stage2.targetSet) {
+    // Same spot, different moment: keep the square, forget which stored region it matched
+    // (loadCachedRegionsForPlanet below re-matches it against this moment's regions)
+    stage2.activeCached = null;
+    stage2.justSynthesizedId = null;
+    stage2.justSynthesizedMeta = null;
+    rebuildTargetPatchOverlay();
+    rebuildCachedFootprintsOverlay();
+    updateStage2TargetInfo();
+    syncStage2ActionUI();
+  } else {
+    clearStage2Target();
+  }
 
   const m = currentPlanet.meta;
   document.getElementById('planet-subtitle').textContent =
-    `Planet #${genState.planetNumber} (seed ${m.seed}) · ${m.plateCount} plates · ` +
-    `${m.majorContinents} continents, ${m.islands} islands · ${m.landPct}% land (${m.genTimeMs} ms)`;
+    `Planet #${genState.planetNumber} (seed ${m.seed})${genState.geoTimeMyr ? ` · ${formatGeoTime(genState.geoTimeMyr)}` : ''} · ${m.plateCount} plates · ` +
+    `${m.majorContinents} continents, ${m.islands} islands · ${m.volcanoCount} volcanoes · ${m.landPct}% land (${m.genTimeMs} ms)`;
 
   syncSeedInputAndUrl();
   loadCachedRegionsForPlanet();
 
   loading.style.display = 'none';
 
-  if (nav.mode === 'surface') {
+  // Scrubbing time leaves a walker where they stand
+  if (nav.mode === 'surface' && !keepView) {
     landOnContinent(0);
   }
 }
 
+function formatGeoTime(myr) {
+  if (!myr) return 'Today';
+  return myr > 0 ? `+${myr} Myr` : `${-myr} Myr ago`;
+}
+
+function setGeoTime(myr, { preview = false } = {}) {
+  genState.geoTimeMyr = Math.max(GEO_TIME_RANGE_MYR[0], Math.min(GEO_TIME_RANGE_MYR[1], Math.round(Number(myr) || 0)));
+  const slider = document.getElementById('time-slider');
+  if (slider) slider.value = String(genState.geoTimeMyr);
+  document.getElementById('time-val').textContent = formatGeoTime(genState.geoTimeMyr);
+  generatePlanetFromState(genState.seed, { keepView: true, preview });
+}
+
 function generateNewPlanet(explicitSeed = null) {
   genState.planetNumber++;
+  // A new planet starts at its own "today"
+  genState.geoTimeMyr = 0;
+  const slider = document.getElementById('time-slider');
+  if (slider) slider.value = '0';
+  const timeVal = document.getElementById('time-val');
+  if (timeVal) timeVal.textContent = formatGeoTime(0);
   const nextSeed = explicitSeed !== null ? explicitSeed : Math.floor(1 + Math.random() * 99999);
   generatePlanetFromState(nextSeed);
 }
@@ -1839,6 +1934,18 @@ document.getElementById('sea-slider').addEventListener('input', (e) => {
   generatePlanetFromState(genState.seed);
 });
 
+{
+  const timeSlider = document.getElementById('time-slider');
+  timeSlider.min = String(GEO_TIME_RANGE_MYR[0]);
+  timeSlider.max = String(GEO_TIME_RANGE_MYR[1]);
+  timeSlider.value = String(genState.geoTimeMyr);
+  document.getElementById('time-val').textContent = formatGeoTime(genState.geoTimeMyr);
+  // Coarse planet while dragging, the real one on release
+  timeSlider.addEventListener('input', (e) => setGeoTime(e.target.value, { preview: true }));
+  timeSlider.addEventListener('change', (e) => setGeoTime(e.target.value));
+  document.getElementById('btn-time-today').addEventListener('click', () => setGeoTime(0));
+}
+
 document.getElementById('relief-slider').addEventListener('input', (e) => {
   genState.reliefScale = Number(e.target.value);
   document.getElementById('relief-val').textContent = `${genState.reliefScale.toFixed(1)}×`;
@@ -1864,6 +1971,9 @@ document.getElementById('chk-tectonics').addEventListener('change', (e) => {
   });
 });
 
+document.getElementById('chk-volcanoes').addEventListener('change', (e) => {
+  if (volcanoMarkers) volcanoMarkers.visible = e.target.checked;
+});
 document.getElementById('chk-poles').addEventListener('change', (e) => {
   if (poleGroup) poleGroup.visible = e.target.checked;
 });

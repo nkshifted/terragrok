@@ -57,6 +57,7 @@ from chart import (  # noqa: E402
     CLIMATE_PRECIP_RANGE,
     CLIMATE_TEMP_RANGE,
     CLIMATE_VERSION,
+    VOLCANO_VERSION,
     GHOST_SIZE,
     blend_climate,
     chart_from_home_meta,
@@ -74,6 +75,7 @@ from chart import (  # noqa: E402
 from tile_ghost import list_tiles_for_home, write_ghost_tile  # noqa: E402
 from tile_grid import chart_tile_id  # noqa: E402
 from tile_stream import TILE_STREAMS  # noqa: E402
+from volcano import ROCK_VERSION, decode_rock, pack_rock, stamp_volcanoes  # noqa: E402
 from world_cache import CATALOG_LOCK, load_synth_catalog, save_synth_catalog  # noqa: E402
 
 # Back-compat alias used throughout this module
@@ -367,6 +369,7 @@ class WarmStage2Engine:
         self._job_seq = itertools.count()
         # (home, qi, qj, tile id) whose climate raster predates CLIMATE_VERSION; worker thread only pops
         self._climate_jobs: collections.deque = collections.deque()
+        self._rock_jobs: collections.deque = collections.deque()
         self.status = {
             "busy": False,
             "phase": "initializing",
@@ -392,6 +395,9 @@ class WarmStage2Engine:
                     if self._climate_jobs:
                         # Quick (coarse model only), and the tiles are already on screen
                         self._refresh_tile_climate(*self._climate_jobs.popleft())
+                        continue
+                    if self._rock_jobs:
+                        self._add_tile_rock(*self._rock_jobs.popleft())
                         continue
                     job = TILE_STREAMS.next_synth_job()
                     if job:
@@ -424,6 +430,7 @@ class WarmStage2Engine:
                 "archetype": chart["archetype"],
                 "climateMode": chart["climateMode"],
                 "seaLevelBias": chart["seaLevelBias"],
+                "geoTimeMyr": chart.get("geoTimeMyr", 0.0),
                 "reliefScale": chart["reliefScale"],
                 "spanDeg": chart["spanDeg"],
                 "resolution": job["resolution"],
@@ -441,6 +448,8 @@ class WarmStage2Engine:
                     "vScale": chart["vScale"],
                 },
             }
+            if not chart.get("volcanoes"):
+                payload.pop("volcanoes", None)
             result = self._synthesize_on_worker(payload)
             TILE_STREAMS.mark_tile(home, qi, qj, result["worldId"], result["resolution"])
             print(f"[TileStream] {tile_id} ready ({result['resolution']}, {result['totalSec']}s)", flush=True)
@@ -448,6 +457,40 @@ class WarmStage2Engine:
             TILE_STREAMS.mark_failed(home, qi, qj)
             self.status.update({"busy": False, "phase": "idle", "message": f"Tile {qi},{qj} failed: {exc}"})
             print(f"[TileStream] {tile_id} FAILED: {exc}", flush=True)
+
+    def _add_tile_rock(self, home: str, qi: int, qj: int, tile_id: str) -> None:
+        """
+        Give a tile synthesized before rock types existed its bedrock raster. Only Stage 1 is
+        needed (no model), and no cones: an older chart has none in its terrain.
+        """
+        try:
+            chart = TILE_STREAMS.chart(home)
+            meta_path = VIEWER_WORLDS_DIR / f"{tile_id}.json"
+            if not chart or not meta_path.exists():
+                return
+            meta = json.loads(meta_path.read_text())
+            n = int(meta["size"])
+            cs = coarse_size_for(meta.get("resolution") or chart["tileResolution"])
+            p = run_stage1_patch(chart, [{"qi": qi, "qj": qj, "coarseSize": cs, "margin": True}])[0]
+            rs, rp = int(p["refSize"]), int(p.get("refPad", 0))
+            ref_rock = decode_rock(p["refRock"], rs + 2 * rp)[rp : rp + rs, rp : rp + rs]
+            rock_n = int(meta.get("climateSize") or min(n, 512))
+            tmp = VIEWER_WORLDS_DIR / f"{tile_id}.rock.u8.tmp"
+            pack_rock(ref_rock, None, rock_n).tofile(tmp)
+            update = {"hasRock": True, "rockVersion": ROCK_VERSION}
+            with CATALOG_LOCK:
+                os.replace(tmp, VIEWER_WORLDS_DIR / f"{tile_id}.rock.u8")
+                meta.update(update)
+                meta_path.write_text(json.dumps(meta, indent=2))
+                catalog = load_synth_catalog()
+                for e in catalog:
+                    if e.get("id") == tile_id:
+                        e.update(update)
+                save_synth_catalog(catalog)
+            TILE_STREAMS.bump_rev(home, qi, qj)
+            print(f"[TileStream] {tile_id}: rock map added", flush=True)
+        except Exception as exc:
+            print(f"[TileStream] {tile_id}: rock map FAILED: {exc}", flush=True)
 
     def _refresh_tile_climate(self, home: str, qi: int, qj: int, tile_id: str) -> None:
         """
@@ -564,6 +607,14 @@ class WarmStage2Engine:
                 stale.append((int(to["qi"]), int(to["qj"]), e["id"]))
         stale.sort(key=lambda t: max(abs(t[0]), abs(t[1])))
         self._climate_jobs.extend((home_world_id, qi, qj, tid) for qi, qj, tid in stale)
+        # Tiles written before rock types existed get a bedrock raster (Stage 1 only, quick)
+        bare = [(0, 0, home_world_id)] if int(meta.get("rockVersion") or 0) < ROCK_VERSION else []
+        for e in existing:
+            to = e.get("tileOrigin") or {}
+            if to.get("scheme") == "chart" and e.get("quality") != "ghost" and int(e.get("rockVersion") or 0) < ROCK_VERSION:
+                bare.append((int(to["qi"]), int(to["qj"]), e["id"]))
+        bare.sort(key=lambda t: max(abs(t[0]), abs(t[1])))
+        self._rock_jobs.extend((home_world_id, qi, qj, tid) for qi, qj, tid in bare)
         if stale:
             print(f"[TileStream] {home_world_id}: refreshing climate of {len(stale)} older tile(s)", flush=True)
         print(
@@ -832,6 +883,22 @@ class WarmStage2Engine:
                 iterations=repose_iters,
             )
 
+            # Volcanoes: the model cannot make them, so Stage 1's cones are built in here, before
+            # the surface detail and the rivers, which then run down their flanks. Pointwise, so a
+            # cone shared with a neighbouring tile is the same on both sides (see volcano.py).
+            volcanoes = payload.get("volcanoes") if isinstance(payload.get("volcanoes"), list) else None
+            lava = None
+            placed_volcanoes: list[dict] = []
+            if volcanoes:
+                elev_viewer, lava, placed_volcanoes = stamp_volcanoes(
+                    elev_viewer,
+                    volcanoes,
+                    tile_px=out_n,
+                    margin_px=margin,
+                    world_span_m=world_span_m,
+                    base_to_viewer=lambda dem: float(dem_to_viewer(np.float32([dem]), v_scale)[0]),
+                )
+
             # Stage 1's planetary climate with a share of TD30m's local detail, blended per pixel so
             # it is continuous across the tiles of a chart (see blend_climate)
             ref_temp_up = zoom(ref_temp, pad_n / ref_full, order=1).astype(np.float32)
@@ -853,6 +920,8 @@ class WarmStage2Engine:
                 temp_c = np.ascontiguousarray(temp_c[crop, crop])
                 precip_mm = np.ascontiguousarray(precip_mm[crop, crop])
                 t_season = np.ascontiguousarray(t_season[crop, crop])
+                if lava is not None:
+                    lava = np.ascontiguousarray(lava[crop, crop])
 
             res_scale = (out_n / 512.0) ** 2
             hydro_prof = _compute_biome_hydrology_profile(elev_refined, temp_c, precip_mm, res_scale)
@@ -891,7 +960,13 @@ class WarmStage2Engine:
             # Include resolution in world id so 1K/2K/4K of the same spot can coexist
             # Background tile stream may force a stable tile_* id (replaces ghost meta)
             force_id = payload.get("forceWorldId")
-            world_id = str(force_id) if force_id else f"planet_s{seed}_{safe_arch}_{coord_slug.lower()}_{res_tag.lower()}"
+            # ...and the geological time, so the same spot can be kept at several moments
+            geo_time = float(payload.get("geoTimeMyr") or 0.0)
+            time_tag = f"_t{'p' if geo_time > 0 else 'm'}{abs(round(geo_time))}" if round(geo_time) else ""
+            time_label = f" · {geo_time:+.0f} Myr" if round(geo_time) else ""
+            world_id = (
+                str(force_id) if force_id else f"planet_s{seed}_{safe_arch}{time_tag}_{coord_slug.lower()}_{res_tag.lower()}"
+            )
             is_chart_tile = bool(chart.get("homeWorldId"))
 
             VIEWER_WORLDS_DIR.mkdir(parents=True, exist_ok=True)
@@ -909,6 +984,15 @@ class WarmStage2Engine:
             precip_range = list(CLIMATE_PRECIP_RANGE)
             clim_rgba = pack_climate(temp_c, precip_mm, t_season, climate_n)
             clim_rgba.tofile(VIEWER_WORLDS_DIR / f"{world_id}.climate.u8")
+
+            # Bedrock: Stage 1's regional rock over the tile plus this tile's fresh lava, on the
+            # climate raster's grid so the viewer handles the two alike
+            ref_rock = None
+            if payload.get("refRock"):
+                ref_rock = decode_rock(payload["refRock"], ref_full)[ref_pad : ref_pad + ref_size, ref_pad : ref_pad + ref_size]
+            has_rock = ref_rock is not None or lava is not None
+            if has_rock:
+                pack_rock(ref_rock, lava, climate_n).tofile(VIEWER_WORLDS_DIR / f"{world_id}.rock.u8")
 
             # Absolute biome moisture + riparian wetness ONLY where real rivers/lakes exist!
             wet_seed = np.clip((riv_u8.astype(np.float32) + lak_u8.astype(np.float32)) / 255.0, 0.0, 1.0)
@@ -934,7 +1018,7 @@ class WarmStage2Engine:
             m_per_px = world_span_m / out_n
             world_meta = {
                 "id": world_id,
-                "title": f"Planet #{seed} · {coord_label} ({biome_label} · {res_tag})",
+                "title": f"Planet #{seed} · {coord_label}{time_label} ({biome_label} · {res_tag})",
                 "subtitle": f"{biome_label} ({hydro_prof['mean_t']:.0f}°C, {hydro_prof['mean_p']:.0f}mm) · {res_tag} ({m_per_px:.2f} m/px) · IoU {iou*100:.0f}%",
                 "size": out_n,
                 "climateSize": climate_n,
@@ -947,6 +1031,21 @@ class WarmStage2Engine:
                 "seaLevel": 0.0,
                 "hasClimate": True,
                 "climateVersion": CLIMATE_VERSION,
+                "hasRock": has_rock,
+                "rockVersion": ROCK_VERSION if has_rock else 0,
+                "volcanoes": [
+                    {
+                        "id": v["id"],
+                        "kind": v["kind"],
+                        "active": bool(v.get("active")),
+                        # Viewer world metres from the tile centre (x east, z south)
+                        "x": round(float(v["x"]) * world_span_m, 1),
+                        "z": round(float(v["z"]) * world_span_m, 1),
+                        "radiusM": round(float(v["radius"]) * world_span_m, 1),
+                        "summitM": v["summitM"],
+                    }
+                    for v in placed_volcanoes
+                ],
                 "tempRange": temp_range,
                 "precipRange": precip_range,
                 "riverCount": len(rivers_data),
@@ -962,6 +1061,8 @@ class WarmStage2Engine:
                     # Everything needed to regenerate Stage 1 and re-enter this chart later
                     "climateMode": str(payload.get("climateMode") or "earth"),
                     "seaLevelBias": float(payload.get("seaLevelBias") or 0.0),
+                    "geoTimeMyr": float(payload.get("geoTimeMyr") or 0.0),
+                    **({"volcanoVersion": VOLCANO_VERSION} if volcanoes is not None else {}),
                     "reliefScale": float(payload.get("reliefScale") or 1.0),
                     "quality": quality,
                     "fidelity": fidelity,

@@ -39,11 +39,35 @@ The viewer alone (`just viewer`) works without the server, on the five bundled d
 tectonics, climate and coarse hydrology directly on the sphere. It is pure JavaScript, so the
 same code runs in the globe page and, under node, on the server.
 
+The globe's **Geological Time** slider (-150 to +200 million years) moves every plate rigidly
+about its own pole, carrying its crust and its outline. Where two plates overlap they are
+colliding, and ranges grow with the depth of the overlap; where they leave a gap, new ocean
+floor opens. Any moment is computed directly, with no stepping. Plates never lock together or
+split, which is why the range is bounded. A synthesized region belongs to the moment it was
+made at.
+
+The same tectonic setting gives each place its **bedrock** and the planet its **volcanoes**.
+Rock is four blend weights (granite, volcanic, limestone, metamorphic; the rest is sandstone):
+metamorphic cores and limestone flanks along collisions, granite under coastal ranges and in
+old continental cores, basalt at rifts, hotspots and island arcs. A planet gets only its few
+most obvious volcanoes, well apart: stratovolcanoes on the strongest subduction arcs, shields
+on the largest hotspot islands, a cinder cone on the most active rift. They are shown on the
+globe as cones, red-orange when active.
+
 **Stage 2: a patch.** The globe page samples elevation and climate around the target and posts
 them to [`experiments/stage2_server.py`](experiments/stage2_server.py). The server conditions the
 diffusion model on that patch, locks coastlines to the planet, relaxes cliffs, adds biome detail
 and solves hydrology with Landlab's priority-flood router, so every river ends at the sea, a lake,
 a confluence or the tile edge. The result is written to `viewer/public/worlds/` (gitignored).
+
+**Volcanoes and rock in a patch.** The diffusion model knows neither. The server builds each
+cone into the synthesized terrain before surface detail and hydrology
+([`experiments/volcano.py`](experiments/volcano.py)), and writes a `.rock.u8` raster beside the
+climate one. The explorer's terrain shader gives each rock its own colour and structure: pale
+jointed granite, black columnar basalt with rust-red cinder on young cones, cream thin-bedded
+limestone, blue-grey tilted slate. Active volcanoes get a lava pool in the crater, a glow that
+strengthens as the sun drops, and a smoke column ([`viewer/src/volcanoFx.js`](viewer/src/volcanoFx.js)). Worlds made before this get a rock map on first use, but
+no cones.
 
 **Streaming: the patch grows.** The home patch defines a *chart*: a flat projection of the planet
 centred on it. Each further tile is the same chart shifted by whole tiles, synthesized as a

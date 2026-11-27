@@ -59,7 +59,8 @@ function sampleNode(src, size, u, v) {
  * Resample a tile's native rasters onto its cell-registered atlas slot. Done once per tile
  * (cache the result) so re-stitching after a neighbour lands does not touch unchanged tiles.
  *
- * @param {{heights: Float32Array, size: number, masks?: Uint8Array, climate?: Uint8Array, climateSize?: number}} tile
+ * @param {{heights: Float32Array, size: number, masks?: Uint8Array, climate?: Uint8Array, climateSize?: number, rock?: Uint8Array}} tile
+ *        `rock` (bedrock weights, see experiments/volcano.py) is on the climate raster's grid.
  */
 export function prepareTileSlot(tile, tileN = 1024, climN = 512) {
   const { heights, size } = tile;
@@ -106,6 +107,20 @@ export function prepareTileSlot(tile, tileN = 1024, climN = 512) {
     }
   }
 
+  let rock = null;
+  if (tile.rock) {
+    const cs = tile.climateSize || size;
+    rock = new Uint8Array(climN * climN * 4);
+    for (let r = 0; r < climN; r++) {
+      const sr = Math.min(cs - 1, Math.round(((r + 0.5) / climN) * (cs - 1)));
+      for (let c = 0; c < climN; c++) {
+        const sc = Math.min(cs - 1, Math.round(((c + 0.5) / climN) * (cs - 1)));
+        const si = (sr * cs + sc) * 4;
+        rock.set(tile.rock.subarray(si, si + 4), (r * climN + c) * 4);
+      }
+    }
+  }
+
   // Exact edge profiles from the native raster, sampled at the slot's texel centres
   const edges = { W: new Float32Array(tileN), E: new Float32Array(tileN), N: new Float32Array(tileN), S: new Float32Array(tileN) };
   for (let k = 0; k < tileN; k++) {
@@ -122,7 +137,7 @@ export function prepareTileSlot(tile, tileN = 1024, climN = 512) {
     SW: heights[last * size],
     SE: heights[last * size + last],
   };
-  return { grid, masks, climate, edges, corners, tileN, climN };
+  return { grid, masks, climate, rock, edges, corners, tileN, climN };
 }
 
 /** Box-blur `src` (edge-clamped) with the given radius, in two passes (≈ triangle filter). */
@@ -201,6 +216,9 @@ export function buildSeamAtlas({
   const heights = new Float32Array(W * W);
   const masks = new Uint8Array(W * W * 4);
   const climate = new Uint8Array(CW * CW * 4);
+  // Bedrock weights; all zero (plain sediment) where a tile has no rock raster
+  const rock = new Uint8Array(CW * CW * 4);
+  let hasRock = false;
 
   const pxPerM = tileN / worldSpan;
   const bandPx = Math.min(tileN * 0.5, Math.max(2, bandM * pxPerM));
@@ -326,6 +344,12 @@ export function buildSeamAtlas({
       }
       fillMasks(masks, W, c0, r0, tileN, own.masks);
       fillClimate(climate, CW, si * climN, sj * climN, climN, own.climate, fallbackClimate, t.ghost ? 0 : 255);
+      if (own.rock) {
+        hasRock = true;
+        for (let r = 0; r < climN; r++) {
+          rock.set(own.rock.subarray(r * climN * 4, (r + 1) * climN * 4), ((sj * climN + r) * CW + si * climN) * 4);
+        }
+      }
     }
   }
 
@@ -344,7 +368,7 @@ export function buildSeamAtlas({
     bandPx,
     detailPx,
   };
-  return { heights, masks, climate, meta, slots };
+  return { heights, masks, climate, rock, hasRock, meta, slots };
 }
 
 function fillMasks(masks, W, c0, r0, tileN, src) {

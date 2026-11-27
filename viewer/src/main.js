@@ -4,6 +4,7 @@ import { createSkyDome, createTerrainMaterial, createWaterMaterial } from './ter
 import { buildLakeSystem, buildRiverSystem } from './rivers.js';
 import { createGrassField } from './grass.js';
 import { buildWorldProps, updatePropsTransform } from './props.js';
+import { createVolcanoFx } from './volcanoFx.js';
 import { buildTerrainClipmapGeometry } from './clipmap.js';
 import { createTileStreamController } from './tileStream.js';
 import { CHARACTER_PRESETS, createCharacter } from './character.js';
@@ -30,6 +31,8 @@ renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 
 const scene = new THREE.Scene();
+// Smoke, glow and lava for the active volcanoes in view (see refreshVolcanoFx)
+const volcanoFx = createVolcanoFx(scene);
 const camera = new THREE.PerspectiveCamera(56, window.innerWidth / window.innerHeight, 0.4, 20000);
 
 // ---------- Streamed chart tiles ----------
@@ -86,6 +89,8 @@ let propsGroup = null;
 let heightFloatTex = null;
 let maskTex = null;
 let climateTex = null;
+// Bedrock weights for the terrain shader; null when the world has no rock map
+let rockTex = null;
 
 // ---------- Settings ----------
 const state = {
@@ -867,12 +872,15 @@ function rebuildChart() {
     heightFloatTex = makeAtlasTexture(atlas.heights, W, THREE.RedFormat, THREE.FloatType, hasFloatLinear);
     maskTex = makeAtlasTexture(atlas.masks, W, THREE.RGBAFormat, THREE.UnsignedByteType, true);
     climateTex = makeAtlasTexture(atlas.climate, CW, THREE.RGBAFormat, THREE.UnsignedByteType, true);
+    if (rockTex) rockTex.dispose();
+    rockTex = makeAtlasTexture(atlas.rock, CW, THREE.RGBAFormat, THREE.UnsignedByteType, true);
     terrainMesh.geometry.dispose();
     terrainMesh.geometry = buildTerrainClipmapGeometry(atlasSpan, W, 128);
   } else {
     replaceTextureData(heightFloatTex, atlas.heights);
     replaceTextureData(maskTex, atlas.masks);
     replaceTextureData(climateTex, atlas.climate);
+    replaceTextureData(rockTex, atlas.rock);
   }
 
   const tu = terrainMat.uniforms;
@@ -880,6 +888,8 @@ function rebuildChart() {
   tu.uMasks.value = maskTex;
   tu.uClimate.value = climateTex;
   tu.uHasClimate.value = 1;
+  tu.uRock.value = rockTex;
+  tu.uHasRock.value = atlas.hasRock ? 1 : 0;
   tu.uWorldSpan.value = atlasSpan;
   tu.uGridSize.value = W;
   tu.uCellReg.value = 1;
@@ -920,10 +930,34 @@ function rebuildChart() {
   syncFogDensity();
   updatePropsTransformAll();
   if (player.grounded) player.pos.y = Math.max(sampleHeight(player.pos.x, player.pos.z), 0.2);
+  refreshVolcanoFx();
   console.info(
     `[seam-atlas] centre ${win.centerQi},${win.centerQj} · ${win.tiles.size} tiles · ` +
       `${built} decor rebuilt · ${farDecor.size} far tiles (${farBuilt} new) · ${(performance.now() - t0).toFixed(0)} ms`
   );
+}
+
+/** Point the volcano effects at every active volcano on the tiles now loaded. */
+function refreshVolcanoFx() {
+  const list = [];
+  const add = (meta, ox, oz) => {
+    for (const v of meta?.volcanoes || []) {
+      if (!v.active) continue;
+      const x = v.x + ox;
+      const z = v.z + oz;
+      // The crater floor: the ground at the cone's centre (heights are stored unscaled)
+      const ground = sampleHeight(x, z) / state.vScale;
+      list.push({ id: v.id, kind: v.kind, x, z, y: ground > 0.5 ? ground : v.summitM - 6, radiusM: v.radiusM });
+    }
+  };
+  if (atlas) {
+    const span = atlas.meta.worldSpan;
+    for (const e of tileStream.getWindow().tiles.values()) if (!e.ghost) add(e.meta, e.qi * span, e.qj * span);
+    for (const e of tileStream.getFarTiles()) if (!e.ghost) add(e.meta, e.qi * span, e.qj * span);
+  } else if (world) {
+    add(world.meta, 0, 0);
+  }
+  volcanoFx.set(list);
 }
 
 function disposeDecor(d) {
@@ -1026,6 +1060,11 @@ function rebuildFarTiles() {
       world.meta.tempRange || [-16.0, 32.0],
       world.meta.precipRange || [0.0, 1800.0]
     );
+    const rTex = e.rock ? makeAtlasTexture(e.rock, cn, THREE.RGBAFormat, THREE.UnsignedByteType, true) : null;
+    if (rTex) {
+      mat.uniforms.uRock.value = rTex;
+      mat.uniforms.uHasRock.value = 1;
+    }
     mat.uniforms.uCellReg.value = 1;
     mat.uniforms.uTileOrigin.value.set(ox, oz);
     // Until the first frame sets the focus (see the render loop): centred on its own tile
@@ -1035,7 +1074,7 @@ function rebuildFarTiles() {
     mesh.frustumCulled = false;
     scene.add(mesh);
 
-    const d = { sig: e.version, mesh, mat, textures: [hTex, mTex, cTex], lake: null, props: null };
+    const d = { sig: e.version, mesh, mat, textures: rTex ? [hTex, mTex, cTex, rTex] : [hTex, mTex, cTex], lake: null, props: null };
     if (!e.ghost) {
       if (e.lakes?.length) {
         d.lake = buildLakeSystem(e.lakes, e.meta.lakeGridSize || e.meta.size, span, hTex, mTex);
@@ -1279,6 +1318,7 @@ function sampleClimate(x, z) {
 
 // ---------- Dispose Helper ----------
 function disposeWorldScene() {
+  volcanoFx.dispose();
   if (tileStream) tileStream.stop();
   atlas = null;
   atlasDirty = false;
@@ -1333,6 +1373,10 @@ function disposeWorldScene() {
     climateTex.dispose();
     climateTex = null;
   }
+  if (rockTex) {
+    rockTex.dispose();
+    rockTex = null;
+  }
 }
 
 // ---------- Load World ----------
@@ -1350,15 +1394,22 @@ async function loadWorld(worldId) {
   ];
   if (meta.hasClimate) {
     fetches.push(fetch(`/worlds/${worldId}.climate.u8`).then((r) => r.arrayBuffer()));
+  } else {
+    fetches.push(null);
   }
-  const [heightBuf, maskBuf, splines, lakes, climateBuf] = await Promise.all(fetches);
+  if (meta.hasRock) {
+    fetches.push(fetch(`/worlds/${worldId}.rock.u8`).then((r) => (r.ok ? r.arrayBuffer() : null)));
+  }
+  const [heightBuf, maskBuf, splines, lakes, climateBuf, rockBuf] = await Promise.all(fetches);
 
   disposeWorldScene();
 
   const heights = new Float32Array(heightBuf);
   const masks = new Uint8Array(maskBuf);
   const climate = climateBuf ? new Uint8Array(climateBuf) : null;
-  world = { meta, heights, masks, climate, splines, lakes };
+  const rockN = meta.climateSize || meta.size;
+  const rock = rockBuf && rockBuf.byteLength === rockN * rockN * 4 ? new Uint8Array(rockBuf) : null;
+  world = { meta, heights, masks, climate, rock, splines, lakes };
 
   subtitleBase = `${meta.subtitle} · ${lakes.length} lakes, ${splines.length} rivers`;
   document.getElementById('world-subtitle').textContent = subtitleBase;
@@ -1409,6 +1460,11 @@ async function loadWorld(worldId) {
     meta.tempRange || [-12.0, 28.0],
     meta.precipRange || [0.0, 1200.0]
   );
+  if (rock) {
+    rockTex = makeAtlasTexture(rock, rockN, THREE.RGBAFormat, THREE.UnsignedByteType, true);
+    terrainMat.uniforms.uRock.value = rockTex;
+    terrainMat.uniforms.uHasRock.value = 1;
+  }
   terrainMat.uniforms.uVScale.value = state.vScale;
   terrainMat.uniforms.uFocusPos.value.set(0, 0, 0);
   terrainMesh = new THREE.Mesh(geo, terrainMat);
@@ -1450,6 +1506,7 @@ async function loadWorld(worldId) {
   // 5. Multi-Tier Conifers, Broadleaf Valley Trees & Craggy Cliff/River Boulders
   propsGroup = buildWorldProps(world, state.vScale);
   scene.add(propsGroup);
+  refreshVolcanoFx();
 
   updateSun();
   setStyleMode(state.styleMode);
@@ -1476,8 +1533,10 @@ async function loadWorld(worldId) {
   const planetLink = document.getElementById('link-planet');
   if (planetLink) {
     if (meta.planetOrigin) {
-      const { seed, archetype } = meta.planetOrigin;
-      planetLink.href = `/planet.html?seed=${encodeURIComponent(seed)}&archetype=${encodeURIComponent(archetype || 'earth')}`;
+      const { seed, archetype, geoTimeMyr } = meta.planetOrigin;
+      // Back to the same moment of the planet's history this world was cut from
+      const time = Number(geoTimeMyr) ? `&time=${encodeURIComponent(Math.round(geoTimeMyr))}` : '';
+      planetLink.href = `/planet.html?seed=${encodeURIComponent(seed)}&archetype=${encodeURIComponent(archetype || 'earth')}${time}`;
       planetLink.textContent = `← Planet #${seed}`;
     } else {
       planetLink.href = '/planet.html';
@@ -1521,7 +1580,7 @@ async function loadWorld(worldId) {
   } else {
     homeMeanClimate = [128, 128, 128];
   }
-  tileStream.start(meta, { heights, masks, climate, rivers: splines, lakes });
+  tileStream.start(meta, { heights, masks, climate, rock, rivers: splines, lakes });
 
   loader.classList.add('hidden');
 }
@@ -2171,6 +2230,7 @@ function animate() {
     terrainMat.uniforms.uTime.value = t;
     terrainMat.uniforms.uFocusPos.value.copy(focus);
   }
+  if (sunLight.userData.dir) volcanoFx.update(t, camera, renderer.domElement.height, sunLight.userData.dir, state.vScale);
   for (const m of farMats()) {
     m.uniforms.uTime.value = t;
     // A far tile's finest rings follow the player too, so what is drawn next to (or briefly

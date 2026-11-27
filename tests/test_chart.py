@@ -69,6 +69,15 @@ def test_chart_from_home_meta_defaults_and_rejections():
     assert chart["tileResolution"] == "2k"
     assert (chart["climateMode"], chart["seaLevelBias"], chart["reliefScale"]) == ("earth", 0.0, 1.0)
     assert (chart["quality"], chart["fidelity"]) == ("high", "exact")
+    # Worlds made before the time slider are the planet's "today"; later ones keep their moment
+    assert chart["geoTimeMyr"] == 0.0
+    # Cones only for charts whose home tile was built from the current set of volcano sites
+    assert chart["volcanoes"] is False
+    for version, expect in ((1, False), (2, True)):
+        po = {**meta["planetOrigin"], "volcanoVersion": version}
+        assert chart_from_home_meta({**meta, "planetOrigin": po})["volcanoes"] is expect
+    aged = {**meta, "planetOrigin": {**meta["planetOrigin"], "geoTimeMyr": 60.0}}
+    assert chart_from_home_meta(aged)["geoTimeMyr"] == 60.0
     assert chart["vScale"] is None
     assert chart_from_home_meta({**meta, "resolution": "1K", "vScale": 0.25})["tileResolution"] == "1k"
     with pytest.raises(ValueError):

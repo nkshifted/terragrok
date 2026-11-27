@@ -483,11 +483,13 @@ export function createTectonicModel({
       // Older islands were carried forward by the plate's Euler rotation!
       const rotK = makeRotationMatrix(pl.axis, pl.omega * k * spacingAngle * 0.9);
       const ip = applyMat3(rotK, pos[0], pos[1], pos[2], [0, 0, 0]);
-      const radius = randRange(rnd, 0.015, 0.027) * Math.pow(0.84, k);
-      const height = randRange(rnd, 0.50, 0.88) * Math.pow(0.85, k);
-      chain.push({ p: normalize3(ip), r: radius, h: height });
+      const rBase = randRange(rnd, 0.015, 0.027);
+      const radius = rBase * Math.pow(0.84, k);
+      const hBase = randRange(rnd, 0.50, 0.88);
+      const height = hBase * Math.pow(0.85, k);
+      chain.push({ p: normalize3(ip), r: radius, h: height, rBase, hBase });
     }
-    hotspots.push({ origin: pos, chain });
+    hotspots.push({ origin: pos, chain, axis: pl.axis, omega: pl.omega, spacingAngle });
   }
 
   // Tilted Magnetic Pole (7° to 21° from geographic north)
@@ -845,24 +847,103 @@ function analyzeContinents(N, heights) {
  *  - meta: radius, seed, archetype, continent stats, magNorth, plates, etc.
  *  - faces: array of 6 { heights: Float32Array, masks: Uint8Array, climate: Uint8Array, plateIds: Uint8Array }
  */
-export function generateTectonicPlanet({
-  seed = 42,
-  archetype = 'auto',
-  climateMode = 'earth',
-  faceSize = 128,
-  radius = 3000,
-  plateCount = null,
-  driftScale = 1.0,
-  seaLevelBias = 0.0,
-  maxElev = 680,
-} = {}) {
-  const t0 = typeof performance !== 'undefined' ? performance.now() : Date.now();
-  const model = createTectonicModel({ seed, archetype, plateCount, driftScale, seaLevelBias });
-  const { plates, lobes, hotspots, nWarp, nCrust, nMountain, nDetail } = model;
+// ---------- Geological time ----------
+/**
+ * The generated planet is "today": `GEO_HISTORY_MYR` after its continents started to drift.
+ * Other moments are reached by moving every plate rigidly about its own pole, carrying both its
+ * crust and its outline. `tau` is time in units of that history: 0 is today, -1 the start.
+ */
+export const GEO_HISTORY_MYR = 150;
+export const GEO_TIME_RANGE_MYR = [-150, 200];
 
-  const N = faceSize;
+export function geoTimeToTau(geoTimeMyr) {
+  const t = Number(geoTimeMyr) || 0;
+  return Math.max(GEO_TIME_RANGE_MYR[0], Math.min(GEO_TIME_RANGE_MYR[1], t)) / GEO_HISTORY_MYR;
+}
+
+/**
+ * How far inside plate `i`'s outline the point q (given in today's frame) lies; negative outside.
+ * `marginRival` is left holding the plate that bounds it there.
+ */
+let marginRival = 0;
+function plateMarginAt(i, x, y, z, plates, nWarp) {
+  // Same warp as findPlate
+  const w1 = 0.24;
+  const wx = x + w1 * nWarp.fbm(x * 2.1 + 3.1, y * 2.1 - 1.7, z * 2.1 + 4.3, 3);
+  const wy = y + w1 * nWarp.fbm(x * 2.1 - 5.2, y * 2.1 + 2.9, z * 2.1 - 1.1, 3);
+  const wz = z + w1 * nWarp.fbm(x * 2.1 + 1.4, y * 2.1 + 6.3, z * 2.1 - 3.8, 3);
+  const inv = 1 / (Math.hypot(wx, wy, wz) || 1);
+  const px = wx * inv;
+  const py = wy * inv;
+  const pz = wz * inv;
+  let own = 0;
+  let other = -1e9;
+  for (let j = 0; j < plates.length; j++) {
+    const c = plates[j].center;
+    const score = px * c[0] + py * c[1] + pz * c[2] + plates[j].sizeBias;
+    if (j === i) own = score;
+    else if (score > other) {
+      other = score;
+      marginRival = j;
+    }
+  }
+  return own - other;
+}
+
+/** Speed of a plate (velocity v at point p) outward through its own edge, whose rival today was `rival`. */
+function edgeSpeed(centerNow, fromToday, rival, x, y, z, vx, vy, vz, tmp) {
+  applyMat3(fromToday, rival[0], rival[1], rival[2], tmp);
+  let nx = tmp[0] - centerNow[0];
+  let ny = tmp[1] - centerNow[1];
+  let nz = tmp[2] - centerNow[2];
+  const ndp = nx * x + ny * y + nz * z;
+  nx -= ndp * x; ny -= ndp * y; nz -= ndp * z;
+  const nLen = Math.hypot(nx, ny, nz) || 1;
+  return (vx * nx + vy * ny + vz * nz) / nLen;
+}
+
+/** Hotspot islands at time tau: the plume stays put, the plate carries older islands away. */
+function hotspotIslandsAt(model, tau) {
+  const out = [];
+  for (const hs of model.hotspots) {
+    if (tau === 0) {
+      for (const isl of hs.chain) out.push(isl);
+      continue;
+    }
+    const n = hs.chain.length;
+    const step = hs.spacingAngle * 0.9;
+    // Islands born per unit of tau, so that a full history carries one the plate's whole drift
+    const shift = (tau * model.driftAngleBase) / step;
+    for (let j = Math.ceil(-shift - 1); j + shift < n; j++) {
+      const age = j + shift;
+      if (age <= -1) continue;
+      const base = hs.chain[((j % n) + n) % n];
+      const grown = Math.max(0, age);
+      const life = Math.min(1, age + 1) * Math.min(1, n - age);
+      if (life <= 0.02) continue;
+      const rot = makeRotationMatrix(hs.axis, hs.omega * grown * step);
+      const ip = applyMat3(rot, hs.origin[0], hs.origin[1], hs.origin[2], [0, 0, 0]);
+      out.push({
+        p: normalize3(ip),
+        r: base.rBase * Math.pow(0.84, grown),
+        h: base.hBase * Math.pow(0.85, grown) * life,
+      });
+    }
+  }
+  return out;
+}
+
+/**
+ * Pass 1: raw tectonic height at every (face, row, col) of the cube-sphere at time `tau`.
+ * With tau = 0 this is exactly the original fixed-outline evaluation (worlds synthesized from a
+ * planet regenerate it from the seed, so "today" must never change).
+ */
+function evalTectonicField(model, N, tau) {
+  const { plates, lobes, nWarp, nCrust, nMountain, nDetail } = model;
+  const nP = plates.length;
   const N2 = N * N;
   const total = 6 * N2;
+  const moving = tau !== 0;
 
   const rawHeight = new Float32Array(total);
   const plateIds = new Uint8Array(total);
@@ -871,12 +952,37 @@ export function generateTectonicPlanet({
   const unitX = new Float32Array(total);
   const unitY = new Float32Array(total);
   const unitZ = new Float32Array(total);
+  // Bedrock as four blend weights (granite, volcanic, limestone, metamorphic); what is left
+  // over is sandstone and other sediment. Derived from the same tectonic setting as the
+  // heights, never fed back into them.
+  const rock = new Uint8Array(total * 4);
+  // Where a volcano could stand, and of which kind (see VOLCANO_KINDS)
+  const volcPot = new Float32Array(total);
+  const volcKind = new Uint8Array(total);
+
+  // Per-plate rotations for this moment: here -> today's outline, here -> pre-drift crust
+  const toToday = [];
+  const fromToday = [];
+  const toProto = [];
+  const centerNow = [];
+  for (let i = 0; i < nP; i++) {
+    const pl = plates[i];
+    toToday.push(makeRotationMatrix(pl.axis, -tau * pl.totalAngle));
+    toProto.push(makeRotationMatrix(pl.axis, -(1 + tau) * pl.totalAngle));
+    fromToday.push(makeRotationMatrix(pl.axis, tau * pl.totalAngle));
+    centerNow.push(moving ? applyMat3(fromToday[i], pl.center[0], pl.center[1], pl.center[2], [0, 0, 0]) : pl.center);
+  }
+  const islands = hotspotIslandsAt(model, tau);
+  // Nothing has had time to build right after the continents start to move
+  const young = tau < 0 ? Math.min(1, (1 + tau) * 4) : 1;
 
   const dir = [0, 0, 0];
   const p0A = [0, 0, 0];
   const p0B = [0, 0, 0];
+  const q = [0, 0, 0];
+  const qA = [0, 0, 0];
+  const qB = [0, 0, 0];
 
-  // Pass 1: Evaluate true seamless spherical tectonics at every (f, r, c) -> unit vector on S^2
   for (let f = 0; f < 6; f++) {
     const faceBase = f * N2;
     for (let r = 0; r < N; r++) {
@@ -892,18 +998,66 @@ export function generateTectonicPlanet({
         unitY[idx] = y;
         unitZ[idx] = z;
 
-        // 1. Plate lookup (3D warped weighted Voronoi on S^2)
-        const plInfo = findPlate(x, y, z, plates, nWarp);
-        const pl1 = plates[plInfo.p1];
-        const pl2 = plates[plInfo.p2];
+        // 1. The two plates that matter here, and how far inside each one's outline we are.
+        //    mA >= mB. Both positive: the plates overlap (collision). mA negative: a gap that
+        //    neither covers (new or since-swallowed ocean floor).
+        let iA = 0;
+        let iB = 1;
+        let mA = 0;
+        let mB = 0;
+        let rivalA = 0; // the plate that bounds A's outline here, and likewise B's
+        let rivalB = 0;
+        if (!moving) {
+          const plInfo = findPlate(x, y, z, plates, nWarp);
+          iA = plInfo.p1;
+          iB = plInfo.p2;
+          mA = plInfo.margin;
+          mB = -plInfo.margin;
+        } else {
+          for (let pass = 0; pass < 2; pass++) {
+            iA = -1;
+            iB = -1;
+            mA = -1e9;
+            mB = -1e9;
+            for (let i = 0; i < nP; i++) {
+              applyMat3(toToday[i], x, y, z, q);
+              if (pass === 0) {
+                // Cheap unwarped test first: the warp cannot pull a plate in from this far out
+                let own = 0;
+                let other = -1e9;
+                for (let j = 0; j < nP; j++) {
+                  const cj = plates[j].center;
+                  const sc = q[0] * cj[0] + q[1] * cj[1] + q[2] * cj[2] + plates[j].sizeBias;
+                  if (j === i) own = sc;
+                  else if (sc > other) other = sc;
+                }
+                if (own - other < -0.4) continue;
+              }
+              const m = plateMarginAt(i, q[0], q[1], q[2], plates, nWarp);
+              if (m > mA) {
+                mB = mA; iB = iA; rivalB = rivalA; qB[0] = qA[0]; qB[1] = qA[1]; qB[2] = qA[2];
+                mA = m; iA = i; rivalA = marginRival; qA[0] = q[0]; qA[1] = q[1]; qA[2] = q[2];
+              } else if (m > mB) {
+                mB = m; iB = i; rivalB = marginRival; qB[0] = q[0]; qB[1] = q[1]; qB[2] = q[2];
+              }
+            }
+            if (iB >= 0) break; // otherwise retry without the cheap test
+          }
+        }
+        const pl1 = plates[iA];
+        const pl2 = plates[iB];
         plateIds[idx] = pl1.id;
+        // Distance from the line midway between the two outlines, and how much they have
+        // closed on each other since today (positive: overlap, negative: gap)
+        const bDist = moving ? (mA - mB) * 0.5 : mA;
+        const closed = moving ? mA + mB : 0;
 
         // 2. Inverse Euler rotation to reconstruct pre-drift crust (gives real rifting & matching coasts!)
-        applyMat3(pl1.invRot, x, y, z, p0A);
+        applyMat3(toProto[iA], x, y, z, p0A);
         let crust1 = evalProtoCrust(p0A[0], p0A[1], p0A[2], lobes, nCrust);
         if (pl1.isOceanicPlate) crust1 -= 0.42;
 
-        applyMat3(pl2.invRot, x, y, z, p0B);
+        applyMat3(toProto[iB], x, y, z, p0B);
         let crust2 = evalProtoCrust(p0B[0], p0B[1], p0B[2], lobes, nCrust);
         if (pl2.isOceanicPlate) crust2 -= 0.42;
 
@@ -917,24 +1071,29 @@ export function generateTectonicPlanet({
         const v2y = pl2.omega * (pl2.axis[2] * x - pl2.axis[0] * z);
         const v2z = pl2.omega * (pl2.axis[0] * y - pl2.axis[1] * x);
 
-        // Approximate boundary normal pointing from plate 1 toward plate 2
-        let nx = pl2.center[0] - pl1.center[0];
-        let ny = pl2.center[1] - pl1.center[1];
-        let nz = pl2.center[2] - pl1.center[2];
-        // Make tangent to sphere at p
-        const ndp = nx * x + ny * y + nz * z;
-        nx -= ndp * x; ny -= ndp * y; nz -= ndp * z;
-        const nLen = Math.hypot(nx, ny, nz) || 1;
-        nx /= nLen; ny /= nLen; nz /= nLen;
-
         // Convergence > 0 means plates collide; < 0 means plates diverge (rift!)
-        const vRelX = v1x - v2x;
-        const vRelY = v1y - v2y;
-        const vRelZ = v1z - v2z;
-        const vConv = vRelX * nx + vRelY * ny + vRelZ * nz;
-
-        // Boundary distance proxy in radians (~margin / 1.2)
-        const bDist = plInfo.margin;
+        let vConv;
+        if (!moving) {
+          // Approximate boundary normal pointing from plate 1 toward plate 2
+          let nx = pl2.center[0] - pl1.center[0];
+          let ny = pl2.center[1] - pl1.center[1];
+          let nz = pl2.center[2] - pl1.center[2];
+          // Make tangent to sphere at p
+          const ndp = nx * x + ny * y + nz * z;
+          nx -= ndp * x; ny -= ndp * y; nz -= ndp * z;
+          const nLen = Math.hypot(nx, ny, nz) || 1;
+          nx /= nLen; ny /= nLen; nz /= nLen;
+          const vRelX = v1x - v2x;
+          const vRelY = v1y - v2y;
+          const vRelZ = v1z - v2z;
+          vConv = vRelX * nx + vRelY * ny + vRelZ * nz;
+        } else {
+          // Each outline was drawn against today's neighbour and travels with its plate, so
+          // each plate has its own edge normal. The closing speed is how fast plate 1 pushes
+          // out through its edge plus how fast plate 2 pushes out through its own.
+          vConv = edgeSpeed(centerNow[iA], fromToday[iA], plates[rivalA].center, x, y, z, v1x, v1y, v1z, q)
+            + edgeSpeed(centerNow[iB], fromToday[iB], plates[rivalB].center, x, y, z, v2x, v2y, v2z, q);
+        }
 
         // 4. Rifting / Divergence vs Convergence / Subduction / Island Arcs!
         // Smoothly blend raw advected crust across passive/convergent boundaries so we never get
@@ -944,7 +1103,18 @@ export function generateTectonicPlanet({
           const blendT = 0.5 * (1.0 - smoothstep(0.0, 0.055, bDist));
           h = crust1 * (1.0 - blendT) + crust2 * blendT;
         }
+        // Where both plates cover the point the more buoyant crust stays on top
+        if (mB > 0) {
+          const top = crust1 > crust2 ? crust1 : crust2;
+          h += (top - h) * smoothstep(0.0, 0.02, mB);
+        }
         let mountainBoost = 0;
+        let rG = 0; // granite
+        let rV = crust1 < -0.05 ? 0.55 : 0; // volcanic: the ocean floor is basalt
+        let rL = 0; // limestone
+        let rM = 0; // metamorphic
+        let vPot = 0;
+        let vKind = 0;
 
         if (vConv < -0.04) {
           // DIVERGING BOUNDARY (RIFTING!)
@@ -952,89 +1122,151 @@ export function generateTectonicPlanet({
           // Jagged rift coastline modulation so split margins look fractal, not ruler-straight
           const riftJitter = nDetail.fbm(x * 7.2 + 2.1, y * 7.2 - 4.7, z * 7.2 + 1.3, 4) * 0.036;
           const bRift = Math.max(0, bDist + riftJitter);
+          // The trough's shoulders sit at the edges of the opened gap; before it opens
+          // (plates still overlapping) there is no trough at all
+          const bShoulder = closed < 0 ? Math.max(0, bDist + closed * 0.5 + riftJitter) : bRift;
+          const opened = closed > 0 ? Math.max(0, 1 - closed / 0.05) : 1;
           const riftWidth = 0.028 + divRate * model.driftAngleBase * 0.26;
-          const riftMask = Math.exp(-(bRift * bRift) / (2 * riftWidth * riftWidth));
+          const riftMask = Math.exp(-(bShoulder * bShoulder) / (2 * riftWidth * riftWidth)) * opened;
           h -= riftMask * (0.52 + divRate * 0.28);
           // Subtle underwater Mid-Ocean Ridge right along the center of the rift
           const mor = Math.exp(-(bRift * bRift) / (2 * 0.010 * 0.010));
-          h += mor * 0.14;
+          h += mor * 0.14 * opened;
           boundaryStrength[idx] = -riftMask;
+          // Flood basalt on the rift shoulders; small cones along the axis of a rift on land
+          rV = Math.max(rV, riftMask * 0.75);
+          if (crust1 > 0.05 && bRift < 0.02) {
+            vPot = 0.5 * opened * (1 - bRift / 0.02);
+            vKind = 3;
+          }
         } else if (vConv > 0.04) {
           // CONVERGING BOUNDARY (COLLISION / SUBDUCTION / ISLAND ARCS!)
           const convRate = Math.min(1.8, vConv);
           const cont1 = crust1 > 0.02;
           const cont2 = crust2 > 0.02;
+          // Ranges build up as the plates keep closing (levelling off), and are absent
+          // before the collision began
+          const grow = (closed >= 0 ? 1 + 0.9 * (1 - Math.exp(-closed / 0.12)) : Math.max(0, 1 + closed / 0.07)) * young;
+          const wide = grow > 1 ? Math.sqrt(grow) : 0.5 + 0.5 * grow;
 
           // Anisotropic directional mountain spine along plate boundary!
           const ridge = nMountain.ridged(x * 7.5 + 1.3, y * 7.5 - 2.4, z * 7.5 + 5.1, 4, 2.15, 0.54);
           const ridgeFine = nDetail.ridged(x * 16.0 - 4.2, y * 16.0 + 3.1, z * 16.0 - 1.9, 3);
 
-          if (cont1 && cont2) {
+          if (grow <= 0) {
+            // not yet in contact
+          } else if (cont1 && cont2) {
             // HIMALAYAN CONTINENT-CONTINENT COLLISION + SUTURE / LAND BRIDGE
-            const belt = Math.exp(-(bDist * bDist) / (2 * 0.085 * 0.085));
-            const uplift = belt * (0.42 + convRate * 0.44) * (0.45 + 0.85 * ridge);
-            h += uplift + belt * 0.12;
+            const sig = 0.085 * wide;
+            const belt = Math.exp(-(bDist * bDist) / (2 * sig * sig));
+            const uplift = belt * (0.42 + convRate * 0.44) * (0.45 + 0.85 * ridge) * grow;
+            h += uplift + belt * 0.12 * grow;
             mountainBoost += uplift * 1.4;
             boundaryStrength[idx] = belt;
-          } else if (cont1 && !cont2) {
-            // ANDEAN COASTAL CORDILLERA (continental overriding edge)
-            const cordillera = Math.exp(-((bDist - 0.026) * (bDist - 0.026)) / (2 * 0.046 * 0.046));
-            const uplift = cordillera * (0.34 + convRate * 0.42) * (0.40 + 0.90 * ridge + 0.25 * ridgeFine);
-            h += uplift;
-            mountainBoost += uplift * 1.3;
-            boundaryStrength[idx] = cordillera;
-          } else if (!cont1 && cont2) {
-            // OCEANIC SIDE OF SUBDUCTION: DEEP OFFSHORE TRENCH!
-            const trench = Math.exp(-((bDist - 0.016) * (bDist - 0.016)) / (2 * 0.018 * 0.018));
-            h -= trench * (0.42 + convRate * 0.25);
-            boundaryStrength[idx] = trench * 0.7;
+            // Squeezed, cooked core along the suture; folded seabed limestone on its flanks
+            rM = belt * belt * 0.9;
+            rL = belt * (1 - belt) * 2.6;
+            rG = belt * belt * belt * 0.25;
+          } else if (cont1 !== cont2) {
+            // OCEAN UNDER CONTINENT. Everything is placed from the continental plate's edge:
+            // inside it the ANDEAN COASTAL CORDILLERA, outside it the DEEP OFFSHORE TRENCH
+            const edge = cont1 ? mA : mB;
+            if (cont1 ? edge >= 0 : edge > 0) {
+              const sig = 0.046 * wide;
+              const cordillera = Math.exp(-((edge - 0.026) * (edge - 0.026)) / (2 * sig * sig));
+              const uplift = cordillera * (0.34 + convRate * 0.42) * (0.40 + 0.90 * ridge + 0.25 * ridgeFine) * grow;
+              h += uplift;
+              mountainBoost += uplift * 1.3;
+              boundaryStrength[idx] = cordillera;
+              // Granite batholith under the range, and a line of volcanoes just inland of
+              // its crest where the sinking plate melts
+              const arcLine = Math.exp(-((edge - 0.05) * (edge - 0.05)) / (2 * 0.02 * 0.02));
+              rG = cordillera * 0.7;
+              rM = cordillera * 0.25;
+              rV = Math.max(rV, arcLine * 0.6 * Math.min(1, grow));
+              vPot = arcLine * Math.min(1, grow) * (0.55 + 0.45 * Math.min(1, convRate));
+              vKind = 1;
+            } else {
+              const out = -edge;
+              const trench = Math.exp(-((out - 0.016) * (out - 0.016)) / (2 * 0.018 * 0.018));
+              h -= trench * (0.42 + convRate * 0.25) * grow;
+              boundaryStrength[idx] = trench * 0.7;
+            }
           } else {
             // OCEAN-OCEAN SUBDUCTION -> CURVED VOLCANIC ISLAND ARC (Japan / NZ / Indonesia / Aleutians!)
             // Volcanic arcs rise from the abyssal floor to pierce sea level (like real Mariana/Tonga/Japan arcs!)
-            const isOverriding = (pl1.ageBias > pl2.ageBias) || (pl1.ageBias === pl2.ageBias && pl1.id > pl2.id);
-            if (isOverriding && convRate > 0.12) {
-              const arcBand = Math.exp(-((bDist - 0.036) * (bDist - 0.036)) / (2 * 0.018 * 0.018));
-              const arcChain = nMountain.fbm(x * 11.5 + 7.1, y * 11.5 - 3.3, z * 11.5 + 2.2, 3);
-              const arcPeaks = smoothstep(-0.08, 0.42, arcChain) * (0.55 + 0.65 * ridge);
-              const arcBoost = arcBand * arcPeaks * (0.62 + convRate * 0.34) * model.islandArcStrength;
-              if (arcBoost > 0.08) {
-                const arcElev = -0.34 + arcBoost * 0.92;
-                if (arcElev > h) h = arcElev;
-                mountainBoost += arcBoost * 1.1;
+            const over1 = (pl1.ageBias > pl2.ageBias) || (pl1.ageBias === pl2.ageBias && pl1.id > pl2.id);
+            const edge = over1 ? mA : mB; // distance inside the overriding plate
+            if (over1 ? edge >= 0 : edge > 0) {
+              if (convRate > 0.12) {
+                const arcBand = Math.exp(-((edge - 0.036) * (edge - 0.036)) / (2 * 0.018 * 0.018));
+                const arcChain = nMountain.fbm(x * 11.5 + 7.1, y * 11.5 - 3.3, z * 11.5 + 2.2, 3);
+                const arcPeaks = smoothstep(-0.08, 0.42, arcChain) * (0.55 + 0.65 * ridge);
+                const arcBoost = arcBand * arcPeaks * (0.62 + convRate * 0.34) * model.islandArcStrength * grow;
+                if (arcBoost > 0.08) {
+                  const arcElev = -0.34 + arcBoost * 0.92;
+                  if (arcElev > h) h = arcElev;
+                  mountainBoost += arcBoost * 1.1;
+                  vPot = Math.min(1, arcBoost * 1.6);
+                  vKind = 1;
+                }
+                boundaryStrength[idx] = arcBand;
+                rV = Math.max(rV, arcBand * 0.8);
               }
-              boundaryStrength[idx] = arcBand;
-            } else if (!isOverriding) {
+            } else {
               // Deep Marianas-style trench beside the island arc
-              const trench = Math.exp(-((bDist - 0.014) * (bDist - 0.014)) / (2 * 0.016 * 0.016));
-              h -= trench * 0.38;
+              const out = -edge;
+              const trench = Math.exp(-((out - 0.014) * (out - 0.014)) / (2 * 0.016 * 0.016));
+              h -= trench * 0.38 * grow;
               boundaryStrength[idx] = trench * 0.6;
             }
           }
         }
 
+        // A gap no plate covers is ocean floor, with a ridge down its middle
+        if (mA < 0) {
+          const floor = -0.95 + 0.14 * Math.exp(-(bDist * bDist) / (2 * 0.012 * 0.012));
+          const gapT = smoothstep(0.0, 0.02, -mA);
+          h += (floor - h) * gapT;
+          mountainBoost *= 1 - gapT;
+          rV = Math.max(rV, 0.55 * gapT);
+          vPot *= 1 - gapT;
+        }
+
         // 5. Stationary Mantle Plume Hotspot Chains (Hawaii / Galapagos / Azores)
         // Shield volcanoes rise straight from the abyssal floor to break sea level in open oceans!
-        for (let hi = 0; hi < hotspots.length; hi++) {
-          const chain = hotspots[hi].chain;
-          for (let k = 0; k < chain.length; k++) {
-            const isl = chain[k];
-            const dDot = x * isl.p[0] + y * isl.p[1] + z * isl.p[2];
-            if (dDot < 0.96) continue;
-            const angDist = Math.acos(Math.min(1, dDot));
-            if (angDist < isl.r * 2.5) {
-              const cone = Math.exp(-(angDist * angDist) / (2 * isl.r * isl.r));
-              const rough = 0.45 + 0.72 * nDetail.ridged(x * 18.0 + 1.1, y * 18.0 - 2.3, z * 18.0 + 0.7, 3);
-              const boost = cone * isl.h * 0.72 * rough;
-              const hsElev = -0.38 + boost * 1.05;
-              if (hsElev > h) h = hsElev;
-              mountainBoost += boost * 0.75;
-            }
+        for (let k = 0; k < islands.length; k++) {
+          const isl = islands[k];
+          const dDot = x * isl.p[0] + y * isl.p[1] + z * isl.p[2];
+          if (dDot < 0.96) continue;
+          const angDist = Math.acos(Math.min(1, dDot));
+          if (angDist < isl.r * 2.5) {
+            const cone = Math.exp(-(angDist * angDist) / (2 * isl.r * isl.r));
+            const rough = 0.45 + 0.72 * nDetail.ridged(x * 18.0 + 1.1, y * 18.0 - 2.3, z * 18.0 + 0.7, 3);
+            const boost = cone * isl.h * 0.72 * rough;
+            const hsElev = -0.38 + boost * 1.05;
+            if (hsElev > h) h = hsElev;
+            mountainBoost += boost * 0.75;
+            rV = Math.max(rV, Math.min(0.8, cone * 1.4));
           }
         }
 
         // 6. Fine 3D Fractal Coastlines, Fjords & Interior Terrain Relief (100% seamless on S^2!)
-        const fineCoast = nDetail.fbm(x * 13.5 - 2.3, y * 13.5 + 5.7, z * 13.5 - 4.1, 4, 2.1, 0.5);
-        const microCrag = nDetail.ridged(x * 24.0 + 3.1, y * 24.0 - 1.9, z * 24.0 + 6.4, 3);
+        // The detail rides with its plate; near a boundary the two plates' patterns are mixed
+        let fineCoast;
+        let microCrag;
+        if (!moving) {
+          fineCoast = nDetail.fbm(x * 13.5 - 2.3, y * 13.5 + 5.7, z * 13.5 - 4.1, 4, 2.1, 0.5);
+          microCrag = nDetail.ridged(x * 24.0 + 3.1, y * 24.0 - 1.9, z * 24.0 + 6.4, 3);
+        } else {
+          fineCoast = nDetail.fbm(qA[0] * 13.5 - 2.3, qA[1] * 13.5 + 5.7, qA[2] * 13.5 - 4.1, 4, 2.1, 0.5);
+          microCrag = nDetail.ridged(qA[0] * 24.0 + 3.1, qA[1] * 24.0 - 1.9, qA[2] * 24.0 + 6.4, 3);
+          if (bDist < 0.05) {
+            const w = 0.5 * (1.0 - smoothstep(0.0, 0.05, bDist));
+            fineCoast += (nDetail.fbm(qB[0] * 13.5 - 2.3, qB[1] * 13.5 + 5.7, qB[2] * 13.5 - 4.1, 4, 2.1, 0.5) - fineCoast) * w;
+            microCrag += (nDetail.ridged(qB[0] * 24.0 + 3.1, qB[1] * 24.0 - 1.9, qB[2] * 24.0 + 6.4, 3) - microCrag) * w;
+          }
+        }
         // Stronger fractal detail right along coastlines for fjords/bays, solid continental craton interiors
         const coastWeight = 0.052 + 0.045 * Math.exp(-h * h * 6.0);
         h += fineCoast * coastWeight + (h > 0.02 ? microCrag * 0.085 : 0);
@@ -1046,9 +1278,153 @@ export function generateTectonicPlanet({
 
         rawHeight[idx] = h;
         orogenyField[idx] = mountainBoost;
+
+        // 7. Bedrock away from the boundaries: old shield granite where the continental crust
+        // is thickest, limestone on its low margins (former shallow seas). Patterns are fixed to
+        // the crust, so they drift with their continent.
+        if (crust1 > 0) {
+          const shield = nCrust.fbm(p0A[0] * 4.3 + 17.1, p0A[1] * 4.3 - 8.6, p0A[2] * 4.3 + 3.3, 3);
+          const basin = nCrust.fbm(p0A[0] * 5.1 - 12.4, p0A[1] * 5.1 + 6.9, p0A[2] * 5.1 - 9.7, 3);
+          const thick = smoothstep(0.12, 0.42, crust1);
+          rG = Math.max(rG, thick * smoothstep(-0.12, 0.2, shield) * 0.8);
+          // Where the old core is not granite it is its metamorphic wrapping (gneiss, schist)
+          rM = Math.max(rM, thick * smoothstep(0.02, 0.3, -shield) * 0.7);
+          rL = Math.max(rL, (1 - smoothstep(0.15, 0.5, crust1)) * smoothstep(-0.12, 0.2, basin) * 0.75);
+        }
+        const rSum = rG + rV + rL + rM;
+        const rNorm = rSum > 0.8 ? 0.8 / rSum : 1; // regional rock tops out at 0.8; fresh lava goes above
+        const ri = idx * 4;
+        rock[ri] = Math.round(rG * rNorm * 255);
+        rock[ri + 1] = Math.round(rV * rNorm * 255);
+        rock[ri + 2] = Math.round(rL * rNorm * 255);
+        rock[ri + 3] = Math.round(rM * rNorm * 255);
+        volcPot[idx] = vPot;
+        volcKind[idx] = vKind;
       }
     }
   }
+
+  return { rawHeight, plateIds, boundaryStrength, orogenyField, unitX, unitY, unitZ, rock, volcPot, volcKind, islands };
+}
+
+// ---------- Volcanoes ----------
+/**
+ * Shapes are in units of the cone's own radius: `aspect` is height / radius, `crater` the crater
+ * radius and `craterDepth` its depth as a share of the height. Radii are radians of arc.
+ */
+export const VOLCANO_KINDS = {
+  strato: { radius: [0.034, 0.054], aspect: 0.56, crater: 0.1, craterDepth: 0.14, most: 5, minScore: 0.78 },
+  shield: { radius: [0.06, 0.09], aspect: 0.15, crater: 0.15, craterDepth: 0.28, most: 2, minScore: 0 },
+  cinder: { radius: [0.01, 0.016], aspect: 0.5, crater: 0.26, craterDepth: 0.3, most: 1, minScore: 0.4 },
+};
+const VOLCANO_KIND_NAMES = [null, 'strato', 'shield', 'cinder'];
+// A planet is small: it gets its few most obvious volcanoes, each well away from the next
+const VOLCANO_SPACING = 0.42; // radians of arc
+
+function hash01(n) {
+  let h = Math.imul(n ^ 0x9e3779b9, 0x85ebca6b);
+  h = Math.imul(h ^ (h >>> 13), 0xc2b2ae35);
+  return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+}
+
+/**
+ * Pick the planet's volcanoes: only the handful of places where the tectonics most plainly
+ * calls for one. The strongest stretches of subduction arc get a stratovolcano, the largest
+ * hotspot islands a shield, the most active rifts on land a cinder cone, and no two stand
+ * close together.
+ */
+function pickVolcanoes(seed, N, heights, unitX, unitY, unitZ, volcPot, volcKind, islands, heightAtDir) {
+  const out = [];
+  const count = { strato: 0, shield: 0, cinder: 0 };
+  const lim = Math.cos(VOLCANO_SPACING);
+  const tooClose = (x, y, z) => out.some((v) => x * v.dir[0] + y * v.dir[1] + z * v.dir[2] > lim);
+  const add = (kind, x, y, z, key, radius) => {
+    const k = VOLCANO_KINDS[kind];
+    const r = radius ?? k.radius[0] + (k.radius[1] - k.radius[0]) * hash01(key * 7 + 1);
+    count[kind]++;
+    out.push({
+      id: key >>> 0,
+      kind,
+      dir: [x, y, z],
+      radius: r,
+      aspect: k.aspect * (0.85 + 0.3 * hash01(key * 7 + 2)),
+      crater: k.crater,
+      craterDepth: k.craterDepth,
+      active: hash01(key * 7 + 3) < 0.5,
+    });
+  };
+
+  // Arcs and rifts first, strongest first; the tiny hash only settles ties between equals
+  const cand = [];
+  for (let i = 0; i < volcPot.length; i++) {
+    if (volcKind[i] > 0 && heights[i] > 2 && volcPot[i] >= VOLCANO_KINDS[VOLCANO_KIND_NAMES[volcKind[i]]].minScore) cand.push(i);
+  }
+  const score = (i) => volcPot[i] + 0.02 * hash01(seed * 977 + i);
+  cand.sort((a, b) => score(b) - score(a) || a - b);
+  const cell = Math.PI / 2 / (N - 1);
+  for (const i of cand) {
+    const kind = VOLCANO_KIND_NAMES[volcKind[i]];
+    if (count[kind] >= VOLCANO_KINDS[kind].most) continue;
+    // Jitter inside the grid cell so sites do not sit on the lattice
+    const key = seed * 977 + i;
+    const jx = (hash01(key * 3 + 11) - 0.5) * cell;
+    const jy = (hash01(key * 3 + 12) - 0.5) * cell;
+    const jz = (hash01(key * 3 + 13) - 0.5) * cell;
+    const d = normalize3([unitX[i] + jx, unitY[i] + jy, unitZ[i] + jz]);
+    if (heightAtDir(d[0], d[1], d[2]) <= 2) continue; // the nudge put it in the sea
+    if (tooClose(d[0], d[1], d[2])) continue;
+    add(kind, d[0], d[1], d[2], key);
+  }
+
+  // Then the biggest hotspot islands that stand clear of the sea
+  const k = VOLCANO_KINDS.shield;
+  islands
+    .map((isl, i) => ({ isl, i }))
+    .filter(({ isl }) => isl.h >= 0.3 && heightAtDir(isl.p[0], isl.p[1], isl.p[2]) > 1)
+    .sort((a, b) => b.isl.h * b.isl.r - a.isl.h * a.isl.r || a.i - b.i)
+    .forEach(({ isl, i }) => {
+      if (count.shield >= k.most || tooClose(isl.p[0], isl.p[1], isl.p[2])) return;
+      add('shield', isl.p[0], isl.p[1], isl.p[2], seed * 131 + i, Math.max(k.radius[0], Math.min(k.radius[1], isl.r * 1.5)));
+    });
+  return out;
+}
+
+// Highest raw height of "today", which fixes the height scale for every other moment
+let peakMemo = { key: '', value: 0 };
+function todayPeakRaw(model, N, key) {
+  if (peakMemo.key !== key) {
+    const raw = evalTectonicField(model, N, 0).rawHeight;
+    let peak = -1e9;
+    for (let i = 0; i < raw.length; i++) if (raw[i] > peak) peak = raw[i];
+    peakMemo = { key, value: peak };
+  }
+  return peakMemo.value;
+}
+
+export function generateTectonicPlanet({
+  seed = 42,
+  archetype = 'auto',
+  climateMode = 'earth',
+  faceSize = 128,
+  radius = 3000,
+  plateCount = null,
+  driftScale = 1.0,
+  seaLevelBias = 0.0,
+  maxElev = 680,
+  geoTimeMyr = 0,
+} = {}) {
+  const t0 = typeof performance !== 'undefined' ? performance.now() : Date.now();
+  const model = createTectonicModel({ seed, archetype, plateCount, driftScale, seaLevelBias });
+  const { plates, nCrust } = model;
+  const tau = geoTimeToTau(geoTimeMyr);
+
+  const N = faceSize;
+  const N2 = N * N;
+  const total = 6 * N2;
+
+  // Pass 1: Evaluate true seamless spherical tectonics at every (f, r, c) -> unit vector on S^2
+  const { rawHeight, plateIds, boundaryStrength, orogenyField, unitX, unitY, unitZ, rock, volcPot, volcKind, islands } =
+    evalTectonicField(model, N, tau);
 
   // Pass 2: Calibrate sea level to target Earth-like ocean fraction (bimodal hypsography!)
   const sampleCount = 12000;
@@ -1063,16 +1439,24 @@ export function generateTectonicPlanet({
   // Convert normalized raw tectonic height -> realistic meters with bimodal continental shelf + alpine peaks
   const heights = new Float32Array(total);
   let maxRawAbove = 0.001;
-  for (let i = 0; i < total; i++) {
-    const d = rawHeight[i] - seaThreshold;
-    if (d > maxRawAbove) maxRawAbove = d;
+  if (tau === 0) {
+    for (let i = 0; i < total; i++) {
+      const d = rawHeight[i] - seaThreshold;
+      if (d > maxRawAbove) maxRawAbove = d;
+    }
+  } else {
+    // Heights at other moments are measured against today's tallest peak, so ranges really
+    // are lower before a collision and higher after it
+    const key = `${seed}|${archetype}|${plateCount}|${driftScale}|${N}`;
+    maxRawAbove = Math.max(0.001, todayPeakRaw(model, N, key) - seaThreshold);
   }
 
   for (let i = 0; i < total; i++) {
     const d = rawHeight[i] - seaThreshold;
     if (d >= 0) {
       // Nonlinear Earth land hypsography: clean coastal plains (>4m) + dramatic tectonic mountain spines!
-      const t = d / maxRawAbove;
+      let t = d / maxRawAbove;
+      if (t > 1) t = 1 + 0.35 * (1 - Math.exp(-(t - 1) / 0.35)); // taller than today's tallest: ease off
       const mountainWeight = Math.min(1.0, orogenyField[i] * 1.45);
       const elev = 3.5 + (Math.pow(t, 1.15) * 0.65 + Math.pow(t, 2.0) * 0.35 + mountainWeight * t * 0.25) * (maxElev - 3.5);
       heights[i] = Math.min(maxElev * 1.08, elev);
@@ -1182,6 +1566,8 @@ export function generateTectonicPlanet({
   // Pass 5: Measure real continent count, island count, and largest landmass centroids!
   const stats = analyzeContinents(N, heights);
 
+  const volcanoes = pickVolcanoes(seed, N, heights, unitX, unitY, unitZ, volcPot, volcKind, islands, sampleHeightAtDir);
+
   // Slice into 6 per-face objects matching viewer/src/planet.js
   const faces = [];
   for (let f = 0; f < 6; f++) {
@@ -1192,6 +1578,7 @@ export function generateTectonicPlanet({
       masks: masksAll.subarray(start * 4, (start + N2) * 4),
       climate: climateAll.subarray(start * 4, (start + N2) * 4),
       plateIds: plateIds.subarray(start, start + N2),
+      rock: rock.subarray(start * 4, (start + N2) * 4),
     });
   }
 
@@ -1200,6 +1587,7 @@ export function generateTectonicPlanet({
   return {
     meta: {
       seed,
+      geoTimeMyr: tau * GEO_HISTORY_MYR,
       archetype: model.archetype,
       archetypeLabel: model.archetypeLabel,
       radius,
@@ -1215,8 +1603,10 @@ export function generateTectonicPlanet({
       landmasses: stats.landmasses,
       lakeCells: hydro.lakeCells,
       riverCells: hydro.riverCells,
+      volcanoCount: volcanoes.length,
       genTimeMs: elapsedMs,
     },
     faces,
+    volcanoes,
   };
 }

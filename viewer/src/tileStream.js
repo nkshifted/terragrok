@@ -55,6 +55,18 @@ function makeFarCopy(entry) {
       }
     }
   }
+  let rock = null;
+  if (slot.rock) {
+    const cn = slot.climN;
+    const cf = cn / FAR_CLIM_N;
+    rock = new Uint8Array(FAR_CLIM_N * FAR_CLIM_N * 4);
+    for (let r = 0; r < FAR_CLIM_N; r++) {
+      for (let c = 0; c < FAR_CLIM_N; c++) {
+        const si = (r * cf * cn + c * cf) * 4;
+        rock.set(slot.rock.subarray(si, si + 4), (r * FAR_CLIM_N + c) * 4);
+      }
+    }
+  }
   return {
     key: entry.key,
     qi: entry.qi,
@@ -71,6 +83,7 @@ function makeFarCopy(entry) {
     heights,
     masks,
     climate,
+    rock,
   };
 }
 
@@ -145,14 +158,15 @@ export function createTileStreamController({ onChange, getPlayerPos }) {
       return entry;
     }
     const climateSize = meta.climateSize || size;
-    const [heights, masks, climate, rivers, lakes] = await Promise.all([
+    const [heights, masks, climate, rivers, lakes, rock] = await Promise.all([
       fetchBytes(`${base}.height.f32`, Float32Array, size * size),
       fetchBytes(`${base}.masks.u8`, Uint8Array, size * size * 4),
       meta.hasClimate ? fetchBytes(`${base}.climate.u8`, Uint8Array, climateSize * climateSize * 4) : null,
       fetch(`${base}.rivers.json`, { cache: 'no-store' }).then((r) => (r.ok ? r.json() : [])),
       fetch(`${base}.lakes.json`, { cache: 'no-store' }).then((r) => (r.ok ? r.json() : [])),
+      meta.hasRock ? fetchBytes(`${base}.rock.u8`, Uint8Array, climateSize * climateSize * 4) : null,
     ]);
-    entry.slot = prepareTileSlot({ heights, size, masks, climate, climateSize }, ATLAS_TILE_N, ATLAS_CLIM_N);
+    entry.slot = prepareTileSlot({ heights, size, masks, climate, climateSize, rock }, ATLAS_TILE_N, ATLAS_CLIM_N);
     entry.rivers = rivers;
     entry.lakes = lakes;
     return entry;
@@ -298,7 +312,7 @@ export function createTileStreamController({ onChange, getPlayerPos }) {
       lakes: home.lakes,
       version: ++version,
       slot: prepareTileSlot(
-        { heights: home.heights, size, masks: home.masks, climate: home.climate, climateSize: homeMeta.climateSize || size },
+        { heights: home.heights, size, masks: home.masks, climate: home.climate, climateSize: homeMeta.climateSize || size, rock: home.rock },
         ATLAS_TILE_N,
         ATLAS_CLIM_N
       ),

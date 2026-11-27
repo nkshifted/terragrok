@@ -51,7 +51,8 @@ curl -s -X POST localhost:8765/api/tiles/stream -H 'Content-Type: application/js
 Seams are invisible only because every tile of a chart is the same world. Changing any of
 these per tile brings the cliffs back:
 
-- the projection origin and the planet settings (`chart_from_home_meta`)
+- the projection origin and the planet settings (`chart_from_home_meta`), including the
+  geological time (`geoTimeMyr`)
 - the diffusion seed (`chart_seed`, from the **home** lat/lon, not the tile's)
 - resolution, `quality` and `fidelity` (1K and 2K are different model scales, not a ladder)
 - `vScale` (`dem_to_viewer`)
@@ -61,8 +62,24 @@ these per tile brings the cliffs back:
   put a straight climate line on every seam. If the rasters change meaning, bump
   `CLIMATE_VERSION`: older tiles are then recomputed by `_refresh_tile_climate` on first use
 
+- volcano cones: `stamp_volcanoes` is a function of each pixel's own position, built from the
+  site's Stage 1 height (`baseDem`), never from the synthesized ground around it. A cone on a
+  seam is then identical in both tiles. A chart either has cones in every tile or in none
+  (`volcanoVersion` on the home's `planetOrigin`); do not add them to an older chart, and
+  bump `VOLCANO_VERSION` in `chart.py` whenever `pickVolcanoes` would choose different sites
+
 Post-processing that looks at a neighbourhood (blurs, relaxation) runs on a 64-pixel margin
 that is cropped afterwards. New filters belong before that crop in `_synthesize_on_worker`.
+
+## The planet's "today" is frozen
+
+Synthesized worlds store only the planet's seed and settings and regenerate Stage 1 from them
+whenever a new tile is needed. So `generateTectonicPlanet` at `geoTimeMyr = 0` must return
+bit-identical output forever: any change, even a reordered multiplication, puts a seam between
+a world's old tiles and its new ones. `viewer/tests/tectonics.test.mjs` pins fingerprints of
+three planets. Other moments go through the `moving` branches of `evalTectonicField`; every
+term added there must reduce to exactly the fixed-outline value when the plates have not moved.
+If a fingerprint has to change, existing worlds need a version field and a migration first.
 
 ## Shared code
 
